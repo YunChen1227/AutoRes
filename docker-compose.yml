@@ -1,0 +1,23 @@
+# 两个服务：scanner（数据管道）+ api（报告服务）。
+# MongoDB 用公司已有实例，不在此编排（design.md D3 / §10.1）。
+services:
+  scanner:
+    build: .
+    command: python -m autores.scanner.main
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - /mnt/nas/benchmark_root:/mnt/nas/benchmark_root:ro   # NAS 只读挂载
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: uvicorn autores.server.main:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - reports:/data/reports          # 报告临时卷
+    restart: unless-stopped
+
+volumes:
+  reports:

@@ -1,0 +1,32 @@
+# AutoRes 配置模板 —— 拷贝为 config.yaml 后填写。
+# 所有项均可用环境变量 AUTORES_<段>_<键> 覆盖（如 AUTORES_LLM_API_KEY）。
+
+llm:                                  # 使用方重点填写（design.md D2）
+  base_url: "http://your-llm-host:8000/v1"   # OpenAI 兼容端点
+  api_key: "sk-xxxx"                          # 无鉴权端点可填任意占位
+  model: "your-model-name"
+  temperature: 0.1                            # 意图解析用低温
+  timeout_seconds: 60
+  max_tool_rounds: 8
+
+database:                             # 公司已有 MongoDB 实例（单节点即可）
+  uri: "mongodb://user:pass@your-mongo-host:27017/?authSource=admin"
+  db_name: "autores"
+  # 集合名固定：test_runs、ingest_log（代码内常量）
+
+scanner:
+  benchmark_root: "/mnt/nas/benchmark_root"   # NAS 挂载点（= 测试人员落盘 --nas-dir）
+  interval_seconds: 300
+  dir_pattern: '^\d{8}_\d{6}$'                # 时间戳目录名正则
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+session:
+  ttl_minutes: 60
+  max_messages: 40
+
+report:
+  output_dir: "/data/reports"
+  ttl_minutes: 120
