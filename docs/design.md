@@ -13,31 +13,32 @@
 
 ## 1. 系统概述
 
-系统由两条相互独立的链路组成，共享同一个 MongoDB 数据库（使用公司已有实例）：
+系统由两条相互独立的链路组成，共享同一个 SQLite 单文件数据库（本地磁盘，零部署）：
 
-1. **数据管道（自动、无人值守）**：定时扫描 NAS 上的测试结果目录，解析 `result.csv` + `metadata.json`，写入 MongoDB。
+1. **数据管道（自动、无人值守）**：定时扫描 NAS 上的测试结果目录，解析 `result.csv` + `metadata.json`，写入 SQLite。
 2. **报告服务（按需触发）**：Web 前端 chatbot 接收自然语言对比需求 → LLM Agent 多轮理解与澄清 → 确定性流水线查库、对齐、生成 Excel → 前端提供下载链接。
 
 ```
-                          ┌─────────────────────────────────────────────┐         ┌──────────────┐
-  测试人员                 │              内网服务器 (Docker Compose)      │  写入    │  MongoDB     │
-     │ 落盘                │                                             │  ┌─────►│ (公司已有实例) │
-     ▼                    │  ┌───────────┐                              │  │      │ test_runs    │
- ┌────────┐   目录挂载     │  │  Scanner  │──────────────────────────────┼──┘      │ ingest_log   │
- │  NAS   │◄──────────────┼──┤ (进程 A)  │                              │         └──────┬───────┘
- └────────┘               │  └───────────┘                              │   查询          │
-                          │  ┌────────────────────────────────────────┐ │◄───────────────┘
-  产品/项目同事             │  │        API Server (进程 B, FastAPI)    │ │
-     │ 浏览器              │  │  ┌──────────┐  ┌─────────┐  ┌───────┐ │ │
-     ▼                    │  │  │ 静态前端  │  │ Agent   │  │ 报告   │ │ │
- ┌──────────┐  HTTP/SSE   │  │  │ (单文件)  │  │ 工具循环 │  │ 流水线 │ │ │
- │ Web 前端  │◄────────────┼──┤  └──────────┘  └────┬────┘  └───┬───┘ │ │
- │ chatbot  │             │  └────────────────────┼───────────┼─────┘ │
- └──────────┘             │                       │           │       │
-                          └───────────────────────┼───────────┼───────┘
-                                                  ▼           ▼
-                                          OpenAI 兼容      临时报告目录
-                                          LLM 端点         (TTL 清理)
+                          ┌─────────────────────────────────────────────┐
+  测试人员                 │              内网服务器 (Docker Compose)      │
+     │ 落盘                │                                             │
+     ▼                    │  ┌───────────┐   写入   ┌──────────────────┐ │
+ ┌────────┐   目录挂载     │  │  Scanner  ├────────►│  SQLite 单文件    │ │
+ │  NAS   │◄──────────────┼──┤ (进程 A)  │          │ /data/autores.db │ │
+ └────────┘               │  └───────────┘          │ test_runs        │ │
+                          │                         │ ingest_log       │ │
+  产品/项目同事             │                         └────────┬─────────┘ │
+     │ 浏览器              │  ┌──────────────────────────────┐ │ 查询      │
+     ▼                    │  │   API Server (进程 B, FastAPI)│◄┘          │
+ ┌──────────┐  HTTP/SSE   │  │  ┌──────────┐ ┌─────────┐ ┌───────┐     │ │
+ │ Web 前端  │◄────────────┼──┤  │ 静态前端  │ │ Agent   │ │ 报告   │     │ │
+ │ chatbot  │             │  │  │ (单文件)  │ │ 工具循环 │ │ 流水线 │     │ │
+ └──────────┘             │  │  └──────────┘ └────┬────┘ └───┬───┘     │ │
+                          │  └────────────────────┼──────────┼─────────┘ │
+                          └───────────────────────┼──────────┼───────────┘
+                                                  ▼          ▼
+                                          OpenAI 兼容     临时报告目录
+                                          LLM 端点        (TTL 清理)
 ```
 
 ---
@@ -50,9 +51,9 @@
 |---|--------|------|------------|
 | D1 | 交互入口 | **自建 Web 前端 chatbot**（暂不接入办公 IM） | 办公软件暂无法接入；Excel 通过前端下载链接获取。接口层预留未来接 IM 的扩展位（见 §10.3） |
 | D2 | NLU 方案 | **外部 OpenAI 兼容 LLM 端点**，地址/密钥由使用方在 config 文件中填写 | 端点支持 function calling；系统不绑定任何具体模型 |
-| D3 | 数据库 | **MongoDB**（文档型，一次测试=一个文档，metrics 内嵌数组）；**使用公司已有实例**，部署仅填连接串 | 见 §6；替代早期 PostgreSQL 方案 |
+| D3 | 数据库 | **SQLite**（单文件、零部署）：一次测试=一行，维度与结构化启动参数为独立列，metrics 以 JSON 列内嵌 | 见 §6；单节点、量小、Scanner 单写，SQLite 足够；替代早期 PostgreSQL / MongoDB 方案，省去外部数据库实例依赖 |
 | D4 | 部署环境 | **内网 Linux 服务器 + NAS 目录挂载** | Scanner 以本地文件系统方式读 NAS 挂载点 |
-| D5 | 后端技术栈 | **Python + FastAPI** | pandas 解析 CSV、openpyxl 生成 Excel、PyMongo/Motor 访问 MongoDB，生态匹配 |
+| D5 | 后端技术栈 | **Python + FastAPI** | openpyxl 生成 Excel、标准库 sqlite3 访问数据库，零额外驱动依赖 |
 | D6 | 前端形态 | **原生 HTML/JS 单文件 SPA**，由 FastAPI 静态托管 | 不引入构建链，一个 `index.html` 搞定；单服务部署 |
 | D7 | 交互模式 | **多轮对话 + 主动澄清** | 需求有歧义（如缺版本号）时 Agent 反问并列出候选，而非猜测 |
 | D8 | Agent 架构 | **混合模式**：需求理解/澄清/数据定位用 LLM 工具循环；确定查询规格后，Excel 生成走确定性代码流水线 | LLM 负责"理解"，代码负责"产出"；报告内容不经过 LLM，保证数据零失真 |
@@ -65,7 +66,7 @@
 | D15 | 多框架支持 | 落盘脚本 `to_csv.py` 新增 `--framework {sglang,vllm}` 入参；两框架 bench 输出字段名不同，脚本内做字段映射统一为同一套 metric 名 | 见 §5.1、§5.2 |
 | D16 | 元信息落盘 | `metadata.txt` 改为 `metadata.json`（结构化、便于入库）；测试人员通过入参提供 **NAS 地址、显卡类型、启动框架、完整启动命令字符串** | JSON 比 kv-txt 更适合承载嵌套的结构化启动参数，见 §5.3 |
 | D17 | 启动参数提取 | 在**落盘脚本侧**从完整启动命令字符串提取并行度与开关（tp/dp/pp/ep/cp、hicache、flexkv、kv-cache-dtype 等），结构化写入 `metadata.json`；提取规则内置框架默认值，命令未显式写的参数按框架默认回填 | 规则集中一处、入库端零框架知识，见 §5.4 |
-| D18 | 参数入库形态 | **折中**：并行度（tp/dp/pp/ep/cp）+ 核心通用开关（kv_cache_dtype、hicache_enabled、flexkv_enabled、torch_compile、quantization、attention_backend）平铺进文档 `params` 子对象（可直接 filter/建索引）；框架专属细节（hicache_ratio 等）进 `extra` 子对象 | 高频对比维度可直接筛选，避免文档字段因框架特性膨胀，见 §6 |
+| D18 | 参数入库形态 | **折中**：并行度（tp/dp/pp/ep/cp）+ 核心通用开关（kv_cache_dtype、hicache_enabled、flexkv_enabled、torch_compile、quantization、attention_backend）建 `test_runs` 独立列（可直接 WHERE/建索引）；框架专属细节（hicache_ratio 等）进 `extra` JSON 列 | 高频对比维度可直接筛选，避免表结构因框架特性膨胀，见 §6 |
 | D19 | 半成品防护 | **取消完成标记机制**：csv/json 均由脚本硬编码原子生成，不存在半成品。入库解析失败即**不记录该 timestamp 目录**（下轮自动重试），成功才记入台账 | 简化 §5.5（原 §5.2 完成标记方案作废） |
 | D20 | 取数策略 | **所有维度全同才取最新一次**；框架版本不同（如 vllm 0.5.11 vs 0.5.12）视为不同记录**全部取出**；不同框架（vllm vs sglang）的版本号**不可跨框架比较**，各自独立取 | 修订原 §7.2 的"latest"策略，见 §7.4 |
 | D21 | 排除逻辑 | 取出数据可能过多，Agent 除"取哪些"外还支持"排除哪些"：QuerySpec 增加 `exclude` 字段，用户可要求剔除某维度值（如"去掉 A800 的"） | 见 §7.3、§7.4 |
@@ -78,14 +79,14 @@
 |----|------|------|
 | 语言 | Python ≥ 3.11 | 全部后端逻辑 |
 | Web 框架 | FastAPI + uvicorn | REST API、SSE 流式回复、静态文件托管 |
-| DB 驱动 | PyMongo（同步） | MongoDB 访问；单节点、数据量小、无并发压力，Scanner 与 API 统一用同步 PyMongo（API 侧查询放线程池，避免阻塞事件循环），不引入 Motor 增加复杂度 |
+| DB 访问 | 标准库 sqlite3（WAL 模式） | 零依赖；Scanner 单进程写、API 读，WAL 支持一写多读；进程内用锁串行化，API 侧查询在线程池中执行不阻塞事件循环 |
 | CSV 解析 | pandas | result.csv 读取与清洗 |
 | Excel 生成 | openpyxl | 对比报告渲染 |
 | LLM 客户端 | openai 官方 SDK（指向自定义 base_url） | 任何 OpenAI 兼容端点均可用 |
 | 调度 | Scanner 进程内 `while + sleep` 循环（简单可靠） | 定时扫描；不依赖系统 cron |
 | 配置 | YAML（`config.yaml`）+ 环境变量覆盖 | 见 §9 |
 | 前端 | 原生 HTML/CSS/JS 单文件 | chatbot 界面 |
-| 部署 | Docker + docker-compose | scanner / api 两个容器（Mongo 用公司已有实例，不入 compose） |
+| 部署 | Docker + docker-compose | scanner / api 两个容器，共享 data 卷承载 SQLite 文件与报告目录 |
 
 ---
 
@@ -106,8 +107,8 @@ AutoRes/
 └── autores/                   # Python 包
     ├── config.py              # 配置加载（YAML + env 覆盖）
     ├── db/
-    │   ├── client.py          # MongoDB 连接（PyMongo 同步）、集合句柄、索引初始化
-    │   └── schema.py          # 文档结构定义与校验（test_runs / ingest_log）
+    │   ├── client.py          # SQLite 连接（WAL）、全部 SQL 集中于此、建表建索引
+    │   └── schema.py          # DDL、维度常量、表行 ↔ 文档 dict 互转（test_runs / ingest_log）
     ├── scanner/               # 进程 A
     │   ├── main.py            # 轮询主循环入口
     │   ├── discovery.py       # 新目录发现（timestamp 目录识别 + 已处理台账比对）
@@ -121,7 +122,7 @@ AutoRes/
     │   │   ├── tools.py       # 工具定义与实现
     │   │   └── prompts.py     # system prompt
     │   └── report/
-    │       ├── query.py       # QuerySpec → MongoDB 查询/聚合
+    │       ├── query.py       # QuerySpec → SQL WHERE 构造与查询
     │       ├── align.py       # 数据对齐（内嵌指标 → 对比宽表）
     │       └── excel.py       # openpyxl 渲染
     └── common/
@@ -249,101 +250,86 @@ AutoRes/
 - **扫描主循环**：按 `scanner.interval_seconds`（默认 300s）轮询 `scanner.benchmark_root`（NAS 挂载点）；列出一级子目录 → 过滤时间戳格式目录 → 与已成功台账比对 → 处理未入库目录。
 - **无半成品概念**：csv/json 由脚本硬编码原子生成，不存在"写一半"。因此**取消完成标记文件、静默期等机制**。
 - **失败即不记录**：解析/入库失败的目录**不写入成功台账**，仅打日志；下一轮扫描自然重试，直到成功才记账。无需 retry_count / abandoned 状态，无需人工干预流程。
-- **幂等**：`test_runs._id`（= 目录名）唯一 + "只处理不在 ingest_log 台账中的目录"双重保证每目录仅入库一次；重复插入因 `_id` 冲突被 Mongo 拒绝。
-- **写入原子性**：单目录的整份 `test_runs` 文档（含内嵌 metrics 数组）一次 `insert_one` 写入，本身即原子；随后写 `ingest_log`。若中途失败，因 `_id` 幂等，下轮重试安全（详见 §6.2）。
+- **幂等**：`test_runs.run_id`（= 目录名）为主键 + "只处理不在 ingest_log 台账中的目录"双重保证每目录仅入库一次；重复插入触发主键冲突（IntegrityError）被拒绝。
+- **写入原子性**：单目录的整条 `test_runs` 记录（含 metrics JSON 列）一条 `INSERT` 写入，本身即原子；随后写 `ingest_log`。若中途失败，因主键幂等，下轮重试安全（详见 §6.2）。
 
 ---
 
-## 6. 数据模型（MongoDB）
+## 6. 数据模型（SQLite）
 
-两个集合。`test_runs` 每个文档 = 一次完整测试（一张 result.csv + 其 metadata.json，D18/方案 A：一次测试=一个文档，指标内嵌数组）；`ingest_log` 是**已入库目录台账**，用于区分哪些 timestamp 目录已处理、哪些未处理。
+两张表。`test_runs` 每行 = 一次完整测试（一张 result.csv + 其 metadata.json，D18/方案 A：一次测试=一行，指标以 JSON 列内嵌）；`ingest_log` 是**已入库目录台账**，用于区分哪些 timestamp 目录已处理、哪些未处理。
 
-### 6.1 `test_runs` 集合
+数据库为单文件（`database.path`，默认 `/data/autores.db`），建库建表建索引全部由代码启动时自动完成（幂等），零人工初始化。**文件须放本地磁盘，不要放 NAS**——网络文件系统上 SQLite 锁不可靠。
 
-```jsonc
-{
-  "_id": "20260708_143000",            // 直接用 timestamp 目录名作主键（天然唯一，即 source_dir）
-  "run_timestamp": ISODate("2026-07-08T14:30:00"),  // 由目录名解析
+### 6.1 `test_runs` 表
 
-  // ── 元信息维度 ──
-  "model": "GLM-4.5",
-  "model_version": "distributed2",
-  "framework": "sglang",               // sglang | vllm
-  "framework_version": "0.4.6",        // 落盘入参手动传（P4 已定）
-  "gpu_type": "H20-141G",              // 来自 --gpu-type
-  "launch_cmd": "python -m sglang.launch_server --tp-size 8 ...",  // 原文，溯源
+```sql
+CREATE TABLE test_runs (
+    run_id            TEXT PRIMARY KEY,   -- = timestamp 目录名（天然唯一，即 source_dir）
+    run_timestamp     TEXT NOT NULL,      -- 由目录名解析，ISO 8601
 
-  // ── 结构化启动参数（D18：高频对比维度平铺为顶层字段，可直接 filter）──
-  "params": {
-    "tp": 8, "dp": 1, "pp": 1, "ep": 1, "cp": 1,
-    "kv_cache_dtype": "auto",
-    "hicache_enabled": true,
-    "flexkv_enabled": false,
-    "torch_compile": false,
-    "quantization": null,
-    "attention_backend": null
-  },
+    -- ── 元信息维度 ──
+    model             TEXT NOT NULL,
+    model_version     TEXT NOT NULL,
+    framework         TEXT NOT NULL,      -- sglang | vllm
+    framework_version TEXT NOT NULL,      -- 落盘入参手动传（P4 已定）
+    gpu_type          TEXT NOT NULL,      -- 来自 --gpu-type
+    launch_cmd        TEXT NOT NULL,      -- 原文，溯源
 
-  // ── 框架专属细节 + 未识别参数（对应原 JSONB）──
-  "extra": {
-    "hicache_ratio": 2.0,
-    "hicache_write_policy": "write_through"
-  },
+    -- ── 结构化启动参数：独立列（D18，高频对比维度可直接 WHERE）──
+    tp INTEGER, dp INTEGER, pp INTEGER, ep INTEGER, cp INTEGER,
+    kv_cache_dtype    TEXT,
+    hicache_enabled   INTEGER,            -- 0/1，读出时还原 bool
+    flexkv_enabled    INTEGER,
+    torch_compile     INTEGER,
+    quantization      TEXT,
+    attention_backend TEXT,
 
-  // ── 指标内嵌数组（方案 A：每个 (输入长度,并发) 组合一个元素）──
-  "metrics": [
-    {
-      "input_length": 1024, "concurrency": 32,
-      "Request_Throughput": 12.5, "Output_Throughput": 3200.0, "Total_Throughput": 4100.0,
-      "Input_Throughput": 900.0,
-      "TTFT_Mean_ms": 85.2, "TTFT_Median_ms": 80.1, "TTFT_P95_ms": 120.3, "TTFT_P99_ms": 140.0,
-      "TPOT_Mean_ms": 15.1, "TPOT_Median_ms": 14.8, "TPOT_P95_ms": 18.0, "TPOT_P99_ms": 20.2,
-      "ITL_Mean_ms": 14.9, "ITL_Median_ms": 14.5, "ITL_P95_ms": 17.5, "ITL_P99_ms": 19.8,
-      "E2E_Mean_ms": 2100.0, "E2E_Median_ms": 2050.0, "E2E_P95_ms": 2400.0, "E2E_P99_ms": 2600.0,
-      "Completed": 500, "Total_Input_Tokens": 512000, "Total_Output_Tokens": 128000
-    }
-    // ... 每个输入长度×并发组合一条
-  ],
+    -- ── 框架专属细节 + 未识别参数 ──
+    extra             TEXT NOT NULL DEFAULT '{}',   -- JSON
 
-  "created_at": ISODate("2026-07-08T14:35:12")
-}
+    -- ── 指标内嵌（方案 A）：JSON 数组，每个 (输入长度,并发) 组合一个元素 ──
+    -- 形如 [{"input_length":1024,"concurrency":32,"Output_Throughput":3200.0,...}, ...]
+    -- 查询只按上面的维度列筛选，metrics 整列取出后在 Python 侧透视（§7.4），无需拆表
+    metrics           TEXT NOT NULL,      -- JSON
+
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX idx_test_runs_dims     ON test_runs (model, framework, framework_version, gpu_type);
+CREATE INDEX idx_test_runs_parallel ON test_runs (tp, dp, pp, ep, cp);
 ```
 
-**索引**（`db/client.py` 启动时确保）：
+代码层保留"文档 dict"形态作为内部契约：`db/schema.py` 提供表行 ↔ dict 互转（params 子对象在读出时由参数列重组），下游对齐/工具/Agent 逻辑与存储引擎解耦——这正是本次从 MongoDB 平滑切换到 SQLite 只动 db 层的原因。
 
-- `_id` 天然唯一（= 目录名），承担幂等去重职责，无需额外唯一约束。
-- 复合索引 `{model:1, framework:1, framework_version:1, gpu_type:1}` —— 元信息维度筛选主路径。
-- 复合索引 `{"params.tp":1, "params.dp":1, "params.pp":1, "params.ep":1, "params.cp":1}` —— 并行度对比。
-- 指标筛选（input_length/concurrency）走内嵌数组，查询时用 `$elemMatch` / 聚合 `$unwind`，量级小不建额外索引。
+### 6.2 `ingest_log` 表（已入库/未入库追踪，D19）
 
-### 6.2 `ingest_log` 集合（已入库/未入库追踪，D19）
+这是"哪些目录已入库、哪些未入库"的核心机制：
 
-这是你问的"哪些目录已入库、哪些未入库"的核心机制：
-
-```jsonc
-{
-  "_id": "20260708_143000",            // = timestamp 目录名
-  "ingested_at": ISODate("2026-07-08T14:35:12")
-}
+```sql
+CREATE TABLE ingest_log (
+    source_dir  TEXT PRIMARY KEY,   -- = timestamp 目录名
+    run_id      TEXT,
+    ingested_at TEXT NOT NULL
+);
 ```
 
 **判定逻辑**（§5.5 Scanner 每轮执行）：
 
 1. 列出 NAS 根目录下所有时间戳格式子目录，得到集合 `on_disk`。
-2. 查 `ingest_log` 所有 `_id`，得到已入库集合 `ingested`。
+2. 查 `ingest_log` 所有 `source_dir`，得到已入库集合 `ingested`。
 3. **待处理 = `on_disk` − `ingested`**，逐个解析入库。
-4. 单目录成功后，**先写 `test_runs` 文档，再写 `ingest_log` 记录**（单节点无事务，D-P6：不用多文档事务）。两步之间即便崩溃也安全——`test_runs._id` 与 `ingest_log._id` 都是目录名，重跑时 `insert_one` 因 `_id` 冲突被拒，不会产生重复数据。
+4. 单目录成功后，**先写 `test_runs` 行，再写 `ingest_log` 记录**。两步之间即便崩溃也安全——两表主键都是目录名，重跑时 `INSERT` 因主键冲突被拒，不会产生重复数据。
 5. **失败即不写 ingest_log**（D19）——该目录下轮扫描自然重新出现在"待处理"集合里，自动重试。因此 `ingest_log` 里存在 = 已成功入库，不存在 = 未入库（含从未处理和处理失败两种，行为上都会被下轮重试）。
 
-> **崩溃边界**：若"写完 test_runs、还没写 ingest_log"时崩溃，下轮该目录仍被视为未入库、重新处理；此时 `test_runs` 的 `insert_one` 因 `_id` 已存在而报 DuplicateKey，Scanner 捕获该异常视为"已入库"，补写 ingest_log 即可。逻辑简单且无需事务。
+> **崩溃边界**：若"写完 test_runs、还没写 ingest_log"时崩溃，下轮该目录仍被视为未入库、重新处理；此时 `test_runs` 的 `INSERT` 因主键已存在报 `IntegrityError`，Scanner 捕获该异常视为"已入库"，补写 ingest_log 即可。（SQLite 本可把两条 INSERT 放同一事务一步到位，此处保留双主键幂等逻辑，与存储引擎无关、可移植。）
 
-> 为什么单列 `ingest_log` 而不直接查 `test_runs` 是否有该 `_id`？两者 `_id` 一致，理论上查 `test_runs` 也能判定。单列 `ingest_log` 的好处：① 台账极轻量（只有目录名+时间），扫描比对快；② 语义清晰，未来若要记录"处理但主动跳过"（如空目录）可扩展字段而不污染数据集合。**若想极简，也可省去 ingest_log，直接以 `test_runs` 是否含该 `_id` 判定**——这是可选的简化，见 §12 P6。
+> 为什么单列 `ingest_log` 而不直接查 `test_runs` 是否有该主键？两者主键一致，理论上查 `test_runs` 也能判定。单列 `ingest_log` 的好处：① 台账极轻量，扫描比对快；② 语义清晰，未来若要记录"处理但主动跳过"（如空目录）可扩展字段而不污染数据表。
 
 **几点说明**：
 
-- `_id` 用目录名，既是主键又是幂等键，重复入库因 `_id` 冲突而被 Mongo 拒绝（`insert` 报 DuplicateKey），天然防重。
+- **并发模型**：连接开 WAL 模式（一写多读），Scanner 容器写、API 容器读，两容器共享同一 data 卷（同宿主机本地盘）；进程内所有 DB 操作经锁串行化。单节点、量小，无需更重的并发方案。
 - `gpu_type` 合并了原设计的 gpu_model + gpu_version（落盘只收单一 `--gpu-type` 字段）。
-- 会话与报告不持久化（D13），因此**没有** conversation / report 集合。
+- 会话与报告不持久化（D13），因此**没有** conversation / report 表。
 
 ---
 
@@ -353,13 +339,13 @@ AutoRes/
 
 ```
 用户消息 ──► [阶段一：LLM 工具循环]                [阶段二：确定性流水线]
-             理解意图、拉取库内维度值、             QuerySpec ─► MongoDB 查询/聚合
+             理解意图、拉取库内维度值、             QuerySpec ─► SQLite 查询
              模糊对齐、发现歧义则反问用户、    ──►   ─► 数据对齐（内嵌指标→宽表）
              最终产出一份结构化 QuerySpec           ─► openpyxl 渲染 Excel
                                                    ─► 返回下载链接
 ```
 
-关键原则：**LLM 只产出"查什么"（QuerySpec），永远不接触"查到的数"**。指标数值从 MongoDB 到 Excel 全程由代码搬运，杜绝 LLM 幻觉污染报告数据。
+关键原则：**LLM 只产出"查什么"（QuerySpec），永远不接触"查到的数"**。指标数值从 SQLite 到 Excel 全程由代码搬运，杜绝 LLM 幻觉污染报告数据。
 
 ### 7.2 阶段一：LLM 工具循环
 
@@ -370,7 +356,7 @@ AutoRes/
 | 工具 | 入参 | 返回 | 用途 |
 |------|------|------|------|
 | `list_dimension_values` | `dimension`（枚举：model / model_version / framework / framework_version / gpu_type / tp / dp / pp / ep / cp / kv_cache_dtype / hicache_enabled / flexkv_enabled / metric_name），可选 `filters`（其他维度的等值约束） | 库内该维度的去重值列表 + 各值的记录数 | 归一化对齐（D14）：用户说"4090"，LLM 拉取 gpu_type 实际值后自行对齐到"NVIDIA RTX 4090"；也用于澄清时向用户列候选 |
-| `count_matching_runs` | 一组维度等值/排除条件 | 命中的文档数量 + 若数量 ≤ 20 则附简要清单（目录名、时间戳、各维度值） | 提交前预检：0 条 → 告知用户没有该数据；数量过多 → 提示用户可加约束或排除某维度值（D21） |
+| `count_matching_runs` | 一组维度等值/排除条件 | 命中的记录数量 + 若数量 ≤ 20 则附简要清单（目录名、时间戳、各维度值） | 提交前预检：0 条 → 告知用户没有该数据；数量过多 → 提示用户可加约束或排除某维度值（D21） |
 | `submit_query_spec` | 完整 QuerySpec（见 7.3） | 校验结果；通过则触发阶段二 | 工具循环的**唯一出口**；后端对 spec 做严格 schema 校验，非法则把错误回给 LLM 修正 |
 
 **System prompt 要点**（`prompts.py`，设计要求而非全文）：
@@ -412,7 +398,7 @@ AutoRes/
 
 ### 7.4 阶段二：确定性报告流水线
 
-1. **查询**：QuerySpec → MongoDB `find`/聚合，取出匹配的 `test_runs` 文档（含内嵌 metrics）。filters/compare_values/exclude 转为 `$match` 条件；metric_filters（输入长度/并发）用 `$unwind` + `$match` 展开内嵌数组后筛选。
+1. **查询**：QuerySpec → SQL `SELECT ... WHERE`，取出匹配的 `test_runs` 行（含 metrics JSON 列）。filters/compare_values 转为 `=`/`IN` 条件、exclude 转为 `NOT IN`（NULL 值不被误杀）；metric_filters（输入长度/并发）在取出后于 Python 侧过滤内嵌指标数组。
 2. **取最新（D20）**：结果按"除时间戳外所有维度组合"分组，每组取 `run_timestamp` 最大者。**不同框架版本、不同框架各自成组，全部保留**——不会因版本不同被误合并。
 3. **对齐**：把各文档的内嵌指标透视为宽表 —— **行 = 指标（含输入长度/并发维度），列 = 对比轴的各个取值**；某组合缺某指标时该单元格填 `N/A`（不留空，明确表达"无数据"）。
 4. **渲染**（纯数据对比表，D12）：单个 sheet；首行标题区注明约束项（如"模型: GLM-4.5 | 框架: sglang | TP: 8"），随后是对比表；仅做基础可读性格式（表头加粗、冻结首行首列、列宽自适应），不加图表、不加结论。
@@ -464,10 +450,9 @@ llm:                                  # ← 使用方重点填写（D2）
   timeout_seconds: 60
   max_tool_rounds: 8
 
-database:                             # ← 公司已有 MongoDB 实例，填连接串即可（D3）
-  uri: "mongodb://user:pass@your-mongo-host:27017/?authSource=admin"
-  db_name: "autores"
-  # 集合名固定：test_runs、ingest_log（代码内常量，无需配置）
+database:                             # ← SQLite 单文件，零部署（D3）
+  path: "/data/autores.db"            # 放本地磁盘（勿放 NAS）；文件不存在自动创建
+  # 表名固定：test_runs、ingest_log（代码内常量，无需配置）
 
 scanner:
   benchmark_root: "/mnt/nas/benchmark_root"   # NAS 挂载点（对应测试人员落盘的 --nas-dir）
@@ -494,14 +479,14 @@ report:
 
 ### 10.1 docker-compose 编排（D9）
 
-**两个服务**（MongoDB 用公司已有实例，不在 compose 内起容器，D3）：
+**两个服务**（数据库为 SQLite 单文件，无独立数据库容器，D3）：
 
 | 服务 | 镜像 | 说明 |
 |------|------|------|
-| `scanner` | 项目镜像，入口 `python -m autores.scanner.main` | 挂载 NAS 目录（只读）+ config.yaml；连公司 Mongo |
-| `api` | 同一项目镜像，入口 `uvicorn autores.server.main:app` | 暴露 8080；挂载 config.yaml + 报告临时卷；连公司 Mongo |
+| `scanner` | 项目镜像，入口 `python -m autores.scanner.main` | 挂载 NAS 目录（只读）+ config.yaml + 共享 `data` 卷（写 SQLite） |
+| `api` | 同一项目镜像，入口 `uvicorn autores.server.main:app` | 暴露 8080；挂载 config.yaml + 共享 `data` 卷（读 SQLite + 写报告目录） |
 
-scanner 与 api 用同一 Dockerfile 构建的同一镜像，仅入口命令不同（D9：同库两进程）。MongoDB 无需建表，两进程启动时各自 `create_index`（幂等）确保 §6.1 的索引存在即可。前置要求：公司 Mongo 实例需从本服务器网络可达，并预先创建好 `autores` 库与读写账号。
+scanner 与 api 用同一 Dockerfile 构建的同一镜像，仅入口命令不同（D9：同库两进程）。两容器共享同一个 `data` 命名卷（同宿主机本地盘），SQLite 开 WAL 模式支持 scanner 写 + api 读并存。建库建表建索引由进程启动时自动完成（幂等），零人工初始化，无任何外部数据库依赖。
 
 ### 10.2 运行要求
 
@@ -543,14 +528,14 @@ scanner 与 api 用同一 Dockerfile 构建的同一镜像，仅入口命令不�
 | P3 | 新增建议指标 | 你 | §5.2 CSV 列 | ✅ 已定：纳入 Completed / Total_Input_Tokens / Total_Output_Tokens / P95（不含 Duration_s） |
 | P4 | framework_version 获取方式 | 你 | §5.3 metadata | ✅ 已定：**入参手动传** `--framework-version` |
 | P5 | 提供 LLM 端点地址/模型名（部署时填 config，不阻塞开发） | 产品负责人 | 仅部署 | ⏳ 待部署 |
-| P6 | Mongo 部署形态 | 你 | §6.2 写入逻辑、部署 | ✅ 已定：**单节点**、无事务、Scanner 单进程串行处理；靠 `_id` 幂等去重，本设计不依赖多文档事务。仅需提供连接串与 `autores` 库读写账号 |
+| P6 | 数据库部署形态 | 你 | §6.2 写入逻辑、部署 | ✅ 已定：**SQLite 单文件**（先后经 PostgreSQL → 公司 Mongo → SQLite 收敛），Scanner 单进程串行处理，主键幂等去重；零外部依赖，无需任何数据库账号/实例 |
 
 ---
 
 ## 13. 后续里程碑建议
 
 1. **M0 落盘脚本**：改造 `to_csv.py`（`--framework`/`--nas-dir`/`--gpu-type`/`--launch-cmd` 等入参、双框架字段映射、启动参数提取、生成 timestamp 目录 + result.csv + metadata.json）——本轮即可动工；
-2. **M1 数据管道**：Mongo 连接/索引初始化 + Scanner 主循环（含 ingest_log 已入库判定）+ 解析器（面向 M0 固定 schema），用真实历史目录回灌验证；
+2. **M1 数据管道**：SQLite 建库建表 + Scanner 主循环（含 ingest_log 已入库判定）+ 解析器（面向 M0 固定 schema），用真实历史目录回灌验证；
 3. **M2 报告流水线**：QuerySpec（含 exclude）→ 查询 → 取最新 → 对齐 → Excel，先用硬编码 spec 测试产出正确性；
 4. **M3 Agent 循环**：接 LLM、三工具、澄清/排除/取数策略，串通 `/api/chat` SSE；
 5. **M4 前端与部署**：单文件 chatbot 页面、docker-compose、内网上线试运行。

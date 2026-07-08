@@ -1,13 +1,13 @@
 # AutoRes — 性能测试结果管理与报告 Agent
 
-自动采集 sglang / vllm 的性能测试结果入库，并通过 Web chatbot 用自然语言按需生成 Excel 对比报告。
+自动采集 sglang / vllm 的性能测试结果入库（SQLite），并通过 Web chatbot 用自然语言按需生成 Excel 对比报告。
 
 完整设计见 [docs/design.md](docs/design.md)。
 
 ## 组成
 
 - **落盘脚本** `to_csv.py`（也在 `tools/`）：测试人员本机运行，把 bench 输出整理为 `result.csv` + `metadata.json`，写入 NAS 时间戳目录。
-- **Scanner**（`autores/scanner/`）：定时扫描 NAS，解析入库 MongoDB。
+- **Scanner**（`autores/scanner/`）：定时扫描 NAS，解析入库 SQLite。
 - **API + 前端**（`autores/server/` + `frontend/index.html`）：LLM Agent 理解需求、确定性流水线生成 Excel、SSE 推送、前端下载。
 
 ## 快速开始
@@ -30,8 +30,8 @@ vllm 场景需额外传 `--bench-cmd`（用于补 `--random-input-len`），且 
 ### 2. 部署服务
 
 ```bash
-cp config.example.yaml config.yaml   # 填写 llm 端点、mongo 连接串、NAS 路径
-docker compose up -d                 # 起 scanner + api（MongoDB 用公司已有实例）
+cp config.example.yaml config.yaml   # 填写 llm 端点、NAS 路径（SQLite 零配置）
+docker compose up -d                 # 起 scanner + api，数据库为共享卷上的 SQLite 单文件
 ```
 
 前端访问 `http://<服务器>:8080/`。

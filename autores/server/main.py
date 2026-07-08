@@ -37,7 +37,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="AutoRes 性能测试报告 Agent", lifespan=_lifespan)
 
-    db = dbc.connect(cfg.database, ensure_indexes=True)
+    db = dbc.connect(cfg.database)
     reports = ReportStore(cfg.report.ttl_minutes)
     sessions = SessionStore(cfg.session.ttl_minutes, cfg.session.max_messages)
     agent = Agent(

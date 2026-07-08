@@ -32,7 +32,7 @@ def health(request: Request):
     status = {"status": "ok"}
     # DB 连通性
     try:
-        app.db.command("ping")
+        app.db.ping()
         status["db"] = "ok"
     except Exception as e:  # noqa: BLE001
         status["db"] = f"error: {e}"

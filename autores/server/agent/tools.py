@@ -4,15 +4,16 @@ Agent 工具（design.md §7.2）。三个工具，刻意保持最小集：
   - count_matching_runs   : 提交前预检命中数量
   - submit_query_spec     : 工具循环唯一出口，触发报告流水线
 
-工具的 JSON Schema 供 LLM function-calling 使用；实现直接读 Mongo。
+工具的 JSON Schema 供 LLM function-calling 使用；实现直接查 SQLite。
 """
 from __future__ import annotations
 
-from typing import Any
-
-from autores.db import client as dbc
 from autores.db import schema
-from autores.server.report.query import QuerySpec, QuerySpecError, build_match
+from autores.server.report.query import (
+    QuerySpec,
+    QuerySpecError,
+    build_conditions,
+)
 
 # ── 工具的 OpenAI function-calling 定义 ──
 
@@ -118,48 +119,23 @@ def list_dimension_values(db, dimension: str, filters: dict | None = None) -> di
     if dimension not in schema.ALL_DIMENSIONS:
         return {"error": f"未知维度: {dimension}", "valid_dimensions": schema.ALL_DIMENSIONS}
 
-    field_path = schema.dimension_field_path(dimension)
-    match: dict[str, Any] = {}
-    if filters:
-        for dim, val in filters.items():
-            if dim in schema.ALL_DIMENSIONS:
-                match[schema.dimension_field_path(dim)] = (
-                    {"$in": val} if isinstance(val, list) else val
-                )
-
-    pipeline = []
-    if match:
-        pipeline.append({"$match": match})
-    pipeline.append({"$group": {"_id": f"${field_path}", "count": {"$sum": 1}}})
-    pipeline.append({"$sort": {"count": -1}})
-
-    results = list(dbc.test_runs(db).aggregate(pipeline))
-    values = [{"value": r["_id"], "count": r["count"]} for r in results]
+    valid_filters = {k: v for k, v in (filters or {}).items()
+                     if k in schema.ALL_DIMENSIONS}
+    where_sql, params = build_conditions(valid_filters)
+    values = db.dimension_values(dimension, where_sql, params)
     return {"dimension": dimension, "values": values}
 
 
 def count_matching_runs(db, filters: dict, exclude: dict | None = None) -> dict:
-    match: dict[str, Any] = {}
-    for dim, val in (filters or {}).items():
+    for dim in list(filters or {}) + list(exclude or {}):
         if dim not in schema.ALL_DIMENSIONS:
             return {"error": f"未知维度: {dim}"}
-        match[schema.dimension_field_path(dim)] = (
-            {"$in": val} if isinstance(val, list) else val
-        )
-    for dim, vals in (exclude or {}).items():
-        if dim not in schema.ALL_DIMENSIONS:
-            return {"error": f"未知维度: {dim}"}
-        path = schema.dimension_field_path(dim)
-        vals_list = vals if isinstance(vals, list) else [vals]
-        if path in match and isinstance(match[path], dict):
-            match[path]["$nin"] = vals_list
-        else:
-            match[path] = {"$nin": vals_list}
 
-    count = dbc.test_runs(db).count_documents(match)
-    result: dict[str, Any] = {"count": count}
+    where_sql, params = build_conditions(filters or {}, exclude)
+    count = db.count_runs(where_sql, params)
+    result: dict = {"count": count}
     if 0 < count <= 20:
-        docs = dbc.test_runs(db).find(match, {"metrics": 0, "extra": 0}).limit(20)
+        docs = db.fetch_runs(where_sql, params)
         result["runs"] = [
             {
                 "_id": d["_id"],

@@ -1,5 +1,5 @@
 """
-QuerySpec → MongoDB 查询（design.md §7.3、§7.4 步骤 1-2）。
+QuerySpec → SQLite 查询（design.md §7.3、§7.4 步骤 1-2）。
 
 QuerySpec 结构：
 {
@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from autores.db import client as dbc
 from autores.db import schema
 
 
@@ -59,39 +58,51 @@ class QuerySpec:
         # 注意：compare_on 允许出现在 exclude 中——即"在该轴上对比、但排除某些取值"（D21）。
 
 
-def _eq_or_in(value: Any):
-    """标量 → 等值；列表 → $in。"""
-    if isinstance(value, list):
-        return {"$in": value}
-    return value
+def build_conditions(filters: dict, exclude: dict | None = None) -> tuple[str, list]:
+    """
+    维度等值/排除条件 → (WHERE 子句, 参数列表)。
+    列名全部经 dimension_column 白名单校验，可安全拼接。
+    """
+    clauses: list[str] = []
+    params: list = []
+
+    for dim, val in (filters or {}).items():
+        col = schema.dimension_column(dim)
+        if isinstance(val, list):
+            placeholders = ", ".join("?" for _ in val)
+            clauses.append(f"{col} IN ({placeholders})")
+            params.extend(val)
+        else:
+            clauses.append(f"{col} = ?")
+            params.append(val)
+
+    for dim, vals in (exclude or {}).items():
+        col = schema.dimension_column(dim)
+        vals_list = vals if isinstance(vals, list) else [vals]
+        placeholders = ", ".join("?" for _ in vals_list)
+        # NULL 值不应被排除条件误杀（NOT IN 遇 NULL 恒为 NULL）
+        clauses.append(f"({col} NOT IN ({placeholders}) OR {col} IS NULL)")
+        params.extend(vals_list)
+
+    return " AND ".join(clauses), params
 
 
-def build_match(spec: QuerySpec) -> dict:
-    """QuerySpec 的维度条件 → Mongo $match 文档。"""
-    match: dict[str, Any] = {}
-
-    for dim, val in spec.filters.items():
-        match[schema.dimension_field_path(dim)] = _eq_or_in(val)
+def build_where(spec: QuerySpec) -> tuple[str, list]:
+    """完整 QuerySpec → (WHERE 子句, 参数列表)。"""
+    filters = dict(spec.filters)
+    where_sql, params = build_conditions(filters, spec.exclude)
 
     if spec.compare_values:
-        match[schema.dimension_field_path(spec.compare_on)] = {"$in": spec.compare_values}
+        col = schema.dimension_column(spec.compare_on)
+        placeholders = ", ".join("?" for _ in spec.compare_values)
+        clause = f"{col} IN ({placeholders})"
+        where_sql = f"{where_sql} AND {clause}" if where_sql else clause
+        params.extend(spec.compare_values)
 
-    for dim, vals in spec.exclude.items():
-        path = schema.dimension_field_path(dim)
-        if path in match and isinstance(match[path], dict) and "$in" in match[path]:
-            # 同一维度既 in 又 nin：取差集语义，追加 $nin
-            match[path]["$nin"] = vals
-        else:
-            match[path] = {"$nin": vals if isinstance(vals, list) else [vals]}
-
-    return match
+    return where_sql, params
 
 
 def run_query(db, spec: QuerySpec) -> list[dict]:
-    """执行查询，返回匹配的 test_runs 文档（含内嵌 metrics）。"""
-    match = build_match(spec)
-    return list(dbc.test_runs(db).find(match))
-
-
-def count_query(db, match: dict) -> int:
-    return dbc.test_runs(db).count_documents(match)
+    """执行查询，返回匹配的测试记录（文档形态，含 metrics）。"""
+    where_sql, params = build_where(spec)
+    return db.fetch_runs(where_sql, params)

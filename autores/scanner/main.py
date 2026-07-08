@@ -2,31 +2,21 @@
 Scanner 主循环（进程 A，design.md §5.5）。
 
 每轮：发现待处理目录 → 逐个解析入库 → 成功写 ingest_log；失败跳过、下轮重试。
-单节点、无事务，靠 _id 幂等去重。
+单节点 SQLite、无跨表事务依赖，靠 run_id 主键幂等去重。
 """
 from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timezone
-
-from pymongo.errors import DuplicateKeyError
 
 from autores.config import get_config
 from autores.common.logging import setup_logging, get_logger
 from autores.db import client as dbc
+from autores.db.client import DuplicateRunError
 from autores.scanner import discovery
 from autores.scanner.parser import parse_run_dir, ParseError
 
 log = get_logger("scanner")
-
-
-def _mark_ingested(db, dir_name: str, run_id: str) -> None:
-    dbc.ingest_log(db).update_one(
-        {"_id": dir_name},
-        {"$set": {"ingested_at": datetime.now(timezone.utc), "run_id": run_id}},
-        upsert=True,
-    )
 
 
 def ingest_dir(db, root: str, dir_name: str) -> bool:
@@ -41,17 +31,17 @@ def ingest_dir(db, root: str, dir_name: str) -> bool:
         return False
 
     try:
-        dbc.test_runs(db).insert_one(doc)
-    except DuplicateKeyError:
+        db.insert_run(doc)
+    except DuplicateRunError:
         # 崩溃边界（§6.2）：test_runs 已写、ingest_log 没写。视为已入库，补写台账。
-        log.info("文档已存在，补写台账", extra={"fields": {"dir": dir_name}})
-        _mark_ingested(db, dir_name, doc["_id"])
+        log.info("记录已存在，补写台账", extra={"fields": {"dir": dir_name}})
+        db.mark_ingested(dir_name, doc["_id"])
         return True
-    except Exception as e:  # noqa: BLE001 —— 其余异常（网络等）也跳过、下轮重试
+    except Exception as e:  # noqa: BLE001 —— 其余异常（磁盘等）也跳过、下轮重试
         log.error("入库失败，跳过（下轮重试）", extra={"fields": {"dir": dir_name, "error": str(e)}})
         return False
 
-    _mark_ingested(db, dir_name, doc["_id"])
+    db.mark_ingested(dir_name, doc["_id"])
     log.info("入库成功", extra={"fields": {"dir": dir_name, "metrics": len(doc["metrics"])}})
     return True
 
@@ -73,7 +63,7 @@ def scan_once(db, root: str, pattern: str) -> tuple[int, int, int]:
 def run() -> None:
     setup_logging()
     cfg = get_config()
-    db = dbc.connect(cfg.database, ensure_indexes=True)
+    db = dbc.connect(cfg.database)
     root = cfg.scanner.benchmark_root
     pattern = cfg.scanner.dir_pattern
     interval = cfg.scanner.interval_seconds

@@ -1,5 +1,6 @@
 # 两个服务：scanner（数据管道）+ api（报告服务）。
-# MongoDB 用公司已有实例，不在此编排（design.md D3 / §10.1）。
+# 数据库为 SQLite 单文件（/data/autores.db），两容器共享同一 data 卷（同宿主机，
+# WAL 模式支持 scanner 写 + api 读）。design.md D3 / §10.1。
 services:
   scanner:
     build: .
@@ -7,6 +8,7 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - /mnt/nas/benchmark_root:/mnt/nas/benchmark_root:ro   # NAS 只读挂载
+      - data:/data                     # SQLite 数据库文件
     restart: unless-stopped
 
   api:
@@ -16,8 +18,8 @@ services:
       - "8080:8080"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - reports:/data/reports          # 报告临时卷
+      - data:/data                     # SQLite 数据库文件 + /data/reports 报告目录
     restart: unless-stopped
 
 volumes:
-  reports:
+  data:

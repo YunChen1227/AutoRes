@@ -9,10 +9,9 @@ llm:                                  # 使用方重点填写（design.md D2）
   timeout_seconds: 60
   max_tool_rounds: 8
 
-database:                             # 公司已有 MongoDB 实例（单节点即可）
-  uri: "mongodb://user:pass@your-mongo-host:27017/?authSource=admin"
-  db_name: "autores"
-  # 集合名固定：test_runs、ingest_log（代码内常量）
+database:                             # SQLite 单文件数据库，零部署
+  path: "/data/autores.db"            # 放本地磁盘（勿放 NAS，网络文件系统上锁不可靠）
+  # 表名固定：test_runs、ingest_log（代码内常量）；文件不存在时自动创建
 
 scanner:
   benchmark_root: "/mnt/nas/benchmark_root"   # NAS 挂载点（= 测试人员落盘 --nas-dir）

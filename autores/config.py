@@ -20,8 +20,7 @@ class LLMConfig:
 
 @dataclass
 class DatabaseConfig:
-    uri: str = "mongodb://localhost:27017"
-    db_name: str = "autores"
+    path: str = "/data/autores.db"   # SQLite 数据库文件路径（本地磁盘，勿放 NAS）
 
 
 @dataclass
