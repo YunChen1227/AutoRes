@@ -1,0 +1,2 @@
+# Shell 脚本必须保持 LF 行尾，否则 Linux 上执行会因 CRLF 报错（如 $'\r': command not found）。
+*.sh text eol=lf

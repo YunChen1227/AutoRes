@@ -10,8 +10,9 @@ llm:                                  # 使用方重点填写（design.md D2）
   max_tool_rounds: 8
 
 database:                             # SQLite 单文件数据库，零部署
-  path: "/data/autores.db"            # 放本地磁盘（勿放 NAS，网络文件系统上锁不可靠）
-  # 表名固定：test_runs、ingest_log（代码内常量）；文件不存在时自动创建
+  path: "var/data/autores.db"         # 放本地磁盘（勿放 NAS，网络文件系统上锁不可靠）
+  # 裸机部署默认落在项目目录下的 var/data/（无需 root 权限）；
+  # 容器部署可改为 /data/autores.db 挂载卷。表名固定：test_runs、ingest_log；文件不存在时自动创建
 
 scanner:
   benchmark_root: "/mnt/nas/benchmark_root"   # NAS 挂载点（= 测试人员落盘 --nas-dir）
@@ -27,5 +28,5 @@ session:
   max_messages: 40
 
 report:
-  output_dir: "/data/reports"
+  output_dir: "var/data/reports"      # 同上，裸机默认项目内目录；容器部署可改 /data/reports
   ttl_minutes: 120

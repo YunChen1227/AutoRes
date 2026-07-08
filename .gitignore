@@ -4,5 +4,6 @@ __pycache__/
 venv/
 config.yaml
 /data/
+/var/
 *.egg-info/
 .pytest_cache/

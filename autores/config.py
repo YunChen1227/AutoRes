@@ -20,7 +20,7 @@ class LLMConfig:
 
 @dataclass
 class DatabaseConfig:
-    path: str = "/data/autores.db"   # SQLite 数据库文件路径（本地磁盘，勿放 NAS）
+    path: str = "var/data/autores.db"   # SQLite 数据库文件路径（本地磁盘，勿放 NAS）
 
 
 @dataclass
@@ -44,7 +44,7 @@ class SessionConfig:
 
 @dataclass
 class ReportConfig:
-    output_dir: str = "/data/reports"
+    output_dir: str = "var/data/reports"
     ttl_minutes: int = 120
 
 
