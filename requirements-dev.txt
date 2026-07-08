@@ -1,0 +1,4 @@
+# 开发/测试依赖（生产不需要）
+-r requirements.txt
+mongomock>=4.1     # 内存 MongoDB，无需真实实例即可跑测试
+httpx>=0.27        # FastAPI TestClient 依赖
