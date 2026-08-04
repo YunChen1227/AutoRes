@@ -5,7 +5,20 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$REPO_ROOT/var/run"
-HEALTH_URL="${AUTORES_HEALTH_URL:-http://127.0.0.1:8080/api/health}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+CONFIG_PATH="${AUTORES_CONFIG:-$REPO_ROOT/config.yaml}"
+
+# 与 start.sh 一致：默认跟 config.yaml 的 server.port，可用 AUTORES_HEALTH_URL 覆盖
+if [ -n "${AUTORES_HEALTH_URL:-}" ]; then
+    HEALTH_URL="$AUTORES_HEALTH_URL"
+else
+    SERVER_PORT="$("$PYTHON_BIN" -c "
+import sys; sys.path.insert(0, '$REPO_ROOT')
+from autores.config import load_config
+print(load_config('$CONFIG_PATH').server.port)
+" 2>/dev/null || echo 8080)"
+    HEALTH_URL="http://127.0.0.1:${SERVER_PORT}/api/health"
+fi
 
 check_one() {
     local name="$1" pidfile="$2"

@@ -15,7 +15,8 @@ LOG_DIR="$REPO_ROOT/var/log"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 export PYTHONIOENCODING=utf-8
 CONFIG_PATH="${AUTORES_CONFIG:-$REPO_ROOT/config.yaml}"
-HEALTH_URL="${AUTORES_HEALTH_URL:-http://127.0.0.1:8080/api/health}"
+# HEALTH_URL 默认从 config.yaml 的 server.port 推导（见下方启动 API 后）；
+# 仍可用环境变量 AUTORES_HEALTH_URL 覆盖。
 HEALTH_RETRIES="${HEALTH_RETRIES:-30}"   # 30 * 1s = 最多等 30 秒
 SCANNER_STARTUP_WAIT="${SCANNER_STARTUP_WAIT:-2}"
 
@@ -108,9 +109,12 @@ from autores.config import load_config
 c = load_config('$CONFIG_PATH').server
 print(f'{c.host}:{c.port}')
 ")"
+SERVER_PORT="${SERVER_HOST##*:}"
+# 健康检查始终打本机回环；config 里 host 可能是 0.0.0.0（绑定地址，不宜直接 curl）
+HEALTH_URL="${AUTORES_HEALTH_URL:-http://127.0.0.1:${SERVER_PORT}/api/health}"
 echo "[start] 启动 API ($SERVER_HOST)..."
 nohup "$PYTHON_BIN" -m uvicorn autores.server.main:app \
-    --host "${SERVER_HOST%%:*}" --port "${SERVER_HOST##*:}" \
+    --host "${SERVER_HOST%%:*}" --port "$SERVER_PORT" \
     >>"$LOG_DIR/api.log" 2>&1 &
 API_PID=$!
 echo "$API_PID" > "$RUN_DIR/api.pid"
@@ -158,5 +162,5 @@ cat /tmp/autores_health_check.json 2>/dev/null || true
 echo
 echo "[start] 全部服务已启动。Scanner PID=$SCANNER_PID  API PID=$API_PID"
 echo "[start] 日志目录: $LOG_DIR"
-echo "[start] 前端访问: http://<服务器IP>:${SERVER_HOST##*:}/"
+echo "[start] 前端访问: http://<服务器IP>:${SERVER_PORT}/"
 echo "[start] 停止服务请运行: scripts/stop.sh"
