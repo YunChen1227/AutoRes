@@ -105,73 +105,130 @@ def format_num(val):
 
 
 # ============================================================================
-# 2. 启动参数提取规则（§5.4）
-#    从 --launch-cmd 字符串解析并行度与开关，命令未写的按框架默认回填。
+# 2. 启动参数提取规则（§5.4，D17）
+#
+#    ⚠ 2026-08-04 重写：旧版在这里手写了两段并列的
+#    `if framework == "sglang" / elif "vllm"` 分支，外加一份必须手工同步的
+#    flag 白名单（_collect_known_flags）。问题有三：
+#      1. 默认值表与上游源码脱节，且 ep 语义写错（sglang 记 1、vllm 记 0，
+#         两边都是"没开 EP"却被当成有差异，每份报告都会出现假差异）；
+#      2. 同一个概念要在两段分支里各写一遍，容易只改一边；
+#      3. 白名单与解析分支必须手工保持一致，漏加就会把已支持的 flag
+#         误判成 unrecognized。
+#
+#    现在改为全部由 tools/param_map.py 的配对表驱动：flag 别名、默认值、
+#    语义类型（开关 vs 宽度、极性相反、量纲不同）都在那张表里，
+#    本文件只负责"按表解析"。新增参数改 param_map.py 一处即可，
+#    白名单由 known_flags() 自动派生，不再手工维护。
+#
+#    配对表的上游基线与校验方式见 param_map.py 顶部说明；
+#    升级 vllm/sglang 后请跑 `python tools/verify_param_map.py`。
 # ============================================================================
 
-# 框架默认值表（§5.4.1，源码核查）
-FRAMEWORK_DEFAULTS = {
-    "sglang": {
-        "tp": 1, "dp": 1, "pp": 1, "ep": 1, "cp": 1,
-        "kv_cache_dtype": "auto",
-        "hicache_enabled": False,
-        "flexkv_enabled": False,
-        "torch_compile": False,          # sglang 默认关，需 --enable-torch-compile
-        "quantization": None,
-        "attention_backend": None,       # 运行时按硬件自动选
-    },
-    "vllm": {
-        "tp": 1, "dp": 1, "pp": 1, "ep": 0, "cp": 1,  # ep 是开关，0/1
-        "kv_cache_dtype": "auto",
-        "hicache_enabled": False,        # vllm 无 hicache，映射 --kv-offloading-*
-        "flexkv_enabled": False,
-        "torch_compile": True,           # vllm 默认开（除非 --enforce-eager）
-        "quantization": None,
-        "attention_backend": None,
-    },
-}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import param_map as pm  # noqa: E402
 
 
-def _get_flag_value(tokens, flags):
+def _iter_flag_tokens(tokens):
     """
-    在 token 列表里找 flags 中任一 flag 的取值。
-    支持 "--flag value" 与 "--flag=value" 两种写法。返回 str 或 None。
+    遍历 token 列表，产出 (flag_name, value)。
+
+    支持三种写法：
+      --flag value  /  --flag=value  /  --flag（布尔开关，value 为 True）
+    布尔开关的判定：下一个 token 以 '-' 开头（或没有下一个）即视为无值。
+    注意负数值（如 -1）不算 flag，需放行给上一个 flag 当取值。
     """
-    for i, tok in enumerate(tokens):
-        for flag in flags:
-            if tok == flag:
-                if i + 1 < len(tokens):
-                    return tokens[i + 1]
-                return None
-            if tok.startswith(flag + "="):
-                return tok.split("=", 1)[1]
-    return None
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if not tok.startswith("-") or _looks_like_negative_number(tok):
+            i += 1
+            continue
+        name, sep, inline = tok.partition("=")
+        if sep:
+            yield name, inline
+            i += 1
+            continue
+        nxt = tokens[i + 1] if i + 1 < n else None
+        if nxt is not None and (not nxt.startswith("-") or _looks_like_negative_number(nxt)):
+            yield name, nxt
+            i += 2
+        else:
+            yield name, True
+            i += 1
 
 
-def _has_flag(tokens, flags):
-    """判断某个布尔开关 flag 是否出现（支持 --flag 与 --flag=true）。"""
-    for tok in tokens:
-        for flag in flags:
-            if tok == flag or tok.startswith(flag + "="):
-                return True
-    return False
+def _looks_like_negative_number(tok):
+    """'-1' / '-0.5' 是取值不是 flag；'-tp' 是 flag。"""
+    if not tok.startswith("-") or len(tok) < 2:
+        return False
+    return tok[1].isdigit() or (tok[1] == "." and len(tok) > 2 and tok[2].isdigit())
 
 
-def _to_int(val, default):
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return default
+def _resolve_flag(name, flag_to_key):
+    """
+    flag 名 → 配对表 key。
+
+    先精确匹配；未命中时按 argparse 前缀缩写规则兜底
+    （SGLang 的 --tp 就是 --tp-size 的缩写，官方 cookbook 里用了 400 次，
+    但它并非显式 alias，必须靠前缀匹配才能认出来）。
+    仅当唯一匹配时才接受，避免歧义缩写误判。
+    """
+    if name in flag_to_key:
+        return flag_to_key[name]
+    if not name.startswith("--"):
+        return None
+    hits = {k for f, k in flag_to_key.items() if f.startswith(name)}
+    return hits.pop() if len(hits) == 1 else None
+
+
+def _coerce(kind, raw):
+    """按配对表声明的语义类型把字符串取值转成合适的 Python 类型。"""
+    if raw is True:  # 裸开关
+        return True
+    if kind == pm.K_INT:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return raw
+    if kind == pm.K_FLOAT:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return raw
+    if kind in (pm.K_BOOL, pm.K_INVERTED, pm.K_SWITCH_WIDTH):
+        if isinstance(raw, str) and raw.lower() in ("true", "false"):
+            return raw.lower() == "true"
+        return raw
+    return raw
+
+
+# 解释器/启动噪声 flag，不算业务参数
+NOISE_FLAGS = {"-m", "-c", "-u"}
 
 
 def extract_launch_params(framework, launch_cmd):
     """
-    从启动命令字符串提取结构化参数。
-    返回 (params: dict, extra: dict)。
-    params 是入库顶层字段，extra 是框架专属细节 + 未识别项。
+    从启动命令字符串提取结构化参数（由 param_map.py 配对表驱动）。
+
+    返回 (params: dict, extra: dict)：
+      params  入库顶层字段，key 与 autores/db/schema.py:PARAM_DIMENSIONS 对齐
+      extra   命令里出现、但未提升为一等列的参数 + 未识别 flag
+
+    与旧版的行为差异（均为有意为之）：
+      * 只记录命令里**显式写了**的参数，不再用"框架默认值"回填。
+        原因：mem_fraction / chunked_prefill_size / max_running_requests 等
+        在 SGLang 侧是按 GPU 显存档位运行时推导的，没有固定标量默认值
+        （见 param_map.py 与 gpu_memory_presets.py）。回填一个假默认值
+        正是旧表"和实际值差异太大"的根因。未显式设置 → 该 key 不出现，
+        下游据此判断"用的是框架默认行为"，而不是拿到一个可能错的数字。
+      * ep 归一为 ep_enabled(bool) + ep_width(int|None)，
+        使 sglang 的 ep_size=1 与 vllm 的未开启 EP 比较结果一致。
+      * torch_compile / prefix_caching 这类极性相反的开关，
+        统一归一为"是否启用"，不再直接存裸 flag 语义。
     """
-    defaults = FRAMEWORK_DEFAULTS[framework]
-    params = dict(defaults)
+    params = {}
     extra = {}
 
     if not launch_cmd:
@@ -183,158 +240,57 @@ def extract_launch_params(framework, launch_cmd):
         # 命令里有不成对引号等，退化为空格切分
         tokens = launch_cmd.split()
 
-    if framework == "sglang":
-        params["tp"] = _to_int(_get_flag_value(tokens, ["--tp-size", "--tensor-parallel-size"]), defaults["tp"])
-        params["dp"] = _to_int(_get_flag_value(tokens, ["--dp-size", "--data-parallel-size"]), defaults["dp"])
-        params["pp"] = _to_int(_get_flag_value(tokens, ["--pp-size", "--pipeline-parallel-size"]), defaults["pp"])
-        params["ep"] = _to_int(_get_flag_value(tokens, ["--ep-size", "--ep", "--expert-parallel-size"]), defaults["ep"])
-        # CP：sglang 无单一 cp-size，取 dcp（decode）为主，attention 侧记入 extra
-        params["cp"] = _to_int(_get_flag_value(tokens, ["--dcp-size", "--decode-context-parallel-size"]), defaults["cp"])
-        attn_cp = _get_flag_value(tokens, ["--attn-cp-size", "--attention-context-parallel-size"])
-        if attn_cp is not None:
-            extra["attn_cp_size"] = _to_int(attn_cp, 1)
-        if _has_flag(tokens, ["--enable-prefill-cp"]):
-            extra["prefill_cp"] = True
-
-        kv_dtype = _get_flag_value(tokens, ["--kv-cache-dtype"])
-        if kv_dtype is not None:
-            params["kv_cache_dtype"] = kv_dtype
-
-        params["hicache_enabled"] = _has_flag(tokens, ["--enable-hierarchical-cache"])
-        if params["hicache_enabled"]:
-            for key, flags in [
-                ("hicache_ratio", ["--hicache-ratio"]),
-                ("hicache_size", ["--hicache-size"]),
-                ("hicache_write_policy", ["--hicache-write-policy"]),
-                ("hicache_io_backend", ["--hicache-io-backend"]),
-                ("hicache_storage_backend", ["--hicache-storage-backend"]),
-            ]:
-                v = _get_flag_value(tokens, flags)
-                if v is not None:
-                    extra[key] = v
-
-        params["flexkv_enabled"] = _has_flag(tokens, ["--enable-flexkv"])
-        params["torch_compile"] = _has_flag(tokens, ["--enable-torch-compile"])
-
-        quant = _get_flag_value(tokens, ["--quantization"])
-        if quant is not None:
-            params["quantization"] = quant
-
-        attn = _get_flag_value(tokens, ["--attention-backend"])
-        if attn is not None:
-            params["attention_backend"] = attn
-
-        # 常用细节进 extra（无默认值/框架专属）
-        for key, flags in [
-            ("chunked_prefill_size", ["--chunked-prefill-size"]),
-            ("mem_fraction_static", ["--mem-fraction-static"]),
-            ("speculative_algorithm", ["--speculative-algorithm"]),
-        ]:
-            v = _get_flag_value(tokens, flags)
-            if v is not None:
-                extra[key] = v
-        if _has_flag(tokens, ["--disable-radix-cache"]):
-            extra["prefix_caching"] = False
-
-    elif framework == "vllm":
-        params["tp"] = _to_int(_get_flag_value(tokens, ["--tensor-parallel-size", "-tp"]), defaults["tp"])
-        params["dp"] = _to_int(_get_flag_value(tokens, ["--data-parallel-size", "-dp"]), defaults["dp"])
-        params["pp"] = _to_int(_get_flag_value(tokens, ["--pipeline-parallel-size", "-pp"]), defaults["pp"])
-        # EP 是布尔开关，度由 TP×DP 派生；置 1/0
-        params["ep"] = 1 if _has_flag(tokens, ["--enable-expert-parallel", "-ep"]) else 0
-        # CP：decode-context-parallel
-        params["cp"] = _to_int(_get_flag_value(tokens, ["--decode-context-parallel-size", "-dcp"]), defaults["cp"])
-        pcp = _get_flag_value(tokens, ["--prefill-context-parallel-size", "-pcp"])
-        if pcp is not None:
-            extra["prefill_context_parallel_size"] = _to_int(pcp, 1)
-
-        kv_dtype = _get_flag_value(tokens, ["--kv-cache-dtype"])
-        if kv_dtype is not None:
-            params["kv_cache_dtype"] = kv_dtype
-
-        # vllm 无 hicache，用 --kv-offloading-* 近似
-        kv_off_size = _get_flag_value(tokens, ["--kv-offloading-size"])
-        if kv_off_size is not None:
-            params["hicache_enabled"] = True
-            extra["kv_offloading_size"] = kv_off_size
-            kv_off_backend = _get_flag_value(tokens, ["--kv-offloading-backend"])
-            if kv_off_backend is not None:
-                extra["kv_offloading_backend"] = kv_off_backend
-
-        # FlexKV 走 --kv-transfer-config JSON 里的 kv_connector
-        kv_transfer = _get_flag_value(tokens, ["--kv-transfer-config"])
-        if kv_transfer is not None:
-            extra["kv_transfer_config"] = kv_transfer
-            try:
-                cfg = json.loads(kv_transfer)
-                if str(cfg.get("kv_connector", "")).lower().startswith("flexkv"):
-                    params["flexkv_enabled"] = True
-            except (json.JSONDecodeError, AttributeError):
-                if "flexkv" in kv_transfer.lower():
-                    params["flexkv_enabled"] = True
-
-        # torch_compile：默认开，除非 --enforce-eager
-        params["torch_compile"] = not _has_flag(tokens, ["--enforce-eager"])
-
-        quant = _get_flag_value(tokens, ["--quantization", "-q"])
-        if quant is not None:
-            params["quantization"] = quant
-
-        for key, flags in [
-            ("gpu_memory_utilization", ["--gpu-memory-utilization"]),
-            ("max_model_len", ["--max-model-len"]),
-            ("block_size", ["--block-size"]),
-            ("cpu_offload_gb", ["--cpu-offload-gb"]),
-        ]:
-            v = _get_flag_value(tokens, flags)
-            if v is not None:
-                extra[key] = v
-        if _has_flag(tokens, ["--no-enable-prefix-caching"]):
-            extra["prefix_caching"] = False
-
-    # 收集所有未被识别的 flag（原样存 extra.unrecognized，不丢弃）
-    known_prefixes = _collect_known_flags(framework)
-    # 解释器/启动噪声 flag，不算业务参数
-    NOISE_FLAGS = {"-m", "-c", "-u"}
+    flag_to_key = pm.flags_for(framework)
     unrecognized = []
-    for tok in tokens:
-        if tok.startswith("--") or (tok.startswith("-") and len(tok) > 1 and not tok[1].isdigit()):
-            flag_name = tok.split("=", 1)[0]
-            if flag_name in NOISE_FLAGS:
-                continue
-            if flag_name not in known_prefixes:
-                unrecognized.append(tok)
+    raw = {}  # key -> 原始取值
+
+    for name, value in _iter_flag_tokens(tokens):
+        if name in NOISE_FLAGS:
+            continue
+        key = _resolve_flag(name, flag_to_key)
+        if key is None:
+            unrecognized.append(name if value is True else f"{name} {value}")
+            continue
+        raw[key] = value
+
+    for key, value in raw.items():
+        pair = pm.PARAM_BY_KEY[key]
+        params[key] = _coerce(pair["kind"], value)
+
+    # ── 语义归一（详见 param_map.py 各条 note）────────────────────────
+    # EP：sglang 是并行宽度、vllm 是布尔开关，必须归一后才能比较
+    if "ep" in params:
+        enabled, width = pm.normalize_ep(framework, raw["ep"])
+        params.pop("ep")
+        params["ep_enabled"] = enabled
+        params["ep_width"] = width
+
+    # torch_compile：sglang --enable-torch-compile 是开启；
+    # vllm --enforce-eager 是关闭（极性相反）
+    if "torch_compile" in params:
+        params["torch_compile"] = (framework == "sglang")
+
+    # prefix_caching：sglang --disable-radix-cache 与
+    # vllm --no-enable-prefix-caching 都表示关闭；--enable-prefix-caching 表示开启
+    if "prefix_caching" in params:
+        flags_seen = {n for n, _ in _iter_flag_tokens(tokens)}
+        if "--enable-prefix-caching" in flags_seen:
+            params["prefix_caching"] = True
+        else:
+            params["prefix_caching"] = False
+
+    # hicache：两边机制不同（sglang 分层缓存 vs vllm KV 卸载），
+    # 只标注"启用了某种 KV 分层/卸载"，具体容量等细节留在 extra
+    if "hicache" in params:
+        val = params["hicache"]
+        params["hicache"] = True
+        if val is not True:
+            extra["hicache_detail"] = val
+
     if unrecognized:
         extra["unrecognized"] = unrecognized
 
     return params, extra
-
-
-def _collect_known_flags(framework):
-    """已被显式处理的 flag 集合，用于识别 unrecognized。"""
-    common = {
-        "sglang": {
-            "--tp-size", "--tensor-parallel-size", "--dp-size", "--data-parallel-size",
-            "--pp-size", "--pipeline-parallel-size", "--ep-size", "--ep", "--expert-parallel-size",
-            "--dcp-size", "--decode-context-parallel-size", "--attn-cp-size",
-            "--attention-context-parallel-size", "--enable-prefill-cp",
-            "--kv-cache-dtype", "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
-            "--hicache-write-policy", "--hicache-io-backend", "--hicache-storage-backend",
-            "--enable-flexkv", "--enable-torch-compile", "--quantization", "--attention-backend",
-            "--chunked-prefill-size", "--mem-fraction-static", "--speculative-algorithm",
-            "--disable-radix-cache",
-        },
-        "vllm": {
-            "--tensor-parallel-size", "-tp", "--data-parallel-size", "-dp",
-            "--pipeline-parallel-size", "-pp", "--enable-expert-parallel", "-ep",
-            "--decode-context-parallel-size", "-dcp", "--prefill-context-parallel-size", "-pcp",
-            "--kv-cache-dtype", "--kv-offloading-size", "--kv-offloading-backend",
-            "--kv-transfer-config", "--enforce-eager", "--quantization", "-q",
-            "--gpu-memory-utilization", "--max-model-len", "--block-size", "--cpu-offload-gb",
-            "--no-enable-prefix-caching",
-        },
-    }
-    return common[framework]
 
 
 def parse_bench_cmd_input_len(bench_cmd):
@@ -345,8 +301,15 @@ def parse_bench_cmd_input_len(bench_cmd):
         tokens = shlex.split(bench_cmd)
     except ValueError:
         tokens = bench_cmd.split()
-    v = _get_flag_value(tokens, ["--random-input-len"])
-    return _to_int(v, None)
+    # 注意：这里解析的是 bench 命令而非 launch 命令，与 param_map 配对表无关，
+    # 因此直接复用 token 遍历，不走 flag_to_key 解析。
+    for name, value in _iter_flag_tokens(tokens):
+        if name == "--random-input-len" and value is not True:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 # ============================================================================
