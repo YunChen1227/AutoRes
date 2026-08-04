@@ -64,8 +64,14 @@ def build_comparison_table(
     """
     构建对比宽表。返回：
       {
-        "column_labels": [对比轴取值1, 取值2, ...],   # 表头列
-        "rows": [
+        "column_labels": [对比轴取值1, 取值2, ...],   # 对比轴取值（渲染时每个指标组内的子列）
+        "metric_names": [指标名, ...],                # 渲染时的列组顺序
+        "matrix": [                                   # 渲染主结构：一行一个测试条件组合
+           {"input_length": 1024, "concurrency": 32,
+            "metrics": {指标名: {列标签: 值 或 "N/A"}}},
+           ...
+        ],
+        "rows": [                                     # 扁平视图（保留给计数/下游消费）
            {"metric_key": (input_len, conc, metric_name),
             "label": "in1024/c32 · Output_Throughput",
             "values": {列标签: 值 或 "N/A"}},
@@ -126,6 +132,23 @@ def build_comparison_table(
             "values": values,
         })
 
+    # 矩阵视图：行 = (input_length, concurrency)，每行内按指标名归组
+    # 行序沿用 rows 的排序结果（已按 input_length、concurrency 排好）
+    matrix: list[dict] = []
+    matrix_index: dict[tuple, dict] = {}
+    for row in rows:
+        cond = (row["input_length"], row["concurrency"])
+        entry = matrix_index.get(cond)
+        if entry is None:
+            entry = {
+                "input_length": row["input_length"],
+                "concurrency": row["concurrency"],
+                "metrics": {},
+            }
+            matrix_index[cond] = entry
+            matrix.append(entry)
+        entry["metrics"][row["metric_name"]] = row["values"]
+
     # 约束项：所有文档中取值一致的维度（用于报告标题区）
     constraints = {}
     for dim in schema.ALL_DIMENSIONS:
@@ -146,6 +169,8 @@ def build_comparison_table(
 
     return {
         "column_labels": column_labels,
+        "metric_names": all_metric_names,
+        "matrix": matrix,
         "rows": rows,
         "constraints": constraints,
         "notes": notes,

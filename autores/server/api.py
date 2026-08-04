@@ -4,17 +4,22 @@ from __future__ import annotations
 import json
 import os
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from autores.common.logging import get_logger
+from autores.db.client import DuplicateRunError
 from autores.server.agent.loop import Agent
+from autores.server.ingest import launch_params, upload as upload_mod
+from autores.server.ingest.upload import UploadError
 
 log = get_logger("api")
 router = APIRouter()
 
-_FRONTEND = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                         "frontend", "index.html")
+_FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                             "frontend")
+_FRONTEND = os.path.join(_FRONTEND_DIR, "index.html")
+_UPLOAD_PAGE = os.path.join(_FRONTEND_DIR, "upload.html")
 
 
 def _sse(event: dict) -> str:
@@ -66,6 +71,58 @@ async def chat(request: Request):
             yield _sse({"type": "done"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.get("/upload")
+def upload_page():
+    """手工上传子页面（CSV + 启动命令 txt）。"""
+    return FileResponse(_UPLOAD_PAGE, media_type="text/html")
+
+
+@router.get("/api/upload/options")
+def upload_options():
+    """上传表单的可选项（框架列表由后端规则表提供，避免前后端各写一份）。"""
+    return JSONResponse({"frameworks": launch_params.supported_frameworks()})
+
+
+@router.post("/api/upload")
+async def upload_run(
+    request: Request,
+    csv_file: UploadFile = File(...),
+    launch_file: UploadFile = File(...),
+    framework: str = Form(...),
+    framework_version: str = Form(...),
+    model: str = Form(...),
+    model_version: str = Form(...),
+    gpu_type: str = Form(...),
+):
+    """手工上传一次测试结果入库。校验失败返回 400 并说明原因，供用户修正后重试。"""
+    st = request.app.state
+    meta = {
+        "framework": framework,
+        "framework_version": framework_version,
+        "model": model,
+        "model_version": model_version,
+        "gpu_type": gpu_type,
+    }
+    try:
+        csv_bytes = await csv_file.read()
+        txt_bytes = await launch_file.read()
+        summary = upload_mod.ingest(st.db, meta, csv_bytes, txt_bytes)
+    except UploadError as e:
+        log.info("上传校验失败", extra={"fields": {"error": str(e)}})
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except DuplicateRunError:
+        # run_id 由服务器时间生成并已查重，正常不会走到；并发同秒提交时兜底
+        log.warning("上传 run_id 冲突")
+        return JSONResponse({"error": "记录已存在，请稍后重试。"}, status_code=409)
+    except Exception as e:  # noqa: BLE001
+        log.error("上传入库异常", extra={"fields": {"error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
+
+    log.info("上传入库成功", extra={"fields": {
+        "run_id": summary["run_id"], "metrics": summary["num_metrics"]}})
+    return JSONResponse(summary)
 
 
 @router.get("/api/download/{token}")

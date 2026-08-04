@@ -1,5 +1,11 @@
 """
 Excel 渲染（design.md §7.4 步骤 4-5）。纯数据对比表，无图表、无结论。
+
+版式（矩阵式宽表）：
+  - 行 = (Input_Length, Concurrency) 组合，按输入长度分块
+  - 列 = 每个指标一个"列组"，组内 = 对比轴各取值 + 差异列（仅两方对比时）
+  - 双层表头：第 1 行为指标名（跨列合并），第 2 行为对比轴取值 / "A vs B"
+  - 每个 Input_Length 块结束后插入一行块汇总：该块内各差异列的均值
 """
 from __future__ import annotations
 
@@ -7,12 +13,21 @@ import os
 from datetime import datetime
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 _HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 _TITLE_FONT = Font(bold=True, size=12)
+_DIM_FILL = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+_DELTA_FILL = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+_SUMMARY_FONT = Font(bold=True, color="C00000")
+_CENTER = Alignment(horizontal="center", vertical="center")
+_THIN = Side(style="thin", color="BFBFBF")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+# 差异列的数字格式：带符号的百分比
+_DELTA_FORMAT = "0.00%"
 
 
 def _constraints_text(constraints: dict) -> str:
@@ -30,6 +45,26 @@ def _constraints_text(constraints: dict) -> str:
     return " | ".join(parts)
 
 
+def _as_number(value):
+    """单元格值转 float；N/A、None、非数值返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _relative_delta(base, ref):
+    """(base - ref) / ref。任一侧缺失或 ref 为 0 时返回 None。"""
+    b, r = _as_number(base), _as_number(ref)
+    if b is None or r is None or r == 0:
+        return None
+    return (b - r) / r
+
+
 def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     """把对比宽表渲染为 xlsx，返回文件路径。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -38,13 +73,19 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     ws = wb.active
     ws.title = "对比报告"
 
-    column_labels = table["column_labels"]
-    rows = table["rows"]
+    column_labels = list(table["column_labels"])
+    matrix = table["matrix"]
+    metric_names = table["metric_names"]
 
-    # 标题区
-    title = f"对比轴: {compare_on}"
+    # 仅当对比轴恰好两个取值时才有意义计算 "A vs B" 差异列
+    two_way = len(column_labels) == 2
+    delta_header = f"{column_labels[0]} vs {column_labels[1]}" if two_way else None
+    # 每个指标占的列数：对比轴取值数（+ 1 个差异列）
+    group_width = len(column_labels) + (1 if two_way else 0)
+
+    # ── 标题区 ──
+    ws.cell(row=1, column=1, value=f"对比轴: {compare_on}").font = _TITLE_FONT
     constraints = _constraints_text(table["constraints"])
-    ws.cell(row=1, column=1, value=title).font = _TITLE_FONT
     if constraints:
         ws.cell(row=2, column=1, value=f"约束: {constraints}")
     note_bits = []
@@ -52,39 +93,121 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
         note_bits.append("含多个框架（版本号不可跨框架比较）")
     if table["notes"].get("multi_version"):
         note_bits.append("含多个框架版本（各自独立取出）")
+    if not two_way:
+        note_bits.append(f"对比轴取值数为 {len(column_labels)}，不生成差异列（仅两方对比时提供）")
     if note_bits:
         ws.cell(row=3, column=1, value="说明: " + "；".join(note_bits))
 
-    header_row = 5
+    top_row, sub_row = 5, 6
+    data_start = 7
 
-    # 表头：第一列是"指标"，其后是对比轴各取值
-    ws.cell(row=header_row, column=1, value="指标 (输入长度/并发)")
-    for j, col_label in enumerate(column_labels, start=2):
-        ws.cell(row=header_row, column=j, value=str(col_label))
-    for j in range(1, len(column_labels) + 2):
-        c = ws.cell(row=header_row, column=j)
-        c.fill = _HEADER_FILL
-        c.font = _HEADER_FONT
-        c.alignment = Alignment(horizontal="center")
+    # ── 双层表头 ──
+    # 左侧两列维度列：Input_Length / Concurrency，纵向合并两行
+    for idx, dim_label in enumerate(("Input_Length", "Concurrency"), start=1):
+        ws.merge_cells(start_row=top_row, start_column=idx, end_row=sub_row, end_column=idx)
+        ws.cell(row=top_row, column=idx, value=dim_label)
 
-    # 数据行
-    for i, row in enumerate(rows, start=header_row + 1):
-        ws.cell(row=i, column=1, value=row["label"])
-        for j, col_label in enumerate(column_labels, start=2):
-            ws.cell(row=i, column=j, value=row["values"].get(col_label, "N/A"))
+    # 指标列组
+    col = 3
+    delta_columns: list[int] = []  # 记录差异列的列号，供块汇总使用
+    for mname in metric_names:
+        end_col = col + group_width - 1
+        if group_width > 1:
+            ws.merge_cells(start_row=top_row, start_column=col, end_row=top_row, end_column=end_col)
+        ws.cell(row=top_row, column=col, value=mname)
+        for offset, col_label in enumerate(column_labels):
+            ws.cell(row=sub_row, column=col + offset, value=str(col_label))
+        if two_way:
+            ws.cell(row=sub_row, column=end_col, value=delta_header)
+            delta_columns.append(end_col)
+        col = end_col + 1
 
-    # 冻结首行首列（冻结表头行 + 指标列）
-    ws.freeze_panes = ws.cell(row=header_row + 1, column=2)
+    last_col = col - 1
+    for r in (top_row, sub_row):
+        for j in range(1, last_col + 1):
+            c = ws.cell(row=r, column=j)
+            c.fill = _HEADER_FILL
+            c.font = _HEADER_FONT
+            c.alignment = _CENTER
+            c.border = _BORDER
+
+    # ── 数据区：按 Input_Length 分块，块尾追加差异均值汇总行 ──
+    # matrix 已按 (input_length, concurrency) 排好序
+    row_cursor = data_start
+    delta_accum: dict[int, list[float]] = {j: [] for j in delta_columns}
+    prev_input_length = None
+
+    def flush_block(cursor: int) -> int:
+        """写入当前块的差异均值汇总行，返回下一个可用行号。"""
+        if not two_way or not any(delta_accum.values()):
+            delta_accum.update({j: [] for j in delta_columns})
+            return cursor
+        for j in delta_columns:
+            vals = delta_accum[j]
+            if not vals:
+                continue
+            c = ws.cell(row=cursor, column=j, value=sum(vals) / len(vals))
+            c.font = _SUMMARY_FONT
+            c.alignment = _CENTER
+            c.number_format = _DELTA_FORMAT
+            c.border = _BORDER
+        delta_accum.update({j: [] for j in delta_columns})
+        return cursor + 1
+
+    for entry in matrix:
+        il = entry["input_length"]
+        if prev_input_length is not None and il != prev_input_length:
+            row_cursor = flush_block(row_cursor)
+        prev_input_length = il
+
+        ws.cell(row=row_cursor, column=1, value=il)
+        ws.cell(row=row_cursor, column=2, value=entry["concurrency"])
+        for j in (1, 2):
+            c = ws.cell(row=row_cursor, column=j)
+            c.fill = _DIM_FILL
+            c.alignment = _CENTER
+            c.border = _BORDER
+
+        col = 3
+        for mname in metric_names:
+            per_column = entry["metrics"].get(mname, {})
+            for offset, col_label in enumerate(column_labels):
+                c = ws.cell(row=row_cursor, column=col + offset,
+                            value=per_column.get(col_label, "N/A"))
+                c.alignment = _CENTER
+                c.border = _BORDER
+            if two_way:
+                delta_col = col + group_width - 1
+                delta = _relative_delta(
+                    per_column.get(column_labels[0]),
+                    per_column.get(column_labels[1]),
+                )
+                c = ws.cell(row=row_cursor, column=delta_col,
+                            value=delta if delta is not None else "N/A")
+                c.alignment = _CENTER
+                c.fill = _DELTA_FILL
+                c.border = _BORDER
+                if delta is not None:
+                    c.number_format = _DELTA_FORMAT
+                    delta_accum[delta_col].append(delta)
+            col += group_width
+        row_cursor += 1
+
+    if prev_input_length is not None:
+        row_cursor = flush_block(row_cursor)
+
+    # 冻结表头 + 左侧两个维度列
+    ws.freeze_panes = ws.cell(row=data_start, column=3)
 
     # 列宽自适应（简单估算）
-    for j in range(1, len(column_labels) + 2):
+    for j in range(1, last_col + 1):
         letter = get_column_letter(j)
         max_len = 0
-        for i in range(header_row, header_row + 1 + len(rows)):
+        for i in range(sub_row, row_cursor):
             v = ws.cell(row=i, column=j).value
             if v is not None:
-                max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 48)
+                max_len = max(max_len, len(f"{v:.4f}" if isinstance(v, float) else str(v)))
+        ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 32)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"对比报告_{compare_on}_{ts}.xlsx"

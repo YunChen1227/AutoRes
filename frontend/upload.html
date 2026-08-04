@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>上传测试结果 - 性能测试报告助手</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --border: #e3e5e9;
+    --text: #1f2328; --muted: #6b7280; --accent: #1f4e78;
+    --err: #b42318; --err-bg: #fdecea; --ok: #0a7c42; --ok-bg: #e9f7ef;
+    --report-bg: #eef4fb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    font-weight: 600; display: flex; align-items: center; gap: 10px;
+  }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: #2ea043; }
+  header .spacer { flex: 1; }
+  header a {
+    font-weight: 500; font-size: 14px; color: var(--accent); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 14px;
+  }
+  header a:hover { background: var(--bg); }
+  main { flex: 1; max-width: 780px; width: 100%; margin: 0 auto; padding: 24px 20px 40px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  .card h3 { margin: 0 0 4px; font-size: 15px; color: var(--accent); }
+  .card .desc { color: var(--muted); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field.full { grid-column: 1 / -1; }
+  label { font-size: 13px; font-weight: 500; }
+  label .req { color: var(--err); }
+  input[type="text"], select {
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+    font: inherit; background: #fff; width: 100%;
+  }
+  input[type="text"]:focus, select:focus { outline: 2px solid #cfe0f2; border-color: var(--accent); }
+  .filebox {
+    border: 1px dashed #c8ccd4; border-radius: 10px; padding: 14px;
+    display: flex; align-items: center; gap: 12px; background: #fafbfc;
+  }
+  .filebox input[type="file"] { font: inherit; font-size: 13px; flex: 1; min-width: 0; }
+  .filebox .tag {
+    font-size: 12px; color: var(--muted); white-space: nowrap;
+  }
+  .actions { display: flex; align-items: center; gap: 12px; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 10px;
+    padding: 0 24px; height: 42px; font-size: 15px; cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  .result { padding: 14px; border-radius: 10px; margin-top: 16px; display: none; line-height: 1.6; }
+  .result.err { background: var(--err-bg); color: var(--err); display: block; }
+  .result.ok { background: var(--ok-bg); color: var(--ok); display: block; }
+  .result h4 { margin: 0 0 8px; }
+  .result .kv { color: var(--text); font-size: 13px; margin-top: 8px; }
+  .result code {
+    display: block; background: #fff; border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin-top: 6px; font-size: 12px; word-break: break-all;
+    white-space: pre-wrap; color: var(--text);
+  }
+  .warn { color: #8a6d00; font-size: 13px; margin-top: 8px; }
+  .hint { text-align: center; color: var(--muted); font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot"></span>上传测试结果
+    <span class="spacer"></span>
+    <a href="/">← 返回对比助手</a>
+  </header>
+
+  <main>
+    <form id="form">
+      <div class="card">
+        <h3>1. 上传文件</h3>
+        <div class="desc">
+          CSV 需含 <b>Input_Length</b> 与 <b>Concurrency</b> 两列（to_csv.py 产出的固定 schema）；
+          txt 写服务启动命令原文，支持 # 注释行与反斜杠续行。
+        </div>
+        <div class="field" style="margin-bottom:14px;">
+          <label>结果 CSV <span class="req">*</span></label>
+          <div class="filebox">
+            <input type="file" name="csv_file" accept=".csv,text/csv" required>
+            <span class="tag">result.csv</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>启动命令 TXT <span class="req">*</span></label>
+          <div class="filebox">
+            <input type="file" name="launch_file" accept=".txt,text/plain" required>
+            <span class="tag">launch_cmd.txt</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>2. 填写元信息</h3>
+        <div class="desc">
+          这些字段无法从 CSV / txt 推断，需手工填写。其中<b>框架</b>决定用哪套启动参数提取规则与默认值回填。
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label>框架 <span class="req">*</span></label>
+            <select name="framework" id="framework" required></select>
+          </div>
+          <div class="field">
+            <label>框架版本 <span class="req">*</span></label>
+            <input type="text" name="framework_version" placeholder="如 0.4.6" required>
+          </div>
+          <div class="field">
+            <label>模型 <span class="req">*</span></label>
+            <input type="text" name="model" placeholder="如 GLM-4.5" required>
+          </div>
+          <div class="field">
+            <label>模型版本 <span class="req">*</span></label>
+            <input type="text" name="model_version" placeholder="如 distributed2" required>
+          </div>
+          <div class="field full">
+            <label>显卡 <span class="req">*</span></label>
+            <input type="text" name="gpu_type" placeholder="如 H20-141G" required>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="actions">
+          <button type="submit" id="submit">提交入库</button>
+          <button type="button" class="ghost" id="reset">清空</button>
+        </div>
+        <div id="result" class="result"></div>
+      </div>
+    </form>
+    <div class="hint">入库后即可在对比助手中按维度查询该次测试。</div>
+  </main>
+
+<script>
+(function () {
+  const form = document.getElementById("form");
+  const submit = document.getElementById("submit");
+  const resetBtn = document.getElementById("reset");
+  const result = document.getElementById("result");
+  const frameworkSel = document.getElementById("framework");
+
+  // 框架列表从后端取，避免前后端各维护一份
+  fetch("/api/upload/options")
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      (d.frameworks || []).forEach(function (fw) {
+        const opt = document.createElement("option");
+        opt.value = fw; opt.textContent = fw;
+        frameworkSel.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      ["sglang", "vllm"].forEach(function (fw) {
+        const opt = document.createElement("option");
+        opt.value = fw; opt.textContent = fw;
+        frameworkSel.appendChild(opt);
+      });
+    });
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function showError(msg) {
+    result.className = "result err";
+    result.innerHTML = "<h4>入库失败</h4>" + esc(msg);
+  }
+
+  function showOk(d) {
+    const params = d.params || {};
+    const kv = Object.keys(params).map(function (k) {
+      return esc(k) + "=" + esc(params[k]);
+    }).join("  ");
+    let html = "<h4>✓ 入库成功</h4>" +
+      '<div class="kv">记录 ID: <b>' + esc(d.run_id) + "</b>　指标行数: <b>" +
+      esc(d.num_metrics) + "</b></div>" +
+      '<div class="kv">解析出的启动参数：<code>' + esc(kv) + "</code></div>" +
+      '<div class="kv">启动命令原文：<code>' + esc(d.launch_cmd) + "</code></div>";
+    if (d.unrecognized && d.unrecognized.length) {
+      html += '<div class="warn">⚠ 未识别的参数（已原样存入 extra，不影响入库）：' +
+              esc(d.unrecognized.join(" ")) + "</div>";
+    }
+    result.className = "result ok";
+    result.innerHTML = html;
+  }
+
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    result.className = "result";
+    result.innerHTML = "";
+    submit.disabled = true;
+    submit.textContent = "提交中…";
+
+    try {
+      const resp = await fetch("/api/upload", {
+        method: "POST",
+        body: new FormData(form),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError(data.error || ("HTTP " + resp.status));
+      } else {
+        showOk(data);
+        // 成功后只清文件选择，元信息保留——同一批测试常需连续上传多次
+        form.querySelectorAll('input[type="file"]').forEach(function (i) { i.value = ""; });
+      }
+    } catch (err) {
+      showError("网络错误：" + err.message);
+    } finally {
+      submit.disabled = false;
+      submit.textContent = "提交入库";
+    }
+  });
+
+  resetBtn.addEventListener("click", function () {
+    form.reset();
+    result.className = "result";
+    result.innerHTML = "";
+  });
+})();
+</script>
+</body>
+</html>
