@@ -9,6 +9,7 @@
 - **落盘脚本** `to_csv.py`（也在 `tools/`）：测试人员本机运行，把 bench 输出整理为 `result.csv` + `metadata.json`，写入 NAS 时间戳目录。
 - **Scanner**（`autores/scanner/`）：定时扫描 NAS，解析入库 SQLite。
 - **API + 前端**（`autores/server/` + `frontend/index.html`）：LLM Agent 理解需求、确定性流水线生成 Excel、SSE 推送、前端下载。
+- **手工上传**（`frontend/upload.html`，页面路径 `/upload`）：数据不在扫描目录时，直接提交一份 CSV + 启动命令 txt + 元信息表单入库，解析规则与自动落盘完全一致（见 design.md §5.6）。
 
 ## 快速开始
 

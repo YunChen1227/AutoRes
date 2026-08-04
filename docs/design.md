@@ -121,6 +121,9 @@ AutoRes/
     │   │   ├── loop.py        # LLM 工具循环
     │   │   ├── tools.py       # 工具定义与实现
     │   │   └── prompts.py     # system prompt
+    │   ├── ingest/
+    │   │   ├── upload.py      # 手工上传解析/校验/入库（§5.6）
+    │   │   └── launch_params.py  # 复用 to_csv.py 的启动参数提取规则
     │   └── report/
     │       ├── query.py       # QuerySpec → SQL WHERE 构造与查询
     │       ├── align.py       # 数据对齐（内嵌指标 → 对比宽表）
@@ -252,6 +255,28 @@ AutoRes/
 - **失败即不记录**：解析/入库失败的目录**不写入成功台账**，仅打日志；下一轮扫描自然重试，直到成功才记账。无需 retry_count / abandoned 状态，无需人工干预流程。
 - **幂等**：`test_runs.run_id`（= 目录名）为主键 + "只处理不在 ingest_log 台账中的目录"双重保证每目录仅入库一次；重复插入触发主键冲突（IntegrityError）被拒绝。
 - **写入原子性**：单目录的整条 `test_runs` 记录（含 metrics JSON 列）一条 `INSERT` 写入，本身即原子；随后写 `ingest_log`。若中途失败，因主键幂等，下轮重试安全（详见 §6.2）。
+
+### 5.6 手工上传入库（前端 `/upload` 子页面）
+
+**场景**：数据分散在不同子系统与地区，未落在 Scanner 扫描的 NAS 目录下。测试人员在前端页面直接提交一份整理好的 CSV 与一个写有启动命令的 txt。
+
+**输入**（三部分，缺一不可）：
+
+| 输入 | 说明 |
+|------|------|
+| `csv_file` | 结果 CSV，须含 `Input_Length` 与 `Concurrency` 两列（to_csv.py 的固定 schema）；其余列原样作为指标 |
+| `launch_file` | 启动命令 txt，原文保留；允许 `#` 注释行、空行与反斜杠续行，非空行拼接为一条命令 |
+| 表单字段 | `framework` / `framework_version` / `model` / `model_version` / `gpu_type`——这 5 项无法从前两个文件推断，是 `metadata.json` 在上传流里的替代品 |
+
+**与目录流的一致性**（关键约束）：
+
+- CSV 行→metric 记录复用 `scanner.parser` 的列名归一与数值转换（`N/A`→`None`、整数去小数点），两条路径解析同一份 CSV 结果逐字段相同；
+- 启动参数提取**按文件路径加载 `tools/to_csv.py` 的 `extract_launch_params`**，而非复制规则——否则同一条命令走两条路径会得到不同 params，库里出现虚假差异；`framework` 决定用哪套规则与默认值回填（§5.4.1）；
+- 产出文档结构与 `parse_run_dir` 完全一致，走同一个 `db.insert_run`，因此上传的记录与扫描的记录在查询/对齐/报告环节无差别。
+
+**run_id 与幂等**：上传无源目录，`run_id` 由服务器时间生成为 `upload_YYYYMMDD_HHMMSS`；同秒冲突时追加 `_1`、`_2`…（人工上传低频，冲突极少）。前缀 `upload_` 便于日后区分手工与自动记录，`extra.ingest_source = "manual_upload"` 同样标注来源。台账以 `run_id` 自身作为 `source_dir`，避免与扫描目录名冲突。
+
+**校验与反馈**：所有非法输入（缺列、空文件、维度列为空、txt 无有效内容、框架非法、编码无法识别、超出体积上限）返回 **400 + 中文原因**，用户修正后可重试；入库成功后回显解析出的 params 与未识别参数（`extra.unrecognized`），供人工复核提取结果是否符合预期。
 
 ---
 
@@ -400,8 +425,12 @@ CREATE TABLE ingest_log (
 
 1. **查询**：QuerySpec → SQL `SELECT ... WHERE`，取出匹配的 `test_runs` 行（含 metrics JSON 列）。filters/compare_values 转为 `=`/`IN` 条件、exclude 转为 `NOT IN`（NULL 值不被误杀）；metric_filters（输入长度/并发）在取出后于 Python 侧过滤内嵌指标数组。
 2. **取最新（D20）**：结果按"除时间戳外所有维度组合"分组，每组取 `run_timestamp` 最大者。**不同框架版本、不同框架各自成组，全部保留**——不会因版本不同被误合并。
-3. **对齐**：把各文档的内嵌指标透视为宽表 —— **行 = 指标（含输入长度/并发维度），列 = 对比轴的各个取值**；某组合缺某指标时该单元格填 `N/A`（不留空，明确表达"无数据"）。
-4. **渲染**（纯数据对比表，D12）：单个 sheet；首行标题区注明约束项（如"模型: GLM-4.5 | 框架: sglang | TP: 8"），随后是对比表；仅做基础可读性格式（表头加粗、冻结首行首列、列宽自适应），不加图表、不加结论。
+3. **对齐**：把各文档的内嵌指标透视为矩阵宽表 —— **行 = (Input_Length, Concurrency) 测试条件组合，列 = 每个指标一个"列组"，组内再按对比轴的各个取值展开**；某组合缺某指标时该单元格填 `N/A`（不留空，明确表达"无数据"）。
+4. **渲染**（纯数据对比表，D12）：单个 sheet；首行标题区注明约束项（如"模型: GLM-4.5 | 框架: sglang | TP: 8"），随后是对比表。表体版式：
+   - **双层表头**：第 1 行为指标名（跨该指标列组合并），第 2 行为对比轴各取值；左侧 `Input_Length` / `Concurrency` 两列纵向合并两行。
+   - **差异列**：当对比轴恰好为两个取值时，每个指标组末尾追加一列 `A vs B`，值为相对差异 `(A - B) / B`，按百分比格式显示；任一侧为 `N/A` 或分母为 0 时该单元格填 `N/A`。对比轴取值数 ≠ 2 时不生成差异列，并在标题区说明。
+   - **块汇总**：每个 `Input_Length` 块结束后插入一行，填该块内各差异列的均值（红色加粗）；`N/A` 不参与均值计算。
+   - 仅做基础可读性格式（表头加粗、冻结表头与维度列、列宽自适应），不加图表、不加结论。
 5. **产出**：文件写入 `report.output_dir`，文件名 `对比报告_{compare_on}_{时间戳}.xlsx`；生成随机下载 token（UUID），token→文件路径映射存内存；聊天回复中附下载链接及本次取数摘要（几条记录、哪些组合、是否有跨框架/多版本、是否有 N/A）。
 
 ### 7.5 会话管理（不持久化，D13）
@@ -425,7 +454,10 @@ CREATE TABLE ingest_log (
 | POST | `/api/chat` | 入参 `{session_id, message}`；返回 **SSE 流**，事件类型见下 |
 | GET | `/api/download/{token}` | 下载 Excel；`Content-Disposition: attachment`；过期返回 410 |
 | GET | `/api/health` | 健康检查：DB 连通性 + LLM 端点可达性 + 最近一次扫描时间 |
+| POST | `/api/upload` | 手工上传入库（multipart）：`csv_file` + `launch_file` + 5 个元信息表单字段；成功返回 run_id/指标行数/解析出的 params，校验失败返回 400 并说明原因 |
+| GET | `/api/upload/options` | 上传表单可选项（框架列表，取自 §5.4.1 默认值表，前后端共用同一来源） |
 | GET | `/` | 返回 `frontend/index.html` |
+| GET | `/upload` | 返回 `frontend/upload.html`（手工上传子页面） |
 
 **SSE 事件类型**（前端据此渲染）：
 
