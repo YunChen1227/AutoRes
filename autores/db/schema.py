@@ -34,22 +34,61 @@ META_DIMENSIONS = [
 ]
 
 # ── 结构化启动参数维度（同样是直接列；文档/接口上仍归为 params）──
+#
+# 与 tools/param_map.py 的配对表一一对应（D17）。新增/删除参数时两边同步改，
+# 并跑 `python tools/verify_param_map.py` 确认 flag 仍存在于上游源码。
+#
+# 注意几个"看起来能比、实际不能比"的列（详见 param_map.py 各条 note）：
+#   mem_fraction         量纲不同（vllm 含激活值、sglang 不含），仅在两边都显式设置时可并列
+#   max_running_requests sglang 默认 None 按 KV 容量推导，vllm 固定 128
+#   chunked_prefill_size sglang 默认 None 按显存档位推导，vllm 固定 2048
+#   ep_enabled/ep_width  sglang 是宽度、vllm 是开关，必须归一后再比
 PARAM_DIMENSIONS = [
+    # 并行度
     "tp",
-    "dp",
     "pp",
-    "ep",
-    "cp",
+    "dp",
+    "dcp",
+    "ep_enabled",
+    "ep_width",
+    # 显存 / KV
+    "mem_fraction",
     "kv_cache_dtype",
-    "hicache_enabled",
-    "flexkv_enabled",
-    "torch_compile",
+    "page_size",
+    "prefix_caching",
+    # 调度
+    "max_running_requests",
+    "chunked_prefill_size",
+    "context_length",
+    # 模型 / 量化
+    "dtype",
     "quantization",
+    "trust_remote_code",
+    "served_model_name",
+    # 编译
+    "torch_compile",
+    # 后端（sglang 专属，vllm 无等价 CLI flag）
     "attention_backend",
+    "moe_a2a_backend",
+    "dp_attention",
+    # 投机解码
+    "spec_algorithm",
+    "spec_num_steps",
+    "spec_eagle_topk",
+    "spec_num_draft_tokens",
+    # KV 分层 / 卸载（两边机制不同，仅粗略近似）
+    "hicache",
 ]
 
 # 布尔型参数列（SQLite 存 0/1，读出时还原为 bool）
-BOOL_PARAMS = {"hicache_enabled", "flexkv_enabled", "torch_compile"}
+BOOL_PARAMS = {
+    "ep_enabled",
+    "prefix_caching",
+    "trust_remote_code",
+    "torch_compile",
+    "dp_attention",
+    "hicache",
+}
 
 # Agent 可用于对比/筛选的全部维度（design.md §7.2 list_dimension_values 枚举）
 ALL_DIMENSIONS = META_DIMENSIONS + PARAM_DIMENSIONS
@@ -67,17 +106,40 @@ CREATE TABLE IF NOT EXISTS test_runs (
     framework_version TEXT NOT NULL,
     gpu_type          TEXT NOT NULL,
     launch_cmd        TEXT NOT NULL,
-    tp                INTEGER,
-    dp                INTEGER,
-    pp                INTEGER,
-    ep                INTEGER,
-    cp                INTEGER,
-    kv_cache_dtype    TEXT,
-    hicache_enabled   INTEGER,
-    flexkv_enabled    INTEGER,
-    torch_compile     INTEGER,
-    quantization      TEXT,
-    attention_backend TEXT,
+    -- 并行度
+    tp                   INTEGER,
+    pp                   INTEGER,
+    dp                   INTEGER,
+    dcp                  INTEGER,
+    ep_enabled           INTEGER,
+    ep_width             INTEGER,
+    -- 显存 / KV
+    mem_fraction         REAL,
+    kv_cache_dtype       TEXT,
+    page_size            INTEGER,
+    prefix_caching       INTEGER,
+    -- 调度
+    max_running_requests INTEGER,
+    chunked_prefill_size INTEGER,
+    context_length       INTEGER,
+    -- 模型 / 量化
+    dtype                TEXT,
+    quantization         TEXT,
+    trust_remote_code    INTEGER,
+    served_model_name    TEXT,
+    -- 编译
+    torch_compile        INTEGER,
+    -- 后端
+    attention_backend    TEXT,
+    moe_a2a_backend      TEXT,
+    dp_attention         INTEGER,
+    -- 投机解码
+    spec_algorithm       TEXT,
+    spec_num_steps       INTEGER,
+    spec_eagle_topk      INTEGER,
+    spec_num_draft_tokens INTEGER,
+    -- KV 分层 / 卸载
+    hicache              INTEGER,
     extra             TEXT NOT NULL DEFAULT '{}',
     metrics           TEXT NOT NULL,
     created_at        TEXT NOT NULL
@@ -85,7 +147,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
 CREATE INDEX IF NOT EXISTS idx_test_runs_dims
     ON test_runs (model, framework, framework_version, gpu_type);
 CREATE INDEX IF NOT EXISTS idx_test_runs_parallel
-    ON test_runs (tp, dp, pp, ep, cp);
+    ON test_runs (tp, pp, dp, dcp, ep_enabled);
 CREATE TABLE IF NOT EXISTS ingest_log (
     source_dir  TEXT PRIMARY KEY,
     run_id      TEXT,
