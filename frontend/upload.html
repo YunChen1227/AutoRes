@@ -193,7 +193,11 @@
     }).join("  ");
     let html = "<h4>✓ 入库成功</h4>" +
       '<div class="kv">记录 ID: <b>' + esc(d.run_id) + "</b>　指标行数: <b>" +
-      esc(d.num_metrics) + "</b></div>" +
+      esc(d.num_metrics) + "</b></div>";
+    if (d.disk_path) {
+      html += '<div class="kv">落盘目录：<code>' + esc(d.disk_path) + "</code></div>";
+    }
+    html +=
       '<div class="kv">解析出的启动参数：<code>' + esc(kv) + "</code></div>" +
       '<div class="kv">启动命令原文：<code>' + esc(d.launch_cmd) + "</code></div>";
     if (d.unrecognized && d.unrecognized.length) {

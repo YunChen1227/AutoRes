@@ -120,7 +120,10 @@ async def upload_run(
     }
     try:
         csv_bytes = await csv_file.read()
-        summary = upload_mod.ingest(st.db, meta, csv_bytes, launch_cmd)
+        summary = upload_mod.ingest(
+            st.db, meta, csv_bytes, launch_cmd,
+            benchmark_root=st.config.scanner.benchmark_root,
+        )
     except UploadError as e:
         log.info("上传校验失败", extra={"fields": {"error": str(e)}})
         return JSONResponse({"error": str(e)}, status_code=400)

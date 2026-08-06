@@ -7,7 +7,8 @@
 与目录流的一致性保证：
   - CSV 解析复用 scanner.parser 的行→metric 逻辑（同样的列名归一与数值转换）；
   - 启动参数提取复用 tools/to_csv.py 的规则（见 launch_params 模块）；
-  - 产出的文档结构与 parse_run_dir 完全一致，走同一个 db.insert_run。
+  - 产出的文档结构与 parse_run_dir 完全一致，走同一个 db.insert_run；
+  - 同时落盘到 config.scanner.benchmark_root，目录结构与 Scanner 一致，便于崩溃后重扫入库。
 差异仅在于元信息来源：目录流读 metadata.json，上传流读表单字段。
 """
 from __future__ import annotations
@@ -29,6 +30,7 @@ from autores.server.ingest.csv_columns import (
     check_required_dimensions,
     format_mapping_summary,
 )
+from autores.server.ingest import persist
 
 log = get_logger("upload")
 
@@ -64,9 +66,6 @@ def _load_gpu_presets():
 def supported_gpu_types() -> list[str]:
     """上传表单可选显卡型号（与 gpu_memory_presets.GPU_MEMORY_GIB 一致）。"""
     return sorted(_load_gpu_presets().GPU_MEMORY_GIB.keys())
-
-# run_id 前缀，用于在库里区分手工上传与 Scanner 扫描的记录
-UPLOAD_PREFIX = "upload_"
 
 # 上传体积上限（防止超大文件打满内存/磁盘）
 MAX_CSV_BYTES = 5 * 1024 * 1024
@@ -176,23 +175,6 @@ def validate_meta(form: dict) -> dict:
     return meta
 
 
-def _make_run_id(db, when: datetime) -> str:
-    """
-    生成 run_id：upload_YYYYMMDD_HHMMSS。
-    同秒冲突时追加 _1、_2…（上传是人工低频操作，冲突极少）。
-    """
-    base = UPLOAD_PREFIX + when.strftime("%Y%m%d_%H%M%S")
-    # 注意：fetch_runs 返回的是文档形态（run_id 已映射为 _id），这里要按库内列名查，
-    # 故用 count_runs 直接对 run_id 列计数，避免取回整行再取错键。
-    if db.count_runs("run_id = ?", [base]) == 0:
-        return base
-    for i in range(1, 1000):
-        cand = f"{base}_{i}"
-        if db.count_runs("run_id = ?", [cand]) == 0:
-            return cand
-    raise UploadError("run_id 冲突过多，请稍后重试")
-
-
 def resolve_launch_text(launch_text: str | None) -> str:
     """从直接输入的文本解析启动命令。"""
     if not launch_text or not launch_text.strip():
@@ -203,22 +185,25 @@ def resolve_launch_text(launch_text: str | None) -> str:
     return parse_launch_txt(raw)
 
 
-def build_doc(db, meta: dict, csv_text: str, launch_cmd: str) -> dict:
+def build_doc(
+    run_id: str,
+    run_timestamp: datetime,
+    meta: dict,
+    metrics: list[dict],
+    launch_cmd: str,
+    params: dict,
+    extra: dict,
+) -> dict:
     """
     组装可直接 insert_run 的 test_runs 文档。
     结构与 scanner.parser.parse_run_dir 的产出保持一致。
     """
-    metrics = parse_csv_text(csv_text)
-    params, extra = launch_params.extract(meta["framework"], launch_cmd)
-
-    # 标注来源，便于日后区分手工上传与自动扫描的记录
     extra = dict(extra)
     extra["ingest_source"] = "manual_upload"
 
-    now = datetime.now(timezone.utc)
     return {
-        "_id": _make_run_id(db, now),
-        "run_timestamp": now,
+        "_id": run_id,
+        "run_timestamp": run_timestamp,
         "model": meta["model"],
         "model_version": meta["model_version"],
         "framework": meta["framework"],
@@ -228,26 +213,53 @@ def build_doc(db, meta: dict, csv_text: str, launch_cmd: str) -> dict:
         "params": params,
         "extra": extra,
         "metrics": metrics,
-        "created_at": now,
+        "created_at": datetime.now(timezone.utc),
     }
 
 
-def ingest(db, meta_form: dict, csv_bytes: bytes, launch_text: str) -> dict:
+def ingest(
+    db,
+    meta_form: dict,
+    csv_bytes: bytes,
+    launch_text: str,
+    *,
+    benchmark_root: str,
+) -> dict:
     """
-    完整上传流程：校验 → 解析 → 入库 → 记台账。
-    返回入库摘要；任何非法输入抛 UploadError（上层转 400）。
+    完整上传流程：校验 → 解析 → 落盘 → 入库 → 记台账。
+    落盘目录与 Scanner 一致，服务崩溃后可通过扫描 benchmark_root 再次入库。
     """
     meta = validate_meta(meta_form)
     csv_text = _decode(csv_bytes, "CSV 文件", MAX_CSV_BYTES)
     launch_cmd = resolve_launch_text(launch_text)
 
-    doc = build_doc(db, meta, csv_text, launch_cmd)
-    db.insert_run(doc)
-    # 台账用 run_id 自身作为 source_dir（上传无源目录），避免与扫描目录名冲突
-    db.mark_ingested(doc["_id"], doc["_id"])
+    metrics = parse_csv_text(csv_text)
+    params, extra = launch_params.extract(meta["framework"], launch_cmd)
+
+    now = datetime.now(timezone.utc)
+    try:
+        dir_name, dir_path = persist.persist_upload(
+            benchmark_root, db, now, meta, metrics, launch_cmd, params, extra,
+        )
+    except persist.PersistError as e:
+        raise UploadError(str(e)) from e
+
+    run_timestamp = datetime.strptime(dir_name, "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
+    doc = build_doc(dir_name, run_timestamp, meta, metrics, launch_cmd, params, extra)
+
+    try:
+        db.insert_run(doc)
+    except Exception:
+        log.error("入库失败，落盘目录已保留供 Scanner 重扫", extra={"fields": {"dir": dir_path}})
+        raise
+
+    db.mark_ingested(dir_name, doc["_id"])
+    log.info("上传落盘并入库", extra={"fields": {"dir": dir_path, "run_id": doc["_id"]}})
 
     return {
         "run_id": doc["_id"],
+        "source_dir": dir_name,
+        "disk_path": dir_path,
         "num_metrics": len(doc["metrics"]),
         "launch_cmd": doc["launch_cmd"],
         "params": doc["params"],
