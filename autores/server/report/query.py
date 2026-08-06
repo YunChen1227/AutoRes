@@ -31,9 +31,11 @@ class QuerySpec:
     exclude: dict[str, list[Any]] = field(default_factory=dict)
     metrics: list[str] | None = None
     metric_filters: dict[str, list[Any]] = field(default_factory=dict)
+    normalize_gpu_scale: bool = True
 
     @staticmethod
     def from_dict(d: dict) -> "QuerySpec":
+        raw_scale = d.get("normalize_gpu_scale")
         spec = QuerySpec(
             compare_on=d.get("compare_on"),
             filters=d.get("filters") or {},
@@ -41,6 +43,7 @@ class QuerySpec:
             exclude=d.get("exclude") or {},
             metrics=d.get("metrics"),
             metric_filters=d.get("metric_filters") or {},
+            normalize_gpu_scale=True if raw_scale is None else bool(raw_scale),
         )
         spec.validate()
         return spec

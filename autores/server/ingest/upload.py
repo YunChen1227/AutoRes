@@ -23,7 +23,7 @@ import threading
 
 from autores.common.logging import get_logger
 from autores.db import schema
-from autores.scanner.parser import ParseError, _to_number
+from autores.scanner.parser import _to_number
 from autores.server.ingest import launch_params
 from autores.server.ingest.csv_columns import (
     build_header_map,
@@ -185,38 +185,6 @@ def resolve_launch_text(launch_text: str | None) -> str:
     return parse_launch_txt(raw)
 
 
-def build_doc(
-    run_id: str,
-    run_timestamp: datetime,
-    meta: dict,
-    metrics: list[dict],
-    launch_cmd: str,
-    params: dict,
-    extra: dict,
-) -> dict:
-    """
-    组装可直接 insert_run 的 test_runs 文档。
-    结构与 scanner.parser.parse_run_dir 的产出保持一致。
-    """
-    extra = dict(extra)
-    extra["ingest_source"] = "manual_upload"
-
-    return {
-        "_id": run_id,
-        "run_timestamp": run_timestamp,
-        "model": meta["model"],
-        "model_version": meta["model_version"],
-        "framework": meta["framework"],
-        "framework_version": meta["framework_version"],
-        "gpu_type": meta["gpu_type"],
-        "launch_cmd": launch_cmd,
-        "params": params,
-        "extra": extra,
-        "metrics": metrics,
-        "created_at": datetime.now(timezone.utc),
-    }
-
-
 def ingest(
     db,
     meta_form: dict,
@@ -224,10 +192,11 @@ def ingest(
     launch_text: str,
     *,
     benchmark_root: str,
+    dir_pattern: str,
 ) -> dict:
     """
-    完整上传流程：校验 → 解析 → 落盘 → 入库 → 记台账。
-    落盘目录与 Scanner 一致，服务崩溃后可通过扫描 benchmark_root 再次入库。
+    完整上传流程：校验 → 解析 → 落盘 → 扫描入库。
+    落盘后立即执行一轮 Scanner，与独立 Scanner 进程逻辑一致。
     """
     meta = validate_meta(meta_form)
     csv_text = _decode(csv_bytes, "CSV 文件", MAX_CSV_BYTES)
@@ -235,6 +204,8 @@ def ingest(
 
     metrics = parse_csv_text(csv_text)
     params, extra = launch_params.extract(meta["framework"], launch_cmd)
+    extra = dict(extra)
+    extra["ingest_source"] = "manual_upload"
 
     now = datetime.now(timezone.utc)
     try:
@@ -244,17 +215,16 @@ def ingest(
     except persist.PersistError as e:
         raise UploadError(str(e)) from e
 
-    run_timestamp = datetime.strptime(dir_name, "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
-    doc = build_doc(dir_name, run_timestamp, meta, metrics, launch_cmd, params, extra)
+    from autores.scanner.main import scan_once
 
-    try:
-        db.insert_run(doc)
-    except Exception:
-        log.error("入库失败，落盘目录已保留供 Scanner 重扫", extra={"fields": {"dir": dir_path}})
-        raise
-
-    db.mark_ingested(dir_name, doc["_id"])
-    log.info("上传落盘并入库", extra={"fields": {"dir": dir_path, "run_id": doc["_id"]}})
+    pending, ok, fail = scan_once(db, benchmark_root, dir_pattern)
+    runs = db.fetch_runs("run_id = ?", [dir_name])
+    if not runs:
+        raise UploadError(
+            f"已落盘至 {dir_path}，但扫描入库失败（pending={pending}, ok={ok}, fail={fail}）"
+        )
+    doc = runs[0]
+    log.info("上传落盘并扫描入库", extra={"fields": {"dir": dir_path, "run_id": doc["_id"]}})
 
     return {
         "run_id": doc["_id"],
@@ -262,6 +232,6 @@ def ingest(
         "disk_path": dir_path,
         "num_metrics": len(doc["metrics"]),
         "launch_cmd": doc["launch_cmd"],
-        "params": doc["params"],
-        "unrecognized": doc["extra"].get("unrecognized", []),
+        "params": doc.get("params", {}),
+        "unrecognized": doc.get("extra", {}).get("unrecognized", []),
     }

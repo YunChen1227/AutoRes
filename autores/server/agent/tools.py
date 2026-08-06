@@ -21,6 +21,26 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "summarize_reports",
+            "description": (
+                "统计库内报告（测试记录）数量，按显卡×模型汇总。"
+                "用于回答'我现在有多少报告''每张卡每个模型各有多少'这类盘点问题。"
+                "忽略框架版本、启动参数等细节，只按 gpu_type + model 归并计数。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filters": {
+                        "type": "object",
+                        "description": "可选：额外维度等值约束，缩小盘点范围",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_dimension_values",
             "description": (
                 "列出数据库中某个维度的所有真实取值及各值的记录数。"
@@ -105,6 +125,15 @@ TOOL_DEFINITIONS = [
                         "type": "object",
                         "description": "可选：按 input_length / concurrency 进一步筛选，值为数组",
                     },
+                    "normalize_gpu_scale": {
+                        "type": "boolean",
+                        "description": (
+                            "可选，默认 true：当对比的各配置实际卡数不同时，"
+                            "按卡数做弱扩展归一——较少卡的一侧吞吐×(大卡/小卡)、"
+                            "并发同比对齐，延迟保持原值，用于'对齐卡数/机器数'的公平对比。"
+                            "卡数相同则自动无操作。用户明确要看原始未换算数值时设为 false。"
+                        ),
+                    },
                 },
                 "required": ["compare_on"],
             },
@@ -114,6 +143,27 @@ TOOL_DEFINITIONS = [
 
 
 # ── 工具实现 ──
+
+def summarize_reports(db, filters: dict | None = None) -> dict:
+    """按显卡×模型盘点报告数量（忽略框架版本/参数等细节）。"""
+    valid_filters = {k: v for k, v in (filters or {}).items()
+                     if k in schema.ALL_DIMENSIONS}
+    where_sql, params = build_conditions(valid_filters)
+    grouped = db.group_counts(["gpu_type", "model"], where_sql, params)
+
+    by_gpu: dict = {}
+    for row in grouped:
+        gpu = row["gpu_type"]
+        entry = by_gpu.setdefault(gpu, {"gpu_type": gpu, "models": [], "total": 0})
+        entry["models"].append({"model": row["model"], "count": row["count"]})
+        entry["total"] += row["count"]
+
+    gpus = sorted(by_gpu.values(), key=lambda e: e["total"], reverse=True)
+    return {
+        "total_reports": sum(e["total"] for e in gpus),
+        "by_gpu": gpus,
+    }
+
 
 def list_dimension_values(db, dimension: str, filters: dict | None = None) -> dict:
     if dimension not in schema.ALL_DIMENSIONS:

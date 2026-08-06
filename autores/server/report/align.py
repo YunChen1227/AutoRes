@@ -60,6 +60,7 @@ def build_comparison_table(
     compare_on: str,
     metrics: list[str] | None = None,
     metric_filters: dict | None = None,
+    gpu_scaled: bool = False,
 ) -> dict:
     """
     构建对比宽表。返回：
@@ -89,6 +90,15 @@ def build_comparison_table(
         cv = _dimension_value(doc, compare_on)
         if cv not in column_labels:
             column_labels.append(cv)
+
+    # 每列的卡数换算信息（弱扩展对比时用于表头标注）
+    column_gpus: dict = {}
+    column_scale: dict = {}
+    for doc in docs:
+        cv = _dimension_value(doc, compare_on)
+        if "_gpus" in doc and cv not in column_gpus:
+            column_gpus[cv] = doc.get("_gpus")
+            column_scale[cv] = doc.get("_scale", 1)
 
     # 收集所有 (input_length, concurrency, metric_name) 作为行；值按列填充
     # 结构：rows_map[(il, cc, metric_name)][column_label] = value
@@ -175,4 +185,7 @@ def build_comparison_table(
         "constraints": constraints,
         "notes": notes,
         "num_runs": len(docs),
+        "gpu_scaled": gpu_scaled and any(s != 1 for s in column_scale.values()),
+        "column_gpus": column_gpus,
+        "column_scale": column_scale,
     }

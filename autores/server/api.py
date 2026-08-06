@@ -123,6 +123,7 @@ async def upload_run(
         summary = upload_mod.ingest(
             st.db, meta, csv_bytes, launch_cmd,
             benchmark_root=st.config.scanner.benchmark_root,
+            dir_pattern=st.config.scanner.dir_pattern,
         )
     except UploadError as e:
         log.info("上传校验失败", extra={"fields": {"error": str(e)}})

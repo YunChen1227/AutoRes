@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from autores.server.report import align, excel
+from autores.server.report import align, excel, hardware
 from autores.server.report.query import QuerySpec, run_query
 
 
@@ -27,11 +27,17 @@ def generate_report(db, spec: QuerySpec, output_dir: str) -> ReportResult:
         )
 
     docs = align.take_latest(docs)
+
+    gpu_scaled = False
+    if spec.normalize_gpu_scale:
+        gpu_scaled = hardware.annotate_and_scale(docs)
+
     table = align.build_comparison_table(
         docs,
         compare_on=spec.compare_on,
         metrics=spec.metrics,
         metric_filters=spec.metric_filters,
+        gpu_scaled=gpu_scaled,
     )
     path = excel.render_comparison(table, spec.compare_on, output_dir)
 

@@ -141,6 +141,9 @@ class Agent:
         })
 
     def _dispatch_tool(self, name: str, args: dict) -> tuple[dict, dict | None]:
+        if name == "summarize_reports":
+            return agent_tools.summarize_reports(self.db, args.get("filters")), None
+
         if name == "list_dimension_values":
             return agent_tools.list_dimension_values(
                 self.db, args.get("dimension"), args.get("filters")), None
@@ -273,6 +276,8 @@ def _tool_msg(tool_call_id: str, result: dict) -> dict:
 
 
 def _status_text(name: str, args: dict) -> str:
+    if name == "summarize_reports":
+        return "正在盘点报告数量…"
     if name == "list_dimension_values":
         return f"正在查询库内「{args.get('dimension', '')}」的可选值…"
     if name == "count_matching_runs":

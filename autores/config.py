@@ -52,6 +52,28 @@ class ReportConfig:
     ttl_minutes: int = 120
 
 
+_PATH_FIELDS: dict[str, tuple[str, ...]] = {
+    "database": ("path",),
+    "scanner": ("benchmark_root",),
+    "report": ("output_dir",),
+}
+
+
+def _resolve_path(config_path: str, value: str) -> str:
+    """相对路径相对于 config 文件所在目录解析，避免受进程 cwd 影响。"""
+    if os.path.isabs(value):
+        return os.path.normpath(value)
+    base = os.path.dirname(os.path.abspath(config_path))
+    return os.path.normpath(os.path.join(base, value))
+
+
+def _resolve_paths(config_path: str, cfg: Config) -> None:
+    for section_name, keys in _PATH_FIELDS.items():
+        section = getattr(cfg, section_name)
+        for key in keys:
+            setattr(section, key, _resolve_path(config_path, getattr(section, key)))
+
+
 @dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -60,6 +82,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
+    config_path: str = "config.yaml"
 
 
 _SECTION_TYPES = {
@@ -97,13 +120,15 @@ def load_config(path: str | None = None) -> Config:
     path 缺省时按 AUTORES_CONFIG 环境变量或 ./config.yaml 查找。
     """
     path = path or os.environ.get("AUTORES_CONFIG", "config.yaml")
+    config_path = os.path.abspath(path)
 
     raw: dict[str, Any] = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
 
     cfg = Config()
+    cfg.config_path = config_path
     for section_name, section_type in _SECTION_TYPES.items():
         section_raw = raw.get(section_name, {}) or {}
         # 只接受 dataclass 已声明的键，忽略多余键
@@ -113,6 +138,7 @@ def load_config(path: str | None = None) -> Config:
         _apply_env_overrides(section_name, section_obj)
         setattr(cfg, section_name, section_obj)
 
+    _resolve_paths(config_path, cfg)
     return cfg
 
 

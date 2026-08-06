@@ -3,7 +3,7 @@ Excel 渲染（design.md §7.4 步骤 4-5）。纯数据对比表，无图表、
 
 版式（矩阵式宽表）：
   - 行 = (Input_Length, Concurrency) 组合，按输入长度分块
-  - 列 = 每个指标一个"列组"，组内 = 对比轴各取值 + 差异列（仅两方对比时）
+  - 列 = 每个指标一个"列组"，组内 = 对比轴各取值 + 两两差异列（≥2 个取值时）
   - 双层表头：第 1 行为指标名（跨列合并），第 2 行为对比轴取值 / "A vs B"
   - 每个 Input_Length 块结束后插入一行块汇总：该块内各差异列的均值
 """
@@ -15,6 +15,8 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+from autores.server.report import hardware
 
 _HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
@@ -80,6 +82,28 @@ def _relative_delta(base, ref, *, lower_is_better: bool = False):
     return (b - r) / r
 
 
+def _compare_pairs(column_labels: list) -> list[tuple]:
+    """对比轴取值的两两组合 (A, B, "A vs B")，A 在前、B 在后。"""
+    pairs = []
+    for i, a in enumerate(column_labels):
+        for b in column_labels[i + 1:]:
+            pairs.append((a, b, f"{a} vs {b}"))
+    return pairs
+
+
+def _write_delta_cell(ws, row: int, col: int, delta, accum: dict[int, list[float]]):
+    """写入单个差异单元格并累计块汇总。"""
+    c = ws.cell(row=row, column=col, value=delta if delta is not None else "N/A")
+    c.alignment = _CENTER
+    c.border = _BORDER
+    if delta is not None:
+        c.number_format = _DELTA_FORMAT
+        _style_delta_cell(c, delta)
+        accum[col].append(delta)
+    else:
+        c.fill = _DELTA_FILL
+
+
 def _style_delta_cell(cell, delta, *, bold: bool = False):
     """正数绿色、负数红色；零或 N/A 不着色。"""
     if not isinstance(delta, (int, float)):
@@ -104,11 +128,26 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     matrix = table["matrix"]
     metric_names = table["metric_names"]
 
-    # 仅当对比轴恰好两个取值时才有意义计算 "A vs B" 差异列
-    two_way = len(column_labels) == 2
-    delta_header = f"{column_labels[0]} vs {column_labels[1]}" if two_way else None
-    # 每个指标占的列数：对比轴取值数（+ 1 个差异列）
-    group_width = len(column_labels) + (1 if two_way else 0)
+    gpu_scaled = table.get("gpu_scaled", False)
+    column_gpus = table.get("column_gpus", {})
+    column_scale = table.get("column_scale", {})
+
+    def _col_display(label) -> str:
+        """列标签：弱扩展换算时追加 (×比例) 标识。"""
+        scale = column_scale.get(label, 1)
+        if gpu_scaled and scale not in (None, 1):
+            return f"{label} (×{scale:g})"
+        return str(label)
+
+    def _metric_display(mname: str) -> str:
+        """吞吐类指标名：换算后追加 (× scale) 标识。"""
+        if gpu_scaled and mname in hardware.THROUGHPUT_METRICS:
+            return f"{mname} (× scale)"
+        return mname
+
+    compare_pairs = _compare_pairs(column_labels)
+    # 每个指标占的列数：对比轴取值数 + 两两差异列数
+    group_width = len(column_labels) + len(compare_pairs)
 
     # ── 标题区 ──
     ws.cell(row=1, column=1, value=f"对比轴: {compare_on}").font = _TITLE_FONT
@@ -120,8 +159,20 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
         note_bits.append("含多个框架（版本号不可跨框架比较）")
     if table["notes"].get("multi_version"):
         note_bits.append("含多个框架版本（各自独立取出）")
-    if not two_way:
-        note_bits.append(f"对比轴取值数为 {len(column_labels)}，不生成差异列（仅两方对比时提供）")
+    if len(column_labels) > 2:
+        note_bits.append(f"对比轴 {len(column_labels)} 个取值，差异列为两两对比")
+    if gpu_scaled:
+        parts = []
+        for label in column_labels:
+            gpus = column_gpus.get(label)
+            if gpus:
+                scale = column_scale.get(label, 1)
+                tag = f"×{scale:g}" if scale not in (None, 1) else "基准"
+                parts.append(f"{label}={hardware.unit_desc(gpus)}({tag})")
+        note_bits.append(
+            "已按卡数弱扩展归一：吞吐类×卡数比例、concurrency 同比对齐、"
+            "延迟类(TTFT/TPOT/ITL/E2E)保持原值　" + "，".join(parts)
+        )
     if note_bits:
         ws.cell(row=3, column=1, value="说明: " + "；".join(note_bits))
 
@@ -137,18 +188,18 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     # 指标列组
     col = 3
     delta_columns: list[int] = []
-    delta_col_metric: dict[int, str] = {}  # 差异列号 → 指标名（块汇总着色用）
     for mname in metric_names:
         end_col = col + group_width - 1
         if group_width > 1:
             ws.merge_cells(start_row=top_row, start_column=col, end_row=top_row, end_column=end_col)
-        ws.cell(row=top_row, column=col, value=mname)
+        ws.cell(row=top_row, column=col, value=_metric_display(mname))
         for offset, col_label in enumerate(column_labels):
-            ws.cell(row=sub_row, column=col + offset, value=str(col_label))
-        if two_way:
-            ws.cell(row=sub_row, column=end_col, value=delta_header)
-            delta_columns.append(end_col)
-            delta_col_metric[end_col] = mname
+            ws.cell(row=sub_row, column=col + offset, value=_col_display(col_label))
+        for k, (label_a, label_b, _) in enumerate(compare_pairs):
+            delta_col = col + len(column_labels) + k
+            ws.cell(row=sub_row, column=delta_col,
+                    value=f"{_col_display(label_a)} vs {_col_display(label_b)}")
+            delta_columns.append(delta_col)
         col = end_col + 1
 
     last_col = col - 1
@@ -168,7 +219,7 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
 
     def flush_block(cursor: int) -> int:
         """写入当前块的差异均值汇总行，返回下一个可用行号。"""
-        if not two_way or not any(delta_accum.values()):
+        if not compare_pairs or not any(delta_accum.values()):
             delta_accum.update({j: [] for j in delta_columns})
             return cursor
         for j in delta_columns:
@@ -206,23 +257,15 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
                             value=per_column.get(col_label, "N/A"))
                 c.alignment = _CENTER
                 c.border = _BORDER
-            if two_way:
-                delta_col = col + group_width - 1
+            lower = _is_lower_better(mname)
+            for k, (label_a, label_b, _) in enumerate(compare_pairs):
+                delta_col = col + len(column_labels) + k
                 delta = _relative_delta(
-                    per_column.get(column_labels[0]),
-                    per_column.get(column_labels[1]),
-                    lower_is_better=_is_lower_better(mname),
+                    per_column.get(label_a),
+                    per_column.get(label_b),
+                    lower_is_better=lower,
                 )
-                c = ws.cell(row=row_cursor, column=delta_col,
-                            value=delta if delta is not None else "N/A")
-                c.alignment = _CENTER
-                c.border = _BORDER
-                if delta is not None:
-                    c.number_format = _DELTA_FORMAT
-                    _style_delta_cell(c, delta)
-                    delta_accum[delta_col].append(delta)
-                else:
-                    c.fill = _DELTA_FILL
+                _write_delta_cell(ws, row_cursor, delta_col, delta, delta_accum)
             col += group_width
         row_cursor += 1
 

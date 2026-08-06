@@ -88,6 +88,32 @@ class Database:
             out.append({"value": val, "count": r["cnt"]})
         return out
 
+    def group_counts(self, dimensions: list[str],
+                     where_sql: str = "", params: list | None = None) -> list[dict]:
+        """
+        按一个或多个维度分组统计记录数。
+        返回 [{dim1: v1, dim2: v2, ..., "count": n}, ...]，按 count 降序。
+        """
+        cols = [schema.dimension_column(d) for d in dimensions]
+        col_list = ", ".join(cols)
+        sql = f"SELECT {col_list}, COUNT(*) AS cnt FROM test_runs"
+        if where_sql:
+            sql += f" WHERE {where_sql}"
+        sql += f" GROUP BY {col_list} ORDER BY cnt DESC"
+        with self._lock:
+            rows = self._conn.execute(sql, params or []).fetchall()
+        out = []
+        for r in rows:
+            item = {}
+            for dim, col in zip(dimensions, cols):
+                val = r[col]
+                if dim in schema.BOOL_PARAMS and val is not None:
+                    val = bool(val)
+                item[dim] = val
+            item["count"] = r["cnt"]
+            out.append(item)
+        return out
+
     # ── ingest_log ──
 
     def ingested_dirs(self) -> set[str]:
