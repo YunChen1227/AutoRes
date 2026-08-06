@@ -2,12 +2,36 @@
 # 所有项均可用环境变量 AUTORES_<段>_<键> 覆盖（如 AUTORES_LLM_API_KEY）。
 
 llm:                                  # 使用方重点填写（design.md D2）
-  base_url: "http://your-llm-host:8000/v1"   # OpenAI 兼容端点
+  # provider: openai_compat | zhipu
+  #   openai_compat — 本地 vLLM/SGLang 等 OpenAI 兼容端点
+  #   zhipu         — 智谱开放平台（需 pip install zai-sdk，见 docs.bigmodel.cn）
+  provider: "openai_compat"
+  base_url: "http://your-llm-host:8000/v1"   # openai_compat 示例
   api_key: "sk-xxxx"                          # 无鉴权端点可填任意占位
   model: "your-model-name"
   temperature: 0.1                            # 意图解析用低温
   timeout_seconds: 60
   max_tool_rounds: 8
+  max_tokens: 8192
+  thinking_enabled: false              # 智谱 glm-4.7-flash 可设为 true，前端会折叠展示思考过程
+
+# 智谱 GLM 直连示例：
+# llm:
+#   provider: "zhipu"
+#   base_url: "https://open.bigmodel.cn/api/paas/v4"
+#   api_key: "YOUR_ZHIPU_API_KEY"
+#   model: "glm-4.7-flash"
+#   thinking_enabled: true
+#   max_tokens: 8192
+#
+# UCloud ModelVerse 示例（OpenAI 兼容，文档见 astraflow.ucloud.cn）：
+# llm:
+#   provider: "openai_compat"
+#   base_url: "https://api.modelverse.cn/v1"
+#   api_key: "YOUR_MODELVERSE_API_KEY"
+#   model: "zai-org/glm-4.7"          # 或 glm-5.2 等，见 GET /v1/models
+#   thinking_enabled: true
+#   max_tokens: 8192
 
 database:                             # SQLite 单文件数据库，零部署
   path: "var/data/autores.db"         # 放本地磁盘（勿放 NAS，网络文件系统上锁不可靠）

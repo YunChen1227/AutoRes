@@ -59,7 +59,7 @@ vllm 场景需额外传 `--bench-cmd`（用于补 `--random-input-len`），且 
 
 1. 上传符合固定 schema 的结果 CSV（须含 `Input_Length`、`Concurrency`）
 2. 上传启动命令 txt（支持 `#` 注释、空行、反斜杠续行）
-3. 填写 `framework` / `framework_version` / `model` / `model_version` / `gpu_type`
+3. 填写 `framework` / `framework_version` / `model`，并从下拉框选择 `gpu_type`（模型无版本时不必填版本）
 
 启动参数提取复用 `tools/to_csv.py` 的同一套规则，入库记录与 Scanner 路径在查询/报告环节无差别。详见 design.md §5.6。
 
@@ -102,7 +102,7 @@ vllm serve /models/Qwen2.5-72B \
   --enable-prefix-caching
 ```
 
-上传时表单可填：`framework=sglang`、`framework_version=0.4.6`、`model=GLM-4.5`、`model_version=distributed2`、`gpu_type=H20-141G`（与 txt 中命令对应即可）。
+上传时表单可填：`framework=sglang`、`framework_version=0.4.6`、`model=GLM-4.5`、`gpu_type=H20-141G`（显卡从下拉选择；与 txt 中命令对应即可）。
 
 ### 3. 部署服务
 

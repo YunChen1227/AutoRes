@@ -40,11 +40,15 @@
   .field.full { grid-column: 1 / -1; }
   label { font-size: 13px; font-weight: 500; }
   label .req { color: var(--err); }
-  input[type="text"], select {
+  input[type="text"], select, textarea {
     border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
     font: inherit; background: #fff; width: 100%;
   }
-  input[type="text"]:focus, select:focus { outline: 2px solid #cfe0f2; border-color: var(--accent); }
+  textarea {
+    min-height: 100px; resize: vertical; line-height: 1.5;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px;
+  }
+  input[type="text"]:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f2; border-color: var(--accent); }
   .filebox {
     border: 1px dashed #c8ccd4; border-radius: 10px; padding: 14px;
     display: flex; align-items: center; gap: 12px; background: #fafbfc;
@@ -84,10 +88,11 @@
   <main>
     <form id="form">
       <div class="card">
-        <h3>1. 上传文件</h3>
+        <h3>1. 上传数据</h3>
         <div class="desc">
-          CSV 需含 <b>Input_Length</b> 与 <b>Concurrency</b> 两列（to_csv.py 产出的固定 schema）；
-          txt 写服务启动命令原文，支持 # 注释行与反斜杠续行。
+          CSV 需含 <b>Input Length / Input_Length</b> 与 <b>Concurrency</b> 两列（维度）；
+          其他指标列名会自动映射到 to_csv.py 规范 schema（如 Request Thr → Request_Throughput）。
+          启动命令直接粘贴，支持 # 注释行与反斜杠续行。
         </div>
         <div class="field" style="margin-bottom:14px;">
           <label>结果 CSV <span class="req">*</span></label>
@@ -97,18 +102,15 @@
           </div>
         </div>
         <div class="field">
-          <label>启动命令 TXT <span class="req">*</span></label>
-          <div class="filebox">
-            <input type="file" name="launch_file" accept=".txt,text/plain" required>
-            <span class="tag">launch_cmd.txt</span>
-          </div>
+          <label>启动命令 <span class="req">*</span></label>
+          <textarea name="launch_cmd" id="launch_cmd" required placeholder="例如：&#10;python -m sglang.launch_server \&#10;  --model-path /models/GLM-4.5 \&#10;  --tp-size 8"></textarea>
         </div>
       </div>
 
       <div class="card">
         <h3>2. 填写元信息</h3>
         <div class="desc">
-          这些字段无法从 CSV / txt 推断，需手工填写。其中<b>框架</b>决定用哪套启动参数提取规则与默认值回填。
+          这些字段无法从 CSV / 启动命令推断，需手工填写。其中<b>框架</b>决定用哪套启动参数提取规则与默认值回填。
         </div>
         <div class="grid">
           <div class="field">
@@ -124,12 +126,8 @@
             <input type="text" name="model" placeholder="如 GLM-4.5" required>
           </div>
           <div class="field">
-            <label>模型版本 <span class="req">*</span></label>
-            <input type="text" name="model_version" placeholder="如 distributed2" required>
-          </div>
-          <div class="field full">
             <label>显卡 <span class="req">*</span></label>
-            <input type="text" name="gpu_type" placeholder="如 H20-141G" required>
+            <select name="gpu_type" id="gpu_type" required></select>
           </div>
         </div>
       </div>
@@ -152,23 +150,29 @@
   const resetBtn = document.getElementById("reset");
   const result = document.getElementById("result");
   const frameworkSel = document.getElementById("framework");
+  const gpuSel = document.getElementById("gpu_type");
 
-  // 框架列表从后端取，避免前后端各维护一份
+  function fillSelect(sel, items) {
+    items.forEach(function (v) {
+      const opt = document.createElement("option");
+      opt.value = v; opt.textContent = v;
+      sel.appendChild(opt);
+    });
+  }
+
+  // 框架 / 显卡列表从后端取，避免前后端各维护一份
   fetch("/api/upload/options")
     .then(function (r) { return r.json(); })
     .then(function (d) {
-      (d.frameworks || []).forEach(function (fw) {
-        const opt = document.createElement("option");
-        opt.value = fw; opt.textContent = fw;
-        frameworkSel.appendChild(opt);
-      });
+      fillSelect(frameworkSel, d.frameworks || []);
+      fillSelect(gpuSel, d.gpu_types || []);
     })
     .catch(function () {
-      ["sglang", "vllm"].forEach(function (fw) {
-        const opt = document.createElement("option");
-        opt.value = fw; opt.textContent = fw;
-        frameworkSel.appendChild(opt);
-      });
+      fillSelect(frameworkSel, ["sglang", "vllm"]);
+      fillSelect(gpuSel, [
+        "H20-141G", "H20-96G", "910B3", "910B4-32G", "910B4-64G",
+        "C550", "PPU810E", "PPU890",
+      ]);
     });
 
   function esc(s) {

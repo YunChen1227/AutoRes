@@ -45,6 +45,13 @@ def health(request: Request):
     return JSONResponse(status)
 
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
 @router.post("/api/chat")
 async def chat(request: Request):
     body = await request.json()
@@ -60,6 +67,7 @@ async def chat(request: Request):
     sess.messages.append({"role": "user", "content": message})
 
     def event_stream():
+        yield ": connected\n\n"
         try:
             for event in agent.run_turn(sess.messages):
                 yield _sse(event)
@@ -70,33 +78,38 @@ async def chat(request: Request):
             st.sessions.trim(sess)
             yield _sse({"type": "done"})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS,
+    )
 
 
 @router.get("/upload")
 def upload_page():
-    """手工上传子页面（CSV + 启动命令 txt）。"""
+    """手工上传子页面（CSV + 启动命令文本）。"""
     return FileResponse(_UPLOAD_PAGE, media_type="text/html")
 
 
 @router.get("/api/upload/options")
 def upload_options():
-    """上传表单的可选项（框架列表由后端规则表提供，避免前后端各写一份）。"""
-    return JSONResponse({"frameworks": launch_params.supported_frameworks()})
+    """上传表单可选项（框架 / 显卡由后端规则表提供，避免前后端各写一份）。"""
+    return JSONResponse({
+        "frameworks": launch_params.supported_frameworks(),
+        "gpu_types": upload_mod.supported_gpu_types(),
+    })
 
 
 @router.post("/api/upload")
 async def upload_run(
     request: Request,
     csv_file: UploadFile = File(...),
-    launch_file: UploadFile = File(...),
+    launch_cmd: str = Form(...),
     framework: str = Form(...),
     framework_version: str = Form(...),
     model: str = Form(...),
-    model_version: str = Form(...),
     gpu_type: str = Form(...),
+    model_version: str = Form(""),
 ):
-    """手工上传一次测试结果入库。校验失败返回 400 并说明原因，供用户修正后重试。"""
+    """手工上传一次测试结果入库。启动命令通过 launch_cmd 文本字段提交。"""
     st = request.app.state
     meta = {
         "framework": framework,
@@ -107,8 +120,7 @@ async def upload_run(
     }
     try:
         csv_bytes = await csv_file.read()
-        txt_bytes = await launch_file.read()
-        summary = upload_mod.ingest(st.db, meta, csv_bytes, txt_bytes)
+        summary = upload_mod.ingest(st.db, meta, csv_bytes, launch_cmd)
     except UploadError as e:
         log.info("上传校验失败", extra={"fields": {"error": str(e)}})
         return JSONResponse({"error": str(e)}, status_code=400)

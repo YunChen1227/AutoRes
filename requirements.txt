@@ -3,4 +3,5 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 openpyxl>=3.1
 openai>=1.30
+zai-sdk>=0.2.2
 pyyaml>=6.0

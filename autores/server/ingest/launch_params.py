@@ -39,13 +39,14 @@ def _load():
 
 
 def supported_frameworks() -> list[str]:
-    """支持的框架列表（= 默认值表的键，前端下拉与后端校验共用同一来源）。"""
-    return sorted(_load().FRAMEWORK_DEFAULTS.keys())
+    """支持的框架列表（与 tools/to_csv.py --framework choices 一致）。"""
+    # 旧版读 FRAMEWORK_DEFAULTS；param_map 重写后默认值表已移除，改为与 CLI choices 对齐。
+    return ["sglang", "vllm"]
 
 
 def extract(framework: str, launch_cmd: str) -> tuple[dict, dict]:
     """从启动命令提取 (params, extra)。framework 非法时抛 ValueError。"""
     mod = _load()
-    if framework not in mod.FRAMEWORK_DEFAULTS:
+    if framework not in supported_frameworks():
         raise ValueError(f"不支持的框架: {framework}")
     return mod.extract_launch_params(framework, launch_cmd)

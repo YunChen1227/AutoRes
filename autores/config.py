@@ -10,12 +10,16 @@ import yaml
 
 @dataclass
 class LLMConfig:
+    # openai_compat：本地/自建 OpenAI 兼容端点；zhipu：智谱开放平台（zai-sdk）
+    provider: str = "openai_compat"
     base_url: str = "http://localhost:8000/v1"
     api_key: str = "placeholder"
     model: str = "default"
     temperature: float = 0.1
     timeout_seconds: int = 60
     max_tool_rounds: int = 8
+    max_tokens: int = 8192
+    thinking_enabled: bool = False
 
 
 @dataclass

@@ -21,7 +21,8 @@ _HEADER_FONT = Font(bold=True, color="FFFFFF")
 _TITLE_FONT = Font(bold=True, size=12)
 _DIM_FILL = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
 _DELTA_FILL = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
-_SUMMARY_FONT = Font(bold=True, color="C00000")
+_DELTA_POS_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+_DELTA_NEG_FILL = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
 _CENTER = Alignment(horizontal="center", vertical="center")
 _THIN = Side(style="thin", color="BFBFBF")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
@@ -57,12 +58,38 @@ def _as_number(value):
         return None
 
 
-def _relative_delta(base, ref):
-    """(base - ref) / ref。任一侧缺失或 ref 为 0 时返回 None。"""
+# 延迟类指标：越低越好，差异列符号与吞吐类相反
+_LOWER_IS_BETTER_PREFIXES = ("TTFT_", "TPOT_", "ITL_", "E2E_")
+
+
+def _is_lower_better(metric_name: str) -> bool:
+    return metric_name.startswith(_LOWER_IS_BETTER_PREFIXES)
+
+
+def _relative_delta(base, ref, *, lower_is_better: bool = False):
+    """
+    相对差异 (A vs B)，A=base（对比轴第一列），B=ref（第二列）。
+    吞吐类：越高越好 → (A-B)/B，A 更高则为正。
+    延迟类：越低越好 → (B-A)/B，A 更低则为正。
+    """
     b, r = _as_number(base), _as_number(ref)
     if b is None or r is None or r == 0:
         return None
+    if lower_is_better:
+        return (r - b) / r
     return (b - r) / r
+
+
+def _style_delta_cell(cell, delta, *, bold: bool = False):
+    """正数绿色、负数红色；零或 N/A 不着色。"""
+    if not isinstance(delta, (int, float)):
+        return
+    if delta > 0:
+        cell.font = Font(bold=bold, color="006100")
+        cell.fill = _DELTA_POS_FILL
+    elif delta < 0:
+        cell.font = Font(bold=bold, color="C00000")
+        cell.fill = _DELTA_NEG_FILL
 
 
 def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
@@ -109,7 +136,8 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
 
     # 指标列组
     col = 3
-    delta_columns: list[int] = []  # 记录差异列的列号，供块汇总使用
+    delta_columns: list[int] = []
+    delta_col_metric: dict[int, str] = {}  # 差异列号 → 指标名（块汇总着色用）
     for mname in metric_names:
         end_col = col + group_width - 1
         if group_width > 1:
@@ -120,6 +148,7 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
         if two_way:
             ws.cell(row=sub_row, column=end_col, value=delta_header)
             delta_columns.append(end_col)
+            delta_col_metric[end_col] = mname
         col = end_col + 1
 
     last_col = col - 1
@@ -146,11 +175,12 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
             vals = delta_accum[j]
             if not vals:
                 continue
-            c = ws.cell(row=cursor, column=j, value=sum(vals) / len(vals))
-            c.font = _SUMMARY_FONT
+            avg = sum(vals) / len(vals)
+            c = ws.cell(row=cursor, column=j, value=avg)
             c.alignment = _CENTER
             c.number_format = _DELTA_FORMAT
             c.border = _BORDER
+            _style_delta_cell(c, avg, bold=True)
         delta_accum.update({j: [] for j in delta_columns})
         return cursor + 1
 
@@ -181,15 +211,18 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
                 delta = _relative_delta(
                     per_column.get(column_labels[0]),
                     per_column.get(column_labels[1]),
+                    lower_is_better=_is_lower_better(mname),
                 )
                 c = ws.cell(row=row_cursor, column=delta_col,
                             value=delta if delta is not None else "N/A")
                 c.alignment = _CENTER
-                c.fill = _DELTA_FILL
                 c.border = _BORDER
                 if delta is not None:
                     c.number_format = _DELTA_FORMAT
+                    _style_delta_cell(c, delta)
                     delta_accum[delta_col].append(delta)
+                else:
+                    c.fill = _DELTA_FILL
             col += group_width
         row_cursor += 1
 
