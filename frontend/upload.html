@@ -36,16 +36,18 @@
   .card h3 { margin: 0 0 4px; font-size: 15px; color: var(--accent); }
   .card .desc { color: var(--muted); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .field:last-child { margin-bottom: 0; }
   .field.full { grid-column: 1 / -1; }
   label { font-size: 13px; font-weight: 500; }
   label .req { color: var(--err); }
+  label .muted { color: var(--muted); font-weight: 400; }
   input[type="text"], select, textarea {
     border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
     font: inherit; background: #fff; width: 100%;
   }
   textarea {
-    min-height: 100px; resize: vertical; line-height: 1.5;
+    min-height: 92px; resize: vertical; line-height: 1.5;
     font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px;
   }
   input[type="text"]:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f2; border-color: var(--accent); }
@@ -54,16 +56,23 @@
     display: flex; align-items: center; gap: 12px; background: #fafbfc;
   }
   .filebox input[type="file"] { font: inherit; font-size: 13px; flex: 1; min-width: 0; }
-  .filebox .tag {
-    font-size: 12px; color: var(--muted); white-space: nowrap;
+  .filebox .tag { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  /* 部署模式选项卡 */
+  .tabs { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-bottom: 14px; }
+  .tab {
+    background: #fff; color: var(--muted); border: none; height: 36px; padding: 0 18px;
+    font-size: 13px; cursor: pointer; border-radius: 0;
   }
+  .tab + .tab { border-left: 1px solid var(--border); }
+  .tab.active { background: var(--accent); color: #fff; }
+  .autohint { font-size: 12px; color: #8a6d00; min-height: 16px; }
   .actions { display: flex; align-items: center; gap: 12px; }
-  button {
+  button.primary {
     background: var(--accent); color: #fff; border: none; border-radius: 10px;
     padding: 0 24px; height: 42px; font-size: 15px; cursor: pointer;
   }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
-  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); height: 42px; border-radius: 10px; padding: 0 18px; cursor: pointer; }
   .result { padding: 14px; border-radius: 10px; margin-top: 16px; display: none; line-height: 1.6; }
   .result.err { background: var(--err-bg); color: var(--err); display: block; }
   .result.ok { background: var(--ok-bg); color: var(--ok); display: block; }
@@ -91,19 +100,50 @@
         <h3>1. 上传数据</h3>
         <div class="desc">
           CSV 需含 <b>Input Length / Input_Length</b> 与 <b>Concurrency</b> 两列（维度）；
-          其他指标列名会自动映射到 to_csv.py 规范 schema（如 Request Thr → Request_Throughput）。
-          启动命令直接粘贴，支持 # 注释行与反斜杠续行。
+          其他指标列名会自动映射到 to_csv.py 规范 schema。启动命令直接粘贴，支持 # 注释行与反斜杠续行。<br>
+          默认「单机 / 分布式」；<b>若命令里出现 disaggregation / kv-transfer-config 等 PD 参数，会自动切到「PD 分离」</b>，
+          需分别填写 prefill、decode（router 可选）。
         </div>
-        <div class="field" style="margin-bottom:14px;">
+
+        <div class="field">
           <label>结果 CSV <span class="req">*</span></label>
           <div class="filebox">
             <input type="file" name="csv_file" accept=".csv,text/csv" required>
-            <span class="tag">result.csv</span>
+            <span class="tag">result.csv（一次测试一份，PD 也是打整体服务的一份）</span>
           </div>
         </div>
-        <div class="field">
-          <label>启动命令 <span class="req">*</span></label>
-          <textarea name="launch_cmd" id="launch_cmd" required placeholder="例如：&#10;python -m sglang.launch_server \&#10;  --model-path /models/GLM-4.5 \&#10;  --tp-size 8"></textarea>
+
+        <input type="hidden" name="deployment_mode" id="deployment_mode" value="colocated">
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab active" data-mode="colocated">单机 / 分布式</button>
+          <button type="button" class="tab" data-mode="pd_disagg">PD 分离</button>
+        </div>
+
+        <div id="panel-colocated">
+          <div class="field">
+            <label>启动命令 <span class="req">*</span></label>
+            <textarea name="launch_cmd" id="launch_cmd"
+              placeholder="例如：&#10;python -m sglang.launch_server \&#10;  --model-path /models/GLM-4.5 \&#10;  --tp-size 8"></textarea>
+            <div class="autohint" id="autohint"></div>
+          </div>
+        </div>
+
+        <div id="panel-pd" style="display:none;">
+          <div class="field">
+            <label>Prefill 启动命令 <span class="req">*</span></label>
+            <textarea name="prefill_cmd" id="prefill_cmd"
+              placeholder="sglang: python -m sglang.launch_server --disaggregation-mode prefill --tp-size 16 ...&#10;vllm : vllm serve ... --kv-transfer-config '{&quot;kv_connector&quot;:&quot;NixlConnector&quot;,&quot;kv_role&quot;:&quot;kv_producer&quot;}'"></textarea>
+          </div>
+          <div class="field">
+            <label>Decode 启动命令 <span class="req">*</span></label>
+            <textarea name="decode_cmd" id="decode_cmd"
+              placeholder="sglang: python -m sglang.launch_server --disaggregation-mode decode --tp-size 16 ...&#10;vllm : vllm serve ... --kv-transfer-config '{&quot;kv_connector&quot;:&quot;NixlConnector&quot;,&quot;kv_role&quot;:&quot;kv_consumer&quot;}'"></textarea>
+          </div>
+          <div class="field">
+            <label>Router / Proxy 启动命令 <span class="muted">(可选，含轮询策略)</span></label>
+            <textarea name="router_cmd" id="router_cmd"
+              placeholder="python -m sglang_router.launch_router --pd-disaggregation \&#10;  --prefill-policy cache_aware --decode-policy power_of_two \&#10;  --prefill http://p0:30000 --decode http://d0:30000"></textarea>
+          </div>
         </div>
       </div>
 
@@ -134,7 +174,7 @@
 
       <div class="card">
         <div class="actions">
-          <button type="submit" id="submit">提交入库</button>
+          <button type="submit" class="primary" id="submit">提交入库</button>
           <button type="button" class="ghost" id="reset">清空</button>
         </div>
         <div id="result" class="result"></div>
@@ -151,16 +191,23 @@
   const result = document.getElementById("result");
   const frameworkSel = document.getElementById("framework");
   const gpuSel = document.getElementById("gpu_type");
+  const modeInput = document.getElementById("deployment_mode");
+  const tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+  const panelCo = document.getElementById("panel-colocated");
+  const panelPd = document.getElementById("panel-pd");
+  const launchCmd = document.getElementById("launch_cmd");
+  const prefillCmd = document.getElementById("prefill_cmd");
+  const decodeCmd = document.getElementById("decode_cmd");
+  const autohint = document.getElementById("autohint");
 
   function fillSelect(sel, items) {
-    items.forEach(function (v) {
+    (items || []).forEach(function (v) {
       const opt = document.createElement("option");
       opt.value = v; opt.textContent = v;
       sel.appendChild(opt);
     });
   }
 
-  // 框架 / 显卡列表从后端取，避免前后端各维护一份
   fetch("/api/upload/options")
     .then(function (r) { return r.json(); })
     .then(function (d) {
@@ -175,6 +222,55 @@
       ]);
     });
 
+  // 与后端 param_map_pd.looks_like_pd 一致的关键字粗判：填好即自动跳转
+  function looksLikePd(s) {
+    if (!s) return false;
+    const low = s.toLowerCase();
+    return low.indexOf("disaggregation") >= 0 ||
+           low.indexOf("kv-transfer-config") >= 0 ||
+           low.indexOf("kv_role") >= 0;
+  }
+
+  function setMode(mode, opts) {
+    opts = opts || {};
+    modeInput.value = mode;
+    tabs.forEach(function (t) {
+      t.classList.toggle("active", t.dataset.mode === mode);
+    });
+    const isPd = mode === "pd_disagg";
+    panelCo.style.display = isPd ? "none" : "";
+    panelPd.style.display = isPd ? "" : "none";
+    if (!isPd) autohint.textContent = "";
+    if (isPd && opts.hint) autohint.textContent = "";
+  }
+
+  tabs.forEach(function (t) {
+    t.addEventListener("click", function () { setMode(t.dataset.mode); });
+  });
+
+  // 单机命令框里贴了 PD 命令 → 自动切到 PD，并把内容挪到 prefill 框
+  launchCmd.addEventListener("input", function () {
+    if (modeInput.value === "colocated" && looksLikePd(launchCmd.value)) {
+      const text = launchCmd.value;
+      launchCmd.value = "";
+      setMode("pd_disagg");
+      if (!prefillCmd.value.trim()) prefillCmd.value = text;
+      autohint.textContent = "";
+      // 提示信息放在 PD 面板顶部
+      showPdSwitchHint();
+    }
+  });
+
+  function showPdSwitchHint() {
+    result.className = "result ok";
+    result.innerHTML = "<h4>已自动切换到「PD 分离」</h4>" +
+      '<div class="kv">检测到 disaggregation / kv-transfer-config 参数，' +
+      "已把命令放入 <b>Prefill</b> 框，请补充 <b>Decode</b>（及可选 Router）命令。</div>";
+    setTimeout(function () {
+      if (result.className.indexOf("ok") >= 0) { result.className = "result"; result.innerHTML = ""; }
+    }, 6000);
+  }
+
   function esc(s) {
     return String(s).replace(/[&<>"]/g, function (c) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
@@ -186,46 +282,77 @@
     result.innerHTML = "<h4>入库失败</h4>" + esc(msg);
   }
 
-  function showOk(d) {
-    const params = d.params || {};
-    const kv = Object.keys(params).map(function (k) {
+  function kvLine(params) {
+    params = params || {};
+    return Object.keys(params).filter(function (k) {
+      return params[k] !== null && params[k] !== undefined && params[k] !== "";
+    }).map(function (k) {
       return esc(k) + "=" + esc(params[k]);
-    }).join("  ");
+    }).join("  ") || "（默认值，命令未显式设置）";
+  }
+
+  function showOk(d) {
     let html = "<h4>✓ 入库成功</h4>" +
       '<div class="kv">记录 ID: <b>' + esc(d.run_id) + "</b>　指标行数: <b>" +
-      esc(d.num_metrics) + "</b></div>";
+      esc(d.num_metrics) + "</b>　模式: <b>" +
+      (d.deployment_mode === "pd_disagg" ? "PD 分离" : "单机/分布式") + "</b></div>";
     if (d.disk_path) {
       html += '<div class="kv">落盘目录：<code>' + esc(d.disk_path) + "</code></div>";
     }
-    html +=
-      '<div class="kv">解析出的启动参数：<code>' + esc(kv) + "</code></div>" +
-      '<div class="kv">启动命令原文：<code>' + esc(d.launch_cmd) + "</code></div>";
-    if (d.unrecognized && d.unrecognized.length) {
-      html += '<div class="warn">⚠ 未识别的参数（已原样存入 extra，不影响入库）：' +
-              esc(d.unrecognized.join(" ")) + "</div>";
+    if (d.deployment_mode === "pd_disagg" && d.pd) {
+      const pd = d.pd;
+      html += '<div class="kv">传输后端：<b>' + esc(pd.transfer_backend || "—") + "</b></div>";
+      html += '<div class="kv">Prefill 参数：<code>' + esc(kvLine(pd.prefill && pd.prefill.params)) + "</code></div>";
+      html += '<div class="kv">Decode 参数：<code>' + esc(kvLine(pd.decode && pd.decode.params)) + "</code></div>";
+      if (pd.router && (pd.router.policy || pd.router.prefill_policy || pd.router.decode_policy)) {
+        html += '<div class="kv">Router 策略：<code>' + esc(kvLine({
+          policy: pd.router.policy, prefill_policy: pd.router.prefill_policy, decode_policy: pd.router.decode_policy,
+        })) + "</code></div>";
+      }
+      const unrec = [].concat(
+        (pd.prefill && pd.prefill.unrecognized) || [],
+        (pd.decode && pd.decode.unrecognized) || []);
+      if (unrec.length) {
+        html += '<div class="warn">⚠ 未识别参数（已存入 extra，不影响入库）：' + esc(unrec.join(" ")) + "</div>";
+      }
+    } else {
+      html += '<div class="kv">解析出的启动参数：<code>' + esc(kvLine(d.params)) + "</code></div>";
+      if (d.unrecognized && d.unrecognized.length) {
+        html += '<div class="warn">⚠ 未识别的参数（已原样存入 extra，不影响入库）：' +
+                esc(d.unrecognized.join(" ")) + "</div>";
+      }
     }
     result.className = "result ok";
     result.innerHTML = html;
+  }
+
+  function validate() {
+    if (modeInput.value === "pd_disagg") {
+      if (!prefillCmd.value.trim()) return "请填写 Prefill 启动命令";
+      if (!decodeCmd.value.trim()) return "请填写 Decode 启动命令";
+    } else {
+      if (!launchCmd.value.trim()) return "请填写启动命令";
+    }
+    return null;
   }
 
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
     result.className = "result";
     result.innerHTML = "";
+
+    const verr = validate();
+    if (verr) { showError(verr); return; }
+
     submit.disabled = true;
     submit.textContent = "提交中…";
-
     try {
-      const resp = await fetch("/api/upload", {
-        method: "POST",
-        body: new FormData(form),
-      });
+      const resp = await fetch("/api/upload", { method: "POST", body: new FormData(form) });
       const data = await resp.json();
       if (!resp.ok) {
         showError(data.error || ("HTTP " + resp.status));
       } else {
         showOk(data);
-        // 成功后只清文件选择，元信息保留——同一批测试常需连续上传多次
         form.querySelectorAll('input[type="file"]').forEach(function (i) { i.value = ""; });
       }
     } catch (err) {
@@ -238,6 +365,7 @@
 
   resetBtn.addEventListener("click", function () {
     form.reset();
+    setMode("colocated");
     result.className = "result";
     result.innerHTML = "";
   });

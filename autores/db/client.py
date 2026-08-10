@@ -30,6 +30,8 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(schema.DDL)
+            # 老库补齐后新增的列（PD 分离相关，D22）；ADD COLUMN 幂等，安全重入
+            schema.migrate(self._conn)
             self._conn.commit()
 
     # ── 基础 ──

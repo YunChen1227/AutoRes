@@ -12,12 +12,15 @@ import importlib.util
 import os
 import threading
 
-_TO_CSV = os.path.join(
+_TOOLS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
-    "tools", "to_csv.py",
+    "tools",
 )
+_TO_CSV = os.path.join(_TOOLS_DIR, "to_csv.py")
+_PARAM_MAP_PD = os.path.join(_TOOLS_DIR, "param_map_pd.py")
 
 _module = None
+_pd_module = None
 _lock = threading.Lock()
 
 
@@ -38,10 +41,38 @@ def _load():
     return _module
 
 
+def _load_pd():
+    """按路径加载 tools/param_map_pd.py（PD 分离解析表）。"""
+    global _pd_module
+    if _pd_module is not None:
+        return _pd_module
+    with _lock:
+        if _pd_module is not None:
+            return _pd_module
+        spec = importlib.util.spec_from_file_location("_autores_param_map_pd", _PARAM_MAP_PD)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"无法加载 PD 分离解析表: {_PARAM_MAP_PD}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _pd_module = mod
+    return _pd_module
+
+
 def supported_frameworks() -> list[str]:
     """支持的框架列表（与 tools/to_csv.py --framework choices 一致）。"""
     # 旧版读 FRAMEWORK_DEFAULTS；param_map 重写后默认值表已移除，改为与 CLI choices 对齐。
     return ["sglang", "vllm"]
+
+
+def router_policies() -> list[str]:
+    """router 可选路由策略（供前端下拉参考，仍接受自由输入）。"""
+    return list(_load_pd().ROUTER_POLICIES)
+
+
+def transfer_backends() -> dict[str, list[str]]:
+    """各框架 KV 传输后端参考取值（sglang 是 flag 取值，vllm 是连接器名）。"""
+    pd = _load_pd()
+    return {"sglang": list(pd.SGL_TRANSFER_BACKENDS)}
 
 
 def extract(framework: str, launch_cmd: str) -> tuple[dict, dict]:
@@ -50,3 +81,60 @@ def extract(framework: str, launch_cmd: str) -> tuple[dict, dict]:
     if framework not in supported_frameworks():
         raise ValueError(f"不支持的框架: {framework}")
     return mod.extract_launch_params(framework, launch_cmd)
+
+
+def detect_role(framework: str, launch_cmd: str) -> str | None:
+    """判断一条命令的 PD 角色：'prefill' / 'decode' / 'both' / None（非 PD）。"""
+    return _load_pd().detect_role(framework, launch_cmd)
+
+
+def looks_like_pd(launch_cmd: str) -> bool:
+    """按关键字粗判是否 PD（disaggregation / kv-transfer-config），供自动跳转用。"""
+    return _load_pd().looks_like_pd(launch_cmd)
+
+
+def _pd_flag_names() -> set[str]:
+    pd = _load_pd()
+    return set(pd.SGL_PD_FLAGS) | {pd.VLLM_KV_FLAG}
+
+
+def extract_role(framework: str, launch_cmd: str) -> dict:
+    """
+    解析一条 PD 角色（prefill 或 decode）server 启动命令，返回：
+      {
+        role: 'prefill'|'decode'|'both',
+        params: {...},        # 通用参数（tp/dp/...），由 param_map.py 解析
+        disagg: {...},        # PD 专属字段（transfer_backend/kv_role/...）
+        launch_cmd: str,
+        unrecognized: [...],  # 未识别 flag（已剔除 PD 专属 flag）
+        extra: {...},         # 通用参数解析的其它 extra（hicache_detail 等）
+      }
+    若该命令不是 PD 角色命令，role 为 None（调用方据此报错）。
+    """
+    pd = _load_pd()
+    role = pd.detect_role(framework, launch_cmd)
+    params, extra = extract(framework, launch_cmd)
+    disagg = pd.extract_disagg(framework, launch_cmd)
+
+    # 从 unrecognized 中剔除 PD 专属 flag（它们已被 disagg 解析，不算"未识别"）
+    pd_flags = _pd_flag_names()
+    unrecognized = []
+    for item in extra.pop("unrecognized", []):
+        first = item.split(" ", 1)[0]
+        if first in pd_flags:
+            continue
+        unrecognized.append(item)
+
+    return {
+        "role": role,
+        "params": params,
+        "disagg": disagg,
+        "launch_cmd": launch_cmd,
+        "unrecognized": unrecognized,
+        "extra": extra,
+    }
+
+
+def parse_router(router_cmd: str | None) -> dict:
+    """解析 router/proxy 启动命令，返回 {policy, prefill_policy, decode_policy, _extra}。"""
+    return _load_pd().parse_router(router_cmd or "")

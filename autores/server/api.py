@@ -91,25 +91,51 @@ def upload_page():
 
 @router.get("/api/upload/options")
 def upload_options():
-    """上传表单可选项（框架 / 显卡由后端规则表提供，避免前后端各写一份）。"""
+    """上传表单可选项（框架 / 显卡 / 路由策略由后端规则表提供，避免前后端各写一份）。"""
     return JSONResponse({
         "frameworks": launch_params.supported_frameworks(),
         "gpu_types": upload_mod.supported_gpu_types(),
+        "router_policies": launch_params.router_policies(),
+        "transfer_backends": launch_params.transfer_backends(),
     })
+
+
+@router.post("/api/upload/detect")
+async def upload_detect(
+    framework: str = Form(""),
+    command: str = Form(""),
+):
+    """
+    判断一条启动命令是否为 PD 分离（供前端"填好即自动跳转"）。
+    返回 {is_pd, role}；role 为 prefill/decode/both/null。
+    """
+    role = None
+    if framework in launch_params.supported_frameworks():
+        role = launch_params.detect_role(framework, command)
+    is_pd = role is not None or launch_params.looks_like_pd(command)
+    return JSONResponse({"is_pd": bool(is_pd), "role": role})
 
 
 @router.post("/api/upload")
 async def upload_run(
     request: Request,
     csv_file: UploadFile = File(...),
-    launch_cmd: str = Form(...),
     framework: str = Form(...),
     framework_version: str = Form(...),
     model: str = Form(...),
     gpu_type: str = Form(...),
     model_version: str = Form(""),
+    deployment_mode: str = Form("colocated"),
+    launch_cmd: str = Form(""),
+    prefill_cmd: str = Form(""),
+    decode_cmd: str = Form(""),
+    router_cmd: str = Form(""),
 ):
-    """手工上传一次测试结果入库。启动命令通过 launch_cmd 文本字段提交。"""
+    """手工上传一次测试结果入库。
+
+    单机/分布式：deployment_mode=colocated，命令走 launch_cmd。
+    PD 分离    ：deployment_mode=pd_disagg，命令走 prefill_cmd / decode_cmd（+ router_cmd）。
+    """
     st = request.app.state
     meta = {
         "framework": framework,
@@ -124,6 +150,10 @@ async def upload_run(
             st.db, meta, csv_bytes, launch_cmd,
             benchmark_root=st.config.scanner.benchmark_root,
             dir_pattern=st.config.scanner.dir_pattern,
+            deployment_mode=deployment_mode,
+            prefill_text=prefill_cmd,
+            decode_text=decode_cmd,
+            router_text=router_cmd,
         )
     except UploadError as e:
         log.info("上传校验失败", extra={"fields": {"error": str(e)}})

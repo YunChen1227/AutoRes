@@ -40,18 +40,35 @@ def metrics_to_csv_rows(metrics: list[dict]) -> list[dict[str, object]]:
     return rows
 
 
-def build_metadata(meta: dict, launch_cmd: str, params: dict, extra: dict) -> dict:
-    """组织 metadata.json（与 tools/to_csv.py build_metadata 字段对齐）。"""
-    return {
+def build_metadata(
+    meta: dict,
+    launch_cmd: str,
+    params: dict,
+    extra: dict,
+    *,
+    deployment_mode: str = "colocated",
+    pd: dict | None = None,
+) -> dict:
+    """组织 metadata.json（与 tools/to_csv.py build_metadata 字段对齐）。
+
+    PD 分离（deployment_mode='pd_disagg'）时额外写入 pd 块：
+      pd = {transfer_backend, prefill:{params,launch_cmd,disagg,unrecognized},
+            decode:{...}, router:{policy,prefill_policy,decode_policy,_extra,launch_cmd}}
+    """
+    out = {
         "framework": meta["framework"],
         "framework_version": meta["framework_version"],
         "model": meta["model"],
         "model_version": meta["model_version"],
         "gpu_type": meta["gpu_type"],
         "launch_cmd": launch_cmd,
+        "deployment_mode": deployment_mode,
         "params": params,
         "extra": extra,
     }
+    if deployment_mode == "pd_disagg" and pd is not None:
+        out["pd"] = pd
+    return out
 
 
 def allocate_timestamp_dir(benchmark_root: str, db, when: datetime) -> str:
@@ -107,6 +124,9 @@ def persist_upload(
     launch_cmd: str,
     params: dict,
     extra: dict,
+    *,
+    deployment_mode: str = "colocated",
+    pd: dict | None = None,
 ) -> tuple[str, str]:
     """
     落盘一次上传。返回 (dir_name, dir_path)。
@@ -117,6 +137,9 @@ def persist_upload(
 
     dir_name = allocate_timestamp_dir(root, db, when)
     dir_path = os.path.join(root, dir_name)
-    metadata = build_metadata(meta, launch_cmd, params, extra)
+    metadata = build_metadata(
+        meta, launch_cmd, params, extra,
+        deployment_mode=deployment_mode, pd=pd,
+    )
     write_run_dir(dir_path, metrics, metadata)
     return dir_name, dir_path

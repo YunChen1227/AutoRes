@@ -185,32 +185,109 @@ def resolve_launch_text(launch_text: str | None) -> str:
     return parse_launch_txt(raw)
 
 
+def _build_pd(framework: str, prefill_text: str, decode_text: str,
+              router_text: str | None) -> tuple[str, dict]:
+    """
+    解析 PD 分离的 prefill / decode / router 三条命令，返回 (combined_launch_cmd, pd_meta)。
+    prefill / decode 必填且角色需匹配；router 可选。
+    """
+    prefill_cmd = resolve_launch_text(prefill_text)
+    decode_cmd = resolve_launch_text(decode_text)
+    router_cmd = ""
+    if router_text and router_text.strip():
+        if len(router_text.encode("utf-8")) > MAX_TXT_BYTES:
+            raise UploadError(f"router 命令超过大小上限（{MAX_TXT_BYTES // 1024} KB）")
+        router_cmd = parse_launch_txt(router_text)
+
+    pf = launch_params.extract_role(framework, prefill_cmd)
+    dc = launch_params.extract_role(framework, decode_cmd)
+
+    if pf["role"] not in ("prefill", "both"):
+        raise UploadError(
+            "prefill 命令里未检测到 prefill 角色："
+            "sglang 需含 --disaggregation-mode prefill，vllm 需 kv_role=kv_producer/kv_both。"
+        )
+    if dc["role"] not in ("decode", "both"):
+        raise UploadError(
+            "decode 命令里未检测到 decode 角色："
+            "sglang 需含 --disaggregation-mode decode，vllm 需 kv_role=kv_consumer/kv_both。"
+        )
+
+    router = launch_params.parse_router(router_cmd)
+    transfer_backend = (pf["disagg"].get("transfer_backend")
+                        or dc["disagg"].get("transfer_backend"))
+
+    combined = f"# PREFILL\n{prefill_cmd}\n\n# DECODE\n{decode_cmd}"
+    if router_cmd:
+        combined += f"\n\n# ROUTER\n{router_cmd}"
+
+    pd_meta = {
+        "transfer_backend": transfer_backend,
+        "prefill": {
+            "params": pf["params"], "launch_cmd": prefill_cmd,
+            "disagg": pf["disagg"], "unrecognized": pf["unrecognized"],
+        },
+        "decode": {
+            "params": dc["params"], "launch_cmd": decode_cmd,
+            "disagg": dc["disagg"], "unrecognized": dc["unrecognized"],
+        },
+        "router": {**router, "launch_cmd": router_cmd},
+    }
+    return combined, pd_meta
+
+
 def ingest(
     db,
     meta_form: dict,
     csv_bytes: bytes,
-    launch_text: str,
+    launch_text: str | None = None,
     *,
     benchmark_root: str,
     dir_pattern: str,
+    deployment_mode: str = "colocated",
+    prefill_text: str | None = None,
+    decode_text: str | None = None,
+    router_text: str | None = None,
 ) -> dict:
     """
     完整上传流程：校验 → 解析 → 落盘 → 扫描入库。
     落盘后立即执行一轮 Scanner，与独立 Scanner 进程逻辑一致。
+
+    deployment_mode:
+      'colocated' —— 单机/分布式：读 launch_text 一条命令（原有行为）；
+      'pd_disagg' —— PD 分离：读 prefill_text / decode_text（必填）+ router_text（可选）。
     """
+    if deployment_mode not in ("colocated", "pd_disagg"):
+        raise UploadError(f"deployment_mode 非法: {deployment_mode}")
+
     meta = validate_meta(meta_form)
     csv_text = _decode(csv_bytes, "CSV 文件", MAX_CSV_BYTES)
-    launch_cmd = resolve_launch_text(launch_text)
-
     metrics = parse_csv_text(csv_text)
-    params, extra = launch_params.extract(meta["framework"], launch_cmd)
-    extra = dict(extra)
-    extra["ingest_source"] = "manual_upload"
+
+    extra: dict = {"ingest_source": "manual_upload"}
+
+    if deployment_mode == "pd_disagg":
+        launch_cmd, pd_meta = _build_pd(
+            meta["framework"], prefill_text, decode_text, router_text)
+        params: dict = {}
+        pd_block: dict | None = pd_meta
+    else:
+        launch_cmd = resolve_launch_text(launch_text)
+        # 安全网：单机模式却贴了 PD 命令 → 提示改用 PD 分离（前端应已自动跳转）
+        if launch_params.looks_like_pd(launch_cmd):
+            raise UploadError(
+                "检测到 disaggregation / kv-transfer-config 相关参数，"
+                "请切换到「PD 分离」分别填写 prefill 与 decode 命令。"
+            )
+        params, base_extra = launch_params.extract(meta["framework"], launch_cmd)
+        extra.update(base_extra)
+        pd_block = None
 
     now = datetime.now(timezone.utc)
     try:
         dir_name, dir_path = persist.persist_upload(
             benchmark_root, db, now, meta, metrics, launch_cmd, params, extra,
+            deployment_mode=deployment_mode, pd=pd_block,
         )
     except persist.PersistError as e:
         raise UploadError(str(e)) from e
@@ -224,14 +301,27 @@ def ingest(
             f"已落盘至 {dir_path}，但扫描入库失败（pending={pending}, ok={ok}, fail={fail}）"
         )
     doc = runs[0]
-    log.info("上传落盘并扫描入库", extra={"fields": {"dir": dir_path, "run_id": doc["_id"]}})
+    log.info("上传落盘并扫描入库", extra={"fields": {
+        "dir": dir_path, "run_id": doc["_id"], "deployment_mode": deployment_mode}})
 
-    return {
+    summary = {
         "run_id": doc["_id"],
         "source_dir": dir_name,
         "disk_path": dir_path,
         "num_metrics": len(doc["metrics"]),
+        "deployment_mode": deployment_mode,
         "launch_cmd": doc["launch_cmd"],
-        "params": doc.get("params", {}),
-        "unrecognized": doc.get("extra", {}).get("unrecognized", []),
     }
+    if deployment_mode == "pd_disagg":
+        summary["pd"] = {
+            "transfer_backend": pd_block["transfer_backend"],
+            "prefill": {"params": pd_block["prefill"]["params"],
+                        "unrecognized": pd_block["prefill"]["unrecognized"]},
+            "decode": {"params": pd_block["decode"]["params"],
+                       "unrecognized": pd_block["decode"]["unrecognized"]},
+            "router": {k: v for k, v in pd_block["router"].items() if k != "launch_cmd"},
+        }
+    else:
+        summary["params"] = doc.get("params", {})
+        summary["unrecognized"] = doc.get("extra", {}).get("unrecognized", [])
+    return summary

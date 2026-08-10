@@ -5,19 +5,21 @@ test_runs 表：一次测试 = 一行。
   run_id            : TEXT PRIMARY KEY（= timestamp 目录名，天然唯一/幂等）
   run_timestamp     : TEXT（ISO 8601）
   model / model_version / framework / framework_version / gpu_type / launch_cmd : TEXT
-  tp/dp/pp/ep/cp    : INTEGER（结构化启动参数，独立列，D18）
-  kv_cache_dtype / quantization / attention_backend : TEXT
-  hicache_enabled / flexkv_enabled / torch_compile  : INTEGER (0/1)
-  extra             : TEXT（JSON，框架专属细节 + 未识别参数）
-  metrics           : TEXT（JSON 数组，每个 (input_length, concurrency) 组合一条；
-                       对应此前"内嵌数组"建模——查询只按维度筛选，指标整取后在
-                       Python 侧透视，无需拆表）
+  deployment_mode   : TEXT（'colocated' = 单机/分布式；'pd_disagg' = PD 分离，D22）
+  <param>           : 单机/分布式的结构化启动参数（独立列，D18）
+  prefill_<param>   : PD 分离时 prefill 实例的同名参数（非 PD 记录为 NULL）
+  decode_<param>    : PD 分离时 decode 实例的同名参数（非 PD 记录为 NULL）
+  pd_transfer_backend / router_*  : PD 专属（传输后端、路由策略）
+  extra             : TEXT（JSON，框架专属细节 + 未识别参数 + PD 原文/长尾字段）
+  metrics           : TEXT（JSON 数组，每个 (input_length, concurrency) 组合一条）
   created_at        : TEXT（ISO 8601）
 
+  单行存储约定（D22，用户确认）：
+    - 单机/分布式记录：<param> 有值，prefill_/decode_/router_/pd_ 全部 NULL；
+    - PD 分离记录：<param> 全部 NULL，prefill_/decode_ 有值，router_/pd_transfer_backend 有值。
+    这样"不再为 PD 单独维护一套表结构"，靠 deployment_mode 区分即可。
+
 ingest_log 表：已入库目录台账。
-  source_dir        : TEXT PRIMARY KEY（= timestamp 目录名）
-  run_id            : TEXT
-  ingested_at       : TEXT（ISO 8601）
 """
 from __future__ import annotations
 
@@ -35,125 +37,169 @@ META_DIMENSIONS = [
 
 # ── 结构化启动参数维度（同样是直接列；文档/接口上仍归为 params）──
 #
-# 与 tools/param_map.py 的配对表一一对应（D17）。新增/删除参数时两边同步改，
-# 并跑 `python tools/verify_param_map.py` 确认 flag 仍存在于上游源码。
+# 与 tools/param_map.py 的配对表一一对应（D17）。(名字, SQL 类型, 是否布尔) 三元组，
+# 由此同时派生 PARAM_DIMENSIONS / BOOL_PARAMS / DDL 列定义，避免三处手工同步。
 #
 # 注意几个"看起来能比、实际不能比"的列（详见 param_map.py 各条 note）：
-#   mem_fraction         量纲不同（vllm 含激活值、sglang 不含），仅在两边都显式设置时可并列
-#   max_running_requests sglang 默认 None 按 KV 容量推导，vllm 固定 128
-#   chunked_prefill_size sglang 默认 None 按显存档位推导，vllm 固定 2048
-#   ep_enabled/ep_width  sglang 是宽度、vllm 是开关，必须归一后再比
-PARAM_DIMENSIONS = [
+#   mem_fraction / max_running_requests / chunked_prefill_size / ep_enabled 等。
+_PARAM_SPECS = [
     # 并行度
-    "tp",
-    "pp",
-    "dp",
-    "dcp",
-    "ep_enabled",
-    "ep_width",
+    ("tp", "INTEGER", False),
+    ("pp", "INTEGER", False),
+    ("dp", "INTEGER", False),
+    ("dcp", "INTEGER", False),
+    ("ep_enabled", "INTEGER", True),
+    ("ep_width", "INTEGER", False),
     # 显存 / KV
-    "mem_fraction",
-    "kv_cache_dtype",
-    "page_size",
-    "prefix_caching",
+    ("mem_fraction", "REAL", False),
+    ("kv_cache_dtype", "TEXT", False),
+    ("page_size", "INTEGER", False),
+    ("prefix_caching", "INTEGER", True),
     # 调度
-    "max_running_requests",
-    "chunked_prefill_size",
-    "context_length",
+    ("max_running_requests", "INTEGER", False),
+    ("chunked_prefill_size", "INTEGER", False),
+    ("context_length", "INTEGER", False),
     # 模型 / 量化
-    "dtype",
-    "quantization",
-    "trust_remote_code",
-    "served_model_name",
+    ("dtype", "TEXT", False),
+    ("quantization", "TEXT", False),
+    ("trust_remote_code", "INTEGER", True),
+    ("served_model_name", "TEXT", False),
     # 编译
-    "torch_compile",
+    ("torch_compile", "INTEGER", True),
     # 后端（sglang 专属，vllm 无等价 CLI flag）
-    "attention_backend",
-    "moe_a2a_backend",
-    "dp_attention",
+    ("attention_backend", "TEXT", False),
+    ("moe_a2a_backend", "TEXT", False),
+    ("dp_attention", "INTEGER", True),
     # 投机解码
-    "spec_algorithm",
-    "spec_num_steps",
-    "spec_eagle_topk",
-    "spec_num_draft_tokens",
+    ("spec_algorithm", "TEXT", False),
+    ("spec_num_steps", "INTEGER", False),
+    ("spec_eagle_topk", "INTEGER", False),
+    ("spec_num_draft_tokens", "INTEGER", False),
     # KV 分层 / 卸载（两边机制不同，仅粗略近似）
-    "hicache",
+    ("hicache", "INTEGER", True),
 ]
 
-# 布尔型参数列（SQLite 存 0/1，读出时还原为 bool）
-BOOL_PARAMS = {
-    "ep_enabled",
-    "prefix_caching",
-    "trust_remote_code",
-    "torch_compile",
-    "dp_attention",
-    "hicache",
-}
+PARAM_DIMENSIONS = [name for name, _t, _b in _PARAM_SPECS]
+_PARAM_SQL_TYPE = {name: t for name, t, _b in _PARAM_SPECS}
+_BASE_BOOL = {name for name, _t, b in _PARAM_SPECS if b}
 
-# Agent 可用于对比/筛选的全部维度（design.md §7.2 list_dimension_values 枚举）
-ALL_DIMENSIONS = META_DIMENSIONS + PARAM_DIMENSIONS
+# ── PD 分离（D22）──
+DEPLOYMENT_MODES = ("colocated", "pd_disagg")
+PD_ROLES = ("prefill", "decode")
+
+# prefill_/decode_ 前缀维度（列存在、可存储/展示；暂不进 Agent 对比枚举，见 ALL_DIMENSIONS）
+PREFILL_DIMENSIONS = [f"prefill_{n}" for n in PARAM_DIMENSIONS]
+DECODE_DIMENSIONS = [f"decode_{n}" for n in PARAM_DIMENSIONS]
+
+# PD 专属独立列（非参数配对，单独定义）
+_PD_META_COLUMNS = [
+    ("pd_transfer_backend", "TEXT"),
+    ("router_policy", "TEXT"),
+    ("router_prefill_policy", "TEXT"),
+    ("router_decode_policy", "TEXT"),
+]
+PD_META_DIMENSIONS = [name for name, _t in _PD_META_COLUMNS]
+
+# 布尔型参数（SQLite 存 0/1，读出还原 bool）——含前缀版本，便于两处判定复用
+BOOL_PARAMS = set(_BASE_BOOL)
+for _role in PD_ROLES:
+    for _n in _BASE_BOOL:
+        BOOL_PARAMS.add(f"{_role}_{_n}")
+
+
+def _base_dim(dim: str) -> str:
+    """去掉 prefill_/decode_ 前缀，得到基础参数名（用于查类型/是否布尔）。"""
+    for role in PD_ROLES:
+        pfx = f"{role}_"
+        if dim.startswith(pfx):
+            return dim[len(pfx):]
+    return dim
+
+
+def is_bool_dim(dim: str) -> bool:
+    return _base_dim(dim) in _BASE_BOOL
+
+
+# Agent 可用于对比/筛选的维度（design.md §7.2 list_dimension_values 枚举）。
+# 加入 deployment_mode 作为"单机分布式 vs PD"的对比轴；prefill_/decode_/router_ 明细
+# 已作为物理列存储与展示，如需让 Agent 直接对比可后续追加到此列表。
+ALL_DIMENSIONS = META_DIMENSIONS + PARAM_DIMENSIONS + ["deployment_mode"]
 
 # 指标里的两个"维度列"（不是性能数值，而是测试条件）
 METRIC_DIMENSION_KEYS = ["Input_Length", "Concurrency"]
 
-DDL = """
+
+# ── test_runs 列清单（DDL 与迁移共用同一份定义）──
+def _test_runs_columns() -> list[tuple[str, str]]:
+    """返回 [(列名, 完整 SQL 类型定义)]，顺序即建表顺序。"""
+    cols: list[tuple[str, str]] = [
+        ("run_id", "TEXT PRIMARY KEY"),
+        ("run_timestamp", "TEXT NOT NULL"),
+        ("model", "TEXT NOT NULL"),
+        ("model_version", "TEXT NOT NULL"),
+        ("framework", "TEXT NOT NULL"),
+        ("framework_version", "TEXT NOT NULL"),
+        ("gpu_type", "TEXT NOT NULL"),
+        ("launch_cmd", "TEXT NOT NULL"),
+        ("deployment_mode", "TEXT NOT NULL DEFAULT 'colocated'"),
+    ]
+    # 单机/分布式参数列
+    for name in PARAM_DIMENSIONS:
+        cols.append((name, _PARAM_SQL_TYPE[name]))
+    # PD：prefill_/decode_ 前缀列（沿用基础类型，可空）
+    for role in PD_ROLES:
+        for name in PARAM_DIMENSIONS:
+            cols.append((f"{role}_{name}", _PARAM_SQL_TYPE[name]))
+    # PD 专属独立列
+    cols.extend(_PD_META_COLUMNS)
+    # 尾部
+    cols.extend([
+        ("extra", "TEXT NOT NULL DEFAULT '{}'"),
+        ("metrics", "TEXT NOT NULL"),
+        ("created_at", "TEXT NOT NULL"),
+    ])
+    return cols
+
+
+TEST_RUNS_COLUMNS = _test_runs_columns()
+TEST_RUNS_COLUMN_NAMES = [c for c, _ in TEST_RUNS_COLUMNS]
+
+_COLUMN_DEFS = ",\n    ".join(f"{name} {sqltype}" for name, sqltype in TEST_RUNS_COLUMNS)
+
+DDL = f"""
 CREATE TABLE IF NOT EXISTS test_runs (
-    run_id            TEXT PRIMARY KEY,
-    run_timestamp     TEXT NOT NULL,
-    model             TEXT NOT NULL,
-    model_version     TEXT NOT NULL,
-    framework         TEXT NOT NULL,
-    framework_version TEXT NOT NULL,
-    gpu_type          TEXT NOT NULL,
-    launch_cmd        TEXT NOT NULL,
-    -- 并行度
-    tp                   INTEGER,
-    pp                   INTEGER,
-    dp                   INTEGER,
-    dcp                  INTEGER,
-    ep_enabled           INTEGER,
-    ep_width             INTEGER,
-    -- 显存 / KV
-    mem_fraction         REAL,
-    kv_cache_dtype       TEXT,
-    page_size            INTEGER,
-    prefix_caching       INTEGER,
-    -- 调度
-    max_running_requests INTEGER,
-    chunked_prefill_size INTEGER,
-    context_length       INTEGER,
-    -- 模型 / 量化
-    dtype                TEXT,
-    quantization         TEXT,
-    trust_remote_code    INTEGER,
-    served_model_name    TEXT,
-    -- 编译
-    torch_compile        INTEGER,
-    -- 后端
-    attention_backend    TEXT,
-    moe_a2a_backend      TEXT,
-    dp_attention         INTEGER,
-    -- 投机解码
-    spec_algorithm       TEXT,
-    spec_num_steps       INTEGER,
-    spec_eagle_topk      INTEGER,
-    spec_num_draft_tokens INTEGER,
-    -- KV 分层 / 卸载
-    hicache              INTEGER,
-    extra             TEXT NOT NULL DEFAULT '{}',
-    metrics           TEXT NOT NULL,
-    created_at        TEXT NOT NULL
+    {_COLUMN_DEFS}
 );
 CREATE INDEX IF NOT EXISTS idx_test_runs_dims
     ON test_runs (model, framework, framework_version, gpu_type);
 CREATE INDEX IF NOT EXISTS idx_test_runs_parallel
     ON test_runs (tp, pp, dp, dcp, ep_enabled);
+CREATE INDEX IF NOT EXISTS idx_test_runs_deployment
+    ON test_runs (deployment_mode);
 CREATE TABLE IF NOT EXISTS ingest_log (
     source_dir  TEXT PRIMARY KEY,
     run_id      TEXT,
     ingested_at TEXT NOT NULL
 );
 """
+
+
+def migrate(conn) -> None:
+    """
+    对已存在的 test_runs 表补齐缺失列（新增 PD 相关列时用）。
+    仅做 ADD COLUMN（可空或带默认值），不改动/删除既有列，安全幂等。
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(test_runs)").fetchall()}
+    if not existing:
+        return  # 表还不存在，DDL 会负责创建
+    for name, sqltype in TEST_RUNS_COLUMNS:
+        if name in existing:
+            continue
+        # 迁移时不能带 PRIMARY KEY / 无默认的 NOT NULL；这些列都是后加的可空/带默认列
+        add_type = sqltype
+        if "PRIMARY KEY" in add_type:
+            continue
+        conn.execute(f"ALTER TABLE test_runs ADD COLUMN {name} {add_type}")
 
 
 def dimension_column(dimension: str) -> str:
@@ -163,9 +209,39 @@ def dimension_column(dimension: str) -> str:
     return dimension
 
 
+def _store_val(dim: str, val):
+    """写库前的值归一：None 保持；布尔参数转 0/1。dim 可带前缀。"""
+    if val is None:
+        return None
+    if is_bool_dim(dim):
+        return 1 if val else 0
+    return val
+
+
+def _load_val(dim: str, val):
+    """读库后的值还原：布尔参数由 0/1 还原为 bool。dim 可带前缀。"""
+    if val is not None and is_bool_dim(dim):
+        return bool(val)
+    return val
+
+
+def _rget(row, key, default=None):
+    """兼容尚未迁移出该列的 Row（正常迁移后所有列都在）。"""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
 def doc_to_row(doc: dict) -> dict:
     """入库文档（parser 产出的 dict 形态）→ 表行。"""
-    params = doc.get("params", {})
+    deployment = doc.get("deployment_mode", "colocated")
+    params = doc.get("params") or {}
+    pd = doc.get("pd") or {}
+    pf_params = (pd.get("prefill") or {}).get("params") or {}
+    dc_params = (pd.get("decode") or {}).get("params") or {}
+    router = pd.get("router") or {}
+
     row = {
         "run_id": doc["_id"],
         "run_timestamp": _iso(doc["run_timestamp"]),
@@ -175,27 +251,29 @@ def doc_to_row(doc: dict) -> dict:
         "framework_version": doc["framework_version"],
         "gpu_type": doc["gpu_type"],
         "launch_cmd": doc["launch_cmd"],
+        "deployment_mode": deployment,
+        "pd_transfer_backend": pd.get("transfer_backend"),
+        "router_policy": router.get("policy"),
+        "router_prefill_policy": router.get("prefill_policy"),
+        "router_decode_policy": router.get("decode_policy"),
         "extra": json.dumps(doc.get("extra", {}), ensure_ascii=False),
         "metrics": json.dumps(doc.get("metrics", []), ensure_ascii=False),
         "created_at": _iso(doc["created_at"]),
     }
     for dim in PARAM_DIMENSIONS:
-        val = params.get(dim)
-        if dim in BOOL_PARAMS and val is not None:
-            val = 1 if val else 0
-        row[dim] = val
+        row[dim] = _store_val(dim, params.get(dim))
+        row[f"prefill_{dim}"] = _store_val(dim, pf_params.get(dim))
+        row[f"decode_{dim}"] = _store_val(dim, dc_params.get(dim))
     return row
 
 
 def row_to_doc(row) -> dict:
     """表行（sqlite3.Row）→ 文档形态（下游对齐/工具层统一消费的 dict 结构）。"""
-    params = {}
-    for dim in PARAM_DIMENSIONS:
-        val = row[dim]
-        if dim in BOOL_PARAMS and val is not None:
-            val = bool(val)
-        params[dim] = val
-    return {
+    deployment = _rget(row, "deployment_mode", "colocated") or "colocated"
+    params = {dim: _load_val(dim, row[dim]) for dim in PARAM_DIMENSIONS}
+    extra = json.loads(row["extra"]) if _rget(row, "extra") else {}
+
+    doc = {
         "_id": row["run_id"],
         "run_timestamp": datetime.fromisoformat(row["run_timestamp"]),
         "model": row["model"],
@@ -204,11 +282,29 @@ def row_to_doc(row) -> dict:
         "framework_version": row["framework_version"],
         "gpu_type": row["gpu_type"],
         "launch_cmd": row["launch_cmd"],
+        "deployment_mode": deployment,
         "params": params,
-        "extra": json.loads(row["extra"]),
+        "extra": extra,
         "metrics": json.loads(row["metrics"]),
         "created_at": datetime.fromisoformat(row["created_at"]),
     }
+
+    if deployment == "pd_disagg":
+        raw_pd = extra.get("pd", {}) if isinstance(extra, dict) else {}
+        pf_params = {dim: _load_val(dim, _rget(row, f"prefill_{dim}")) for dim in PARAM_DIMENSIONS}
+        dc_params = {dim: _load_val(dim, _rget(row, f"decode_{dim}")) for dim in PARAM_DIMENSIONS}
+        doc["pd"] = {
+            "transfer_backend": _rget(row, "pd_transfer_backend"),
+            "prefill": {"params": pf_params, **(raw_pd.get("prefill") or {})},
+            "decode": {"params": dc_params, **(raw_pd.get("decode") or {})},
+            "router": {
+                "policy": _rget(row, "router_policy"),
+                "prefill_policy": _rget(row, "router_prefill_policy"),
+                "decode_policy": _rget(row, "router_decode_policy"),
+                **(raw_pd.get("router") or {}),
+            },
+        }
+    return doc
 
 
 def _iso(dt) -> str:

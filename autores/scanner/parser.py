@@ -97,6 +97,9 @@ def parse_run_dir(dir_path: str) -> dict:
     meta = _parse_metadata(os.path.join(dir_path, "metadata.json"))
     metrics = _parse_csv(os.path.join(dir_path, "result.csv"))
 
+    deployment = meta.get("deployment_mode", "colocated")
+    extra = dict(meta.get("extra", {}))
+
     doc = {
         "_id": dir_name,
         "run_timestamp": run_timestamp,
@@ -106,9 +109,41 @@ def parse_run_dir(dir_path: str) -> dict:
         "framework_version": meta["framework_version"],
         "gpu_type": meta["gpu_type"],
         "launch_cmd": meta["launch_cmd"],
+        "deployment_mode": deployment,
         "params": meta.get("params", {}),
-        "extra": meta.get("extra", {}),
+        "extra": extra,
         "metrics": metrics,
         "created_at": datetime.now(timezone.utc),
     }
+
+    if deployment == "pd_disagg" and meta.get("pd"):
+        doc["pd"], extra["pd"] = _split_pd(meta["pd"])
     return doc
+
+
+def _split_pd(pd_meta: dict) -> tuple[dict, dict]:
+    """
+    metadata.pd → (doc.pd 列数据, extra.pd 原文留档)。
+      doc.pd  : 提列存储/对比用（transfer_backend / 各角色 params / router 策略）
+      extra.pd: 原始启动命令、PD 专属字段、未识别 flag，供展示与追溯
+    """
+    prefill = pd_meta.get("prefill", {}) or {}
+    decode = pd_meta.get("decode", {}) or {}
+    router = pd_meta.get("router", {}) or {}
+
+    doc_pd = {
+        "transfer_backend": pd_meta.get("transfer_backend"),
+        "prefill": {"params": prefill.get("params", {})},
+        "decode": {"params": decode.get("params", {})},
+        "router": {
+            "policy": router.get("policy"),
+            "prefill_policy": router.get("prefill_policy"),
+            "decode_policy": router.get("decode_policy"),
+        },
+    }
+    extra_pd = {
+        "prefill": {k: prefill.get(k) for k in ("launch_cmd", "disagg", "unrecognized")},
+        "decode": {k: decode.get(k) for k in ("launch_cmd", "disagg", "unrecognized")},
+        "router": {k: router.get(k) for k in ("launch_cmd", "_extra")},
+    }
+    return doc_pd, extra_pd
