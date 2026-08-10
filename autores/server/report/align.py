@@ -91,13 +91,15 @@ def build_comparison_table(
         if cv not in column_labels:
             column_labels.append(cv)
 
-    # 每列的卡数换算信息（弱扩展对比时用于表头标注）
+    # 每列的卡数 / 显卡型号（弱扩展对比时用于表头标注）
     column_gpus: dict = {}
+    column_gpu_types: dict = {}
     column_scale: dict = {}
     for doc in docs:
         cv = _dimension_value(doc, compare_on)
         if "_gpus" in doc and cv not in column_gpus:
             column_gpus[cv] = doc.get("_gpus")
+            column_gpu_types[cv] = doc.get("gpu_type", "")
             column_scale[cv] = doc.get("_scale", 1)
 
     # 收集所有 (input_length, concurrency, metric_name) 作为行；值按列填充
@@ -187,5 +189,6 @@ def build_comparison_table(
         "num_runs": len(docs),
         "gpu_scaled": gpu_scaled and any(s != 1 for s in column_scale.values()),
         "column_gpus": column_gpus,
+        "column_gpu_types": column_gpu_types,
         "column_scale": column_scale,
     }

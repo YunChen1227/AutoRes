@@ -201,7 +201,7 @@ def detect_role(framework: str, cmd: str) -> str | None:
                 v = str(value).strip().lower()
                 return v if v in ("prefill", "decode") else None
         return None
-    if framework == "vllm":
+    if framework in ("vllm", "vllm-ascend"):
         cfg = _vllm_kv_config(cmd)
         if not cfg:
             return None
@@ -261,7 +261,7 @@ def extract_disagg(framework: str, cmd: str, *, fill_defaults: bool = True) -> d
                 if default is not None and field not in out:
                     out[field] = default
 
-    elif framework == "vllm":
+    elif framework in ("vllm", "vllm-ascend"):
         cfg = _vllm_kv_config(cmd) or {}
         for jkey, (field, _note, default) in VLLM_KV_FIELDS.items():
             if jkey in cfg:

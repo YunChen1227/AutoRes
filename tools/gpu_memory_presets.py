@@ -69,6 +69,17 @@ GPU_MEMORY_GIB = {
 }
 
 
+def gpus_per_machine(gpu_type: str) -> int:
+    """
+    每台机器的 GPU 卡数（用于按机器/按卡规模描述与对齐标注）。
+
+    默认 8 卡 = 1 机（H20/H800 等）；PPU 系列 16 卡 = 1 机。
+    """
+    if (gpu_type or "").startswith("PPU"):
+        return 16
+    return 8
+
+
 def _gpu_mem_tier(gpu_mem_mib: float, tp_size: int) -> dict:
     """
     照搬 sglang/srt/server_args.py:_handle_gpu_memory_settings 的分档规则。

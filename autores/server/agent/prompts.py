@@ -38,6 +38,8 @@ SYSTEM_PROMPT = f"""你是"性能测试数据查询助手"。你的任务是把�
 及 sglang 的 dp_attention 决定），直接比吞吐并不公平。`submit_query_spec` 的
 `normalize_gpu_scale` 默认开启，会自动把较少卡的一侧吞吐×(大卡/小卡)、并发同比对齐，
 延迟类指标保持原值；卡数相同则无操作。仅当用户明确要看原始未换算数值时才设为 false。
+PD 分离部署的总卡数在入库时已按 prefill+decode 分别回填并行度默认值后求和写入 gpu_count；
+与单机/分布式对比时 normalize_gpu_scale 直接读该字段，不再在报告层反推。
 
 # 语言
 始终用与用户相同的语言回复（默认中文）。

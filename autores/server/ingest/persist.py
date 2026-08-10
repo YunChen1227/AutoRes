@@ -65,9 +65,13 @@ def build_metadata(
         "deployment_mode": deployment_mode,
         "params": params,
         "extra": extra,
+        "gpu_count": extra.get("gpu_count"),
     }
     if deployment_mode == "pd_disagg" and pd is not None:
         out["pd"] = pd
+        out["gpu_count"] = pd.get("gpu_count", out["gpu_count"])
+        out["prefill_gpu_count"] = pd.get("prefill_gpu_count")
+        out["decode_gpu_count"] = pd.get("decode_gpu_count")
     return out
 
 

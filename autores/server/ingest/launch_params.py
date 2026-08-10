@@ -18,9 +18,11 @@ _TOOLS_DIR = os.path.join(
 )
 _TO_CSV = os.path.join(_TOOLS_DIR, "to_csv.py")
 _PARAM_MAP_PD = os.path.join(_TOOLS_DIR, "param_map_pd.py")
+_GPU_COUNT = os.path.join(_TOOLS_DIR, "gpu_count.py")
 
 _module = None
 _pd_module = None
+_gc_module = None
 _lock = threading.Lock()
 
 
@@ -58,10 +60,25 @@ def _load_pd():
     return _pd_module
 
 
+def _load_gc():
+    global _gc_module
+    if _gc_module is not None:
+        return _gc_module
+    with _lock:
+        if _gc_module is not None:
+            return _gc_module
+        spec = importlib.util.spec_from_file_location("_autores_gpu_count", _GPU_COUNT)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"无法加载卡数计算模块: {_GPU_COUNT}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _gc_module = mod
+    return _gc_module
+
+
 def supported_frameworks() -> list[str]:
     """支持的框架列表（与 tools/to_csv.py --framework choices 一致）。"""
-    # 旧版读 FRAMEWORK_DEFAULTS；param_map 重写后默认值表已移除，改为与 CLI choices 对齐。
-    return ["sglang", "vllm"]
+    return ["sglang", "vllm", "vllm-ascend"]
 
 
 def router_policies() -> list[str]:
@@ -125,10 +142,15 @@ def extract_role(framework: str, launch_cmd: str) -> dict:
             continue
         unrecognized.append(item)
 
+    gc = _load_gc()
+    pm_fw = "vllm" if framework == "vllm-ascend" else framework
+    gpu_count = gc.annotate_gpu_count(pm_fw, params, extra)
+
     return {
         "role": role,
         "params": params,
         "disagg": disagg,
+        "gpu_count": gpu_count,
         "launch_cmd": launch_cmd,
         "unrecognized": unrecognized,
         "extra": extra,
@@ -138,3 +160,9 @@ def extract_role(framework: str, launch_cmd: str) -> dict:
 def parse_router(router_cmd: str | None) -> dict:
     """解析 router/proxy 启动命令，返回 {policy, prefill_policy, decode_policy, _extra}。"""
     return _load_pd().parse_router(router_cmd or "")
+
+
+def pd_gpu_counts(framework: str, prefill_params: dict, decode_params: dict) -> tuple[int, int, int]:
+    """PD 分离：回填并行度默认值后算 prefill/decode/总卡数。"""
+    pm_fw = "vllm" if framework == "vllm-ascend" else framework
+    return _load_gc().annotate_pd_gpu_counts(pm_fw, prefill_params, decode_params)

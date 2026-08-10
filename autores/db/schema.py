@@ -93,6 +93,9 @@ DECODE_DIMENSIONS = [f"decode_{n}" for n in PARAM_DIMENSIONS]
 
 # PD 专属独立列（非参数配对，单独定义）
 _PD_META_COLUMNS = [
+    ("gpu_count", "INTEGER"),
+    ("prefill_gpu_count", "INTEGER"),
+    ("decode_gpu_count", "INTEGER"),
     ("pd_transfer_backend", "TEXT"),
     ("router_policy", "TEXT"),
     ("router_prefill_policy", "TEXT"),
@@ -242,6 +245,7 @@ def doc_to_row(doc: dict) -> dict:
     dc_params = (pd.get("decode") or {}).get("params") or {}
     router = pd.get("router") or {}
 
+    extra_raw = doc.get("extra") or {}
     row = {
         "run_id": doc["_id"],
         "run_timestamp": _iso(doc["run_timestamp"]),
@@ -252,6 +256,9 @@ def doc_to_row(doc: dict) -> dict:
         "gpu_type": doc["gpu_type"],
         "launch_cmd": doc["launch_cmd"],
         "deployment_mode": deployment,
+        "gpu_count": doc.get("gpu_count") or extra_raw.get("gpu_count"),
+        "prefill_gpu_count": doc.get("prefill_gpu_count"),
+        "decode_gpu_count": doc.get("decode_gpu_count"),
         "pd_transfer_backend": pd.get("transfer_backend"),
         "router_policy": router.get("policy"),
         "router_prefill_policy": router.get("prefill_policy"),
@@ -283,6 +290,9 @@ def row_to_doc(row) -> dict:
         "gpu_type": row["gpu_type"],
         "launch_cmd": row["launch_cmd"],
         "deployment_mode": deployment,
+        "gpu_count": _rget(row, "gpu_count"),
+        "prefill_gpu_count": _rget(row, "prefill_gpu_count"),
+        "decode_gpu_count": _rget(row, "decode_gpu_count"),
         "params": params,
         "extra": extra,
         "metrics": json.loads(row["metrics"]),

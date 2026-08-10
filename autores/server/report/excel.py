@@ -130,6 +130,7 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
 
     gpu_scaled = table.get("gpu_scaled", False)
     column_gpus = table.get("column_gpus", {})
+    column_gpu_types = table.get("column_gpu_types", {})
     column_scale = table.get("column_scale", {})
 
     def _col_display(label) -> str:
@@ -168,7 +169,7 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
             if gpus:
                 scale = column_scale.get(label, 1)
                 tag = f"×{scale:g}" if scale not in (None, 1) else "基准"
-                parts.append(f"{label}={hardware.unit_desc(gpus)}({tag})")
+                parts.append(f"{label}={hardware.unit_desc(gpus, column_gpu_types.get(label, ''))}({tag})")
         note_bits.append(
             "已按卡数弱扩展归一：吞吐类×卡数比例、concurrency 同比对齐、"
             "延迟类(TTFT/TPOT/ITL/E2E)保持原值　" + "，".join(parts)

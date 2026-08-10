@@ -217,19 +217,27 @@ def _build_pd(framework: str, prefill_text: str, decode_text: str,
     transfer_backend = (pf["disagg"].get("transfer_backend")
                         or dc["disagg"].get("transfer_backend"))
 
+    pf_gpus, dc_gpus, total_gpus = launch_params.pd_gpu_counts(
+        framework, pf["params"], dc["params"])
+
     combined = f"# PREFILL\n{prefill_cmd}\n\n# DECODE\n{decode_cmd}"
     if router_cmd:
         combined += f"\n\n# ROUTER\n{router_cmd}"
 
     pd_meta = {
         "transfer_backend": transfer_backend,
+        "gpu_count": total_gpus,
+        "prefill_gpu_count": pf_gpus,
+        "decode_gpu_count": dc_gpus,
         "prefill": {
             "params": pf["params"], "launch_cmd": prefill_cmd,
             "disagg": pf["disagg"], "unrecognized": pf["unrecognized"],
+            "gpu_count": pf_gpus,
         },
         "decode": {
             "params": dc["params"], "launch_cmd": decode_cmd,
             "disagg": dc["disagg"], "unrecognized": dc["unrecognized"],
+            "gpu_count": dc_gpus,
         },
         "router": {**router, "launch_cmd": router_cmd},
     }
@@ -271,6 +279,9 @@ def ingest(
             meta["framework"], prefill_text, decode_text, router_text)
         params: dict = {}
         pd_block: dict | None = pd_meta
+        extra["gpu_count"] = pd_meta["gpu_count"]
+        extra["prefill_gpu_count"] = pd_meta["prefill_gpu_count"]
+        extra["decode_gpu_count"] = pd_meta["decode_gpu_count"]
     else:
         launch_cmd = resolve_launch_text(launch_text)
         # 安全网：单机模式却贴了 PD 命令 → 提示改用 PD 分离（前端应已自动跳转）
@@ -310,11 +321,15 @@ def ingest(
         "disk_path": dir_path,
         "num_metrics": len(doc["metrics"]),
         "deployment_mode": deployment_mode,
+        "gpu_count": doc.get("gpu_count"),
         "launch_cmd": doc["launch_cmd"],
     }
     if deployment_mode == "pd_disagg":
         summary["pd"] = {
             "transfer_backend": pd_block["transfer_backend"],
+            "gpu_count": pd_block["gpu_count"],
+            "prefill_gpu_count": pd_block["prefill_gpu_count"],
+            "decode_gpu_count": pd_block["decode_gpu_count"],
             "prefill": {"params": pd_block["prefill"]["params"],
                         "unrecognized": pd_block["prefill"]["unrecognized"]},
             "decode": {"params": pd_block["decode"]["params"],

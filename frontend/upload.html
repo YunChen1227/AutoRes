@@ -215,7 +215,7 @@
       fillSelect(gpuSel, d.gpu_types || []);
     })
     .catch(function () {
-      fillSelect(frameworkSel, ["sglang", "vllm"]);
+      fillSelect(frameworkSel, ["sglang", "vllm", "vllm-ascend"]);
       fillSelect(gpuSel, [
         "H20-141G", "H20-96G", "910B3", "910B4-32G", "910B4-64G",
         "C550", "PPU810E", "PPU890",

@@ -127,6 +127,7 @@ def format_num(val):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import param_map as pm  # noqa: E402
+import gpu_count as gc  # noqa: E402
 
 
 def _iter_flag_tokens(tokens):
@@ -216,18 +217,9 @@ def extract_launch_params(framework, launch_cmd):
       params  入库顶层字段，key 与 autores/db/schema.py:PARAM_DIMENSIONS 对齐
       extra   命令里出现、但未提升为一等列的参数 + 未识别 flag
 
-    与旧版的行为差异（均为有意为之）：
-      * 只记录命令里**显式写了**的参数，不再用"框架默认值"回填。
-        原因：mem_fraction / chunked_prefill_size / max_running_requests 等
-        在 SGLang 侧是按 GPU 显存档位运行时推导的，没有固定标量默认值
-        （见 param_map.py 与 gpu_memory_presets.py）。回填一个假默认值
-        正是旧表"和实际值差异太大"的根因。未显式设置 → 该 key 不出现，
-        下游据此判断"用的是框架默认行为"，而不是拿到一个可能错的数字。
-      * ep 归一为 ep_enabled(bool) + ep_width(int|None)，
-        使 sglang 的 ep_size=1 与 vllm 的未开启 EP 比较结果一致。
-      * torch_compile / prefix_caching 这类极性相反的开关，
-        统一归一为"是否启用"，不再直接存裸 flag 语义。
+    framework 可为 vllm-ascend；参数解析走 vllm 分支，入库 framework 仍存原名。
     """
+    pm_fw = "vllm" if framework == "vllm-ascend" else framework
     params = {}
     extra = {}
 
@@ -240,7 +232,7 @@ def extract_launch_params(framework, launch_cmd):
         # 命令里有不成对引号等，退化为空格切分
         tokens = launch_cmd.split()
 
-    flag_to_key = pm.flags_for(framework)
+    flag_to_key = pm.flags_for(pm_fw)
     unrecognized = []
     raw = {}  # key -> 原始取值
 
@@ -260,7 +252,7 @@ def extract_launch_params(framework, launch_cmd):
     # ── 语义归一（详见 param_map.py 各条 note）────────────────────────
     # EP：sglang 是并行宽度、vllm 是布尔开关，必须归一后才能比较
     if "ep" in params:
-        enabled, width = pm.normalize_ep(framework, raw["ep"])
+        enabled, width = pm.normalize_ep(pm_fw, raw["ep"])
         params.pop("ep")
         params["ep_enabled"] = enabled
         params["ep_width"] = width
@@ -268,7 +260,7 @@ def extract_launch_params(framework, launch_cmd):
     # torch_compile：sglang --enable-torch-compile 是开启；
     # vllm --enforce-eager 是关闭（极性相反）
     if "torch_compile" in params:
-        params["torch_compile"] = (framework == "sglang")
+        params["torch_compile"] = (pm_fw == "sglang")
 
     # prefix_caching：sglang --disable-radix-cache 与
     # vllm --no-enable-prefix-caching 都表示关闭；--enable-prefix-caching 表示开启
@@ -289,6 +281,9 @@ def extract_launch_params(framework, launch_cmd):
 
     if unrecognized:
         extra["unrecognized"] = unrecognized
+
+    # 回填 tp/pp/dp 静态默认值并计算实际卡数（design.md D-默认值 + 卡数对齐）
+    gc.annotate_gpu_count(pm_fw, params, extra)
 
     return params, extra
 
@@ -324,7 +319,6 @@ def load_bench_records(framework, input_dir):
     vllm:   所有 *.json 各作为一个整体 JSON。
     """
     records = []
-
     if framework == "sglang":
         patterns = ["*.jsonl", "*.json"]
         for pat in patterns:
@@ -351,12 +345,13 @@ def load_bench_records(framework, input_dir):
 
 def record_to_row(framework, record, fallback_input_len):
     """把一条 bench record 映射为 CSV 行（统一列名）。"""
+    pm_fw = "vllm" if framework == "vllm-ascend" else framework
     row = {}
     for col, fw_keys in METRIC_FIELD_MAP.items():
-        key = fw_keys.get(framework)
+        key = fw_keys.get(pm_fw)
         if key is None:
             # 该框架无此字段
-            if col == "Input_Length" and framework == "vllm":
+            if col == "Input_Length" and pm_fw == "vllm":
                 row[col] = fallback_input_len if fallback_input_len is not None else NA
             else:
                 row[col] = NA
@@ -410,6 +405,7 @@ def build_metadata(args, params, extra):
         "bench_cmd": args.bench_cmd,
         "params": params,
         "extra": extra,
+        "gpu_count": extra.get("gpu_count"),
     }
 
 
@@ -417,7 +413,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="性能测试结果落盘脚本：整理 bench 输出为 result.csv + metadata.json"
     )
-    p.add_argument("--framework", required=True, choices=["sglang", "vllm"],
+    p.add_argument("--framework", required=True, choices=["sglang", "vllm", "vllm-ascend"],
                    help="推理框架，决定 bench 字段映射与参数提取规则")
     p.add_argument("--framework-version", required=True,
                    help="框架版本（如 0.4.6 / 0.5.12），手动传入")
@@ -454,7 +450,7 @@ def main():
         raise SystemExit(f"[ERR] 在 {args.input_dir} 未找到有效 bench 结果，请检查 --framework 与路径")
 
     fallback_input_len = parse_bench_cmd_input_len(args.bench_cmd)
-    if args.framework == "vllm" and fallback_input_len is None:
+    if args.framework in ("vllm", "vllm-ascend") and fallback_input_len is None:
         print("⚠️  vllm 场景未能从 --bench-cmd 解析出 --random-input-len，Input_Length 将填 N/A")
 
     rows = build_rows(args.framework, records, fallback_input_len)
