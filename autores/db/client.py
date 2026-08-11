@@ -29,9 +29,10 @@ class Database:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.executescript(schema.DDL)
-            # 老库补齐后新增的列（PD 分离相关，D22）；ADD COLUMN 幂等，安全重入
+            # 老库：CREATE TABLE 跳过已有表 → migrate 补列 → 再建索引（否则缺列报错）
+            self._conn.executescript(schema.DDL_TABLES)
             schema.migrate(self._conn)
+            self._conn.executescript(schema.DDL_INDEXES)
             self._conn.commit()
 
     # ── 基础 ──

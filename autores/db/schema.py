@@ -228,22 +228,28 @@ TEST_RUNS_COLUMN_NAMES = [c for c, _ in TEST_RUNS_COLUMNS]
 
 _COLUMN_DEFS = ",\n    ".join(f"{name} {sqltype}" for name, sqltype in TEST_RUNS_COLUMNS)
 
-DDL = f"""
+# 建表与建索引分开：老库已存在时 CREATE TABLE 会跳过，须先 migrate 补列再建索引。
+DDL_TABLES = f"""
 CREATE TABLE IF NOT EXISTS test_runs (
     {_COLUMN_DEFS}
 );
-CREATE INDEX IF NOT EXISTS idx_test_runs_dims
-    ON test_runs (model, framework, framework_version, gpu_type);
-CREATE INDEX IF NOT EXISTS idx_test_runs_parallel
-    ON test_runs (tp, pp, dp, dcp, ep_enabled);
-CREATE INDEX IF NOT EXISTS idx_test_runs_deployment
-    ON test_runs (deployment_mode);
 CREATE TABLE IF NOT EXISTS ingest_log (
     source_dir  TEXT PRIMARY KEY,
     run_id      TEXT,
     ingested_at TEXT NOT NULL
 );
 """
+
+DDL_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_test_runs_dims
+    ON test_runs (model, framework, framework_version, gpu_type);
+CREATE INDEX IF NOT EXISTS idx_test_runs_parallel
+    ON test_runs (tp, pp, dp, dcp, ep_enabled);
+CREATE INDEX IF NOT EXISTS idx_test_runs_deployment
+    ON test_runs (deployment_mode);
+"""
+
+DDL = DDL_TABLES + DDL_INDEXES
 
 
 def migrate(conn) -> None:
