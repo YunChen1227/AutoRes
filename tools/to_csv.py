@@ -87,6 +87,19 @@ METRIC_FIELD_MAP = {
     "Completed":           {"sglang": "completed",            "vllm": "completed"},
     "Total_Input_Tokens":  {"sglang": "total_input_tokens",   "vllm": "total_input_tokens"},
     "Total_Output_Tokens": {"sglang": "total_output_tokens",  "vllm": "total_output_tokens"},
+    # ── KV cache 命中率（强制对齐：跨框架可比，统一 0-100 百分比）──
+    #   sglang: bench --cache-report → cache_report.cache_hit_rate_pct（嵌套 key）
+    #   vllm  : bench 本身不产出，由 vllm_sgl_benchs.sh 前后拉 /metrics 的
+    #           prefix_cache_hits/queries 算 delta 注入 kv_cache_hit_rate
+    "KV_Cache_Hit_Rate(%)": {"sglang": "cache_report.cache_hit_rate_pct",
+                             "vllm": "kv_cache_hit_rate"},
+    # ── spec decoding 接受率（不对齐：两框架颗粒度不同，跨框架不可比）──
+    #   故意用带框架前缀的独立列名，避免报告把它们塞进同一可比列。
+    #   sglang bench 只聚合 accept length（avg_spec_accept_length）；
+    #   vllm bench 产出 acceptance_rate(%) + acceptance_length（per-position 略）。
+    "SGLang_Spec_Accept_Length": {"sglang": "accept_length",              "vllm": None},
+    "vLLM_Spec_Accept_Rate(%)":  {"sglang": None, "vllm": "spec_decode_acceptance_rate"},
+    "vLLM_Spec_Accept_Length":   {"sglang": None, "vllm": "spec_decode_acceptance_length"},
 }
 
 # CSV 列顺序（= METRIC_FIELD_MAP 的键序）
@@ -102,6 +115,23 @@ def format_num(val):
     if isinstance(val, (int, float)):
         return round(float(val), 2)
     return val
+
+
+# 缺失标记：区别于合法的 0 / 0.0（命中率、接受率可能就是 0）
+_MISSING = object()
+
+
+def _dig(record, key):
+    """
+    从 record 取值，支持点号嵌套 key（如 cache_report.cache_hit_rate_pct）。
+    命中返回值；缺失返回 _MISSING（供上层区分"没有该字段"与"值为 0"）。
+    """
+    cur = record
+    for part in key.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return _MISSING
+        cur = cur[part]
+    return cur
 
 
 # ============================================================================
@@ -356,8 +386,8 @@ def record_to_row(framework, record, fallback_input_len):
             else:
                 row[col] = NA
             continue
-        val = record.get(key, NA)
-        row[col] = format_num(val) if val != NA else NA
+        val = _dig(record, key)
+        row[col] = format_num(val) if val is not _MISSING else NA
     return row
 
 

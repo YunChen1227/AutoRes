@@ -37,6 +37,12 @@ CANONICAL_COLUMNS: tuple[str, ...] = (
     "Completed",
     "Total_Input_Tokens",
     "Total_Output_Tokens",
+    # KV cache 命中率：强制对齐，跨框架可比（统一 0-100 百分比）
+    "KV_Cache_Hit_Rate(%)",
+    # spec decoding 接受率：不对齐，跨框架不可比（框架前缀列各存各的）
+    "SGLang_Spec_Accept_Length",
+    "vLLM_Spec_Accept_Rate(%)",
+    "vLLM_Spec_Accept_Length",
 )
 
 _CANONICAL_SET = frozenset(CANONICAL_COLUMNS)
@@ -116,6 +122,19 @@ _MANUAL_ALIASES: dict[str, str] = {
     "numcompleted": "Completed",
     "totalinputtokens": "Total_Input_Tokens",
     "totaloutputtokens": "Total_Output_Tokens",
+    # KV cache 命中率（对齐列）—— 兼容各种拉平写法
+    "cachehitrate": "KV_Cache_Hit_Rate(%)",
+    "cachehitratepct": "KV_Cache_Hit_Rate(%)",
+    "kvhitrate": "KV_Cache_Hit_Rate(%)",
+    "prefixcachehitrate": "KV_Cache_Hit_Rate(%)",
+    "kvcachehitratepct": "KV_Cache_Hit_Rate(%)",
+    # spec decoding（框架专属，非对齐列）
+    "sglangacceptlength": "SGLang_Spec_Accept_Length",
+    "sglangspecacceptlength": "SGLang_Spec_Accept_Length",
+    "vllmspecacceptrate": "vLLM_Spec_Accept_Rate(%)",
+    "specdecodeacceptancerate": "vLLM_Spec_Accept_Rate(%)",
+    "vllmspecacceptlength": "vLLM_Spec_Accept_Length",
+    "specdecodeacceptancelength": "vLLM_Spec_Accept_Length",
 }
 
 for k, v in _MANUAL_ALIASES.items():
