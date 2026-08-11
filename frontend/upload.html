@@ -66,6 +66,9 @@
   .tab + .tab { border-left: 1px solid var(--border); }
   .tab.active { background: var(--accent); color: #fff; }
   .autohint { font-size: 12px; color: #8a6d00; min-height: 16px; }
+  .radios { display: flex; gap: 18px; align-items: center; padding-top: 8px; flex-wrap: wrap; }
+  .radios label { font-weight: 400; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .radios input[type="radio"] { width: auto; }
   .actions { display: flex; align-items: center; gap: 12px; }
   button.primary {
     background: var(--accent); color: #fff; border: none; border-radius: 10px;
@@ -148,7 +151,33 @@
       </div>
 
       <div class="card">
-        <h3>2. 填写元信息</h3>
+        <h3>2. bench（压测）参数</h3>
+        <div class="desc">
+          <b>bench 框架</b>与上面的 server 框架相互独立（sglang bench 可打 vllm server，反之亦然）。
+          上传 CSV 后会按 spec decoding 列是否有值<b>自动识别</b>：仅 vLLM 列有值→vllm，仅 SGLang 列有值→sglang；
+          两者都有 / 都无则需手选。<br>
+          <b>是否 flush cache</b> 无法从 CSV 推断，必须手动选择（flush=冷启动无前缀命中，不 flush=复用缓存，结果差异大）。
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label>bench 框架 <span class="req">*</span></label>
+            <select name="bench_framework" id="bench_framework" required>
+              <option value="">请选择 / 上传 CSV 自动识别</option>
+            </select>
+            <div class="autohint" id="benchhint"></div>
+          </div>
+          <div class="field">
+            <label>压测前是否 flush cache <span class="req">*</span></label>
+            <div class="radios" id="flush_radios">
+              <label><input type="radio" name="bench_flush_cache" value="true"> 是（清空 KV，冷启动）</label>
+              <label><input type="radio" name="bench_flush_cache" value="false"> 否（复用缓存）</label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>3. 填写元信息</h3>
         <div class="desc">
           这些字段无法从 CSV / 启动命令推断，需手工填写。其中<b>框架</b>决定用哪套启动参数提取规则与默认值回填。
         </div>
@@ -191,6 +220,9 @@
   const result = document.getElementById("result");
   const frameworkSel = document.getElementById("framework");
   const gpuSel = document.getElementById("gpu_type");
+  const benchSel = document.getElementById("bench_framework");
+  const benchHint = document.getElementById("benchhint");
+  const csvInput = form.querySelector('input[name="csv_file"]');
   const modeInput = document.getElementById("deployment_mode");
   const tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
   const panelCo = document.getElementById("panel-colocated");
@@ -213,6 +245,7 @@
     .then(function (d) {
       fillSelect(frameworkSel, d.frameworks || []);
       fillSelect(gpuSel, d.gpu_types || []);
+      fillSelect(benchSel, d.bench_frameworks || ["sglang", "vllm"]);
     })
     .catch(function () {
       fillSelect(frameworkSel, ["sglang", "vllm", "vllm-ascend"]);
@@ -220,7 +253,38 @@
         "H20-141G", "H20-96G", "910B3", "910B4-32G", "910B4-64G",
         "C550", "PPU810E", "PPU890",
       ]);
+      fillSelect(benchSel, ["sglang", "vllm"]);
     });
+
+  // 选好 CSV 后自动识别 bench 框架（按 spec 列是否有值粗判）
+  csvInput.addEventListener("change", function () {
+    const file = csvInput.files && csvInput.files[0];
+    if (!file) { benchHint.textContent = ""; return; }
+    benchHint.style.color = "#6b7280";
+    benchHint.textContent = "正在识别 bench 框架…";
+    const fd = new FormData();
+    fd.append("csv_file", file);
+    fetch("/api/upload/detect-bench", { method: "POST", body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.error) { benchHint.style.color = "#b42318"; benchHint.textContent = d.error; return; }
+        if (d.bench_framework) {
+          benchSel.value = d.bench_framework;
+          benchHint.style.color = "#0a7c42";
+          benchHint.textContent = "已按 CSV spec 列自动识别为 " + d.bench_framework + "，如有误请手动改。";
+        } else {
+          benchHint.style.color = "#8a6d00";
+          const both = d.sglang_spec_present && d.vllm_spec_present;
+          benchHint.textContent = both
+            ? "CSV 中 SGLang 与 vLLM spec 列都有值，无法自动判断，请手选。"
+            : "CSV 无可判断的 spec 列，请手选 bench 框架。";
+        }
+      })
+      .catch(function () {
+        benchHint.style.color = "#8a6d00";
+        benchHint.textContent = "自动识别失败，请手选 bench 框架。";
+      });
+  });
 
   // 与后端 param_map_pd.looks_like_pd 一致的关键字粗判：填好即自动跳转
   function looksLikePd(s) {
@@ -333,6 +397,10 @@
     } else {
       if (!launchCmd.value.trim()) return "请填写启动命令";
     }
+    if (!benchSel.value) return "请选择 bench 框架（可上传 CSV 自动识别）";
+    if (!form.querySelector('input[name="bench_flush_cache"]:checked')) {
+      return "请选择压测前是否 flush cache";
+    }
     return null;
   }
 
@@ -366,6 +434,7 @@
   resetBtn.addEventListener("click", function () {
     form.reset();
     setMode("colocated");
+    benchHint.textContent = "";
     result.className = "result";
     result.innerHTML = "";
   });

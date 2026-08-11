@@ -6,24 +6,36 @@
 写入 NAS 上以时间戳命名的目录，供 Scanner 入库。
 
 用法示例：
-  # sglang
+  # sglang（server 与 bench 同为 sglang，压测前未清缓存）
+  #   metadata 字段与 autores/db/schema.py METADATA_DIRECT_FIELDS 一致
   python to_csv.py \
-      --framework sglang \
+      --framework sglang --bench-framework sglang \
       --framework-version 0.4.6 \
+      --bench-flush-cache false \
       --input-dir ./logs_H20G144_GLM52 \
       --nas-dir /mnt/nas/benchmark_root \
       --gpu-type H20-141G \
-      --model GLM-4.5 --model-version distributed2 \
+      --model GLM-4.5 \
       --launch-cmd "python -m sglang.launch_server --tp-size 8 --enable-hierarchical-cache"
+
+  # server 与 bench 框架不同：vllm server + sglang bench，压测前清缓存
+  python to_csv.py \
+      --framework vllm --bench-framework sglang \
+      --framework-version 0.5.12 \
+      --bench-flush-cache true \
+      --input-dir ./logs --nas-dir /mnt/nas/benchmark_root \
+      --gpu-type H800 --model Qwen2.5-72B \
+      --launch-cmd "vllm serve Qwen2.5-72B -tp 8"
 
   # vllm（注意 e2el / input_len 需要额外信息，见 --bench-cmd）
   python to_csv.py \
-      --framework vllm \
+      --framework vllm --bench-framework vllm \
       --framework-version 0.5.12 \
+      --bench-flush-cache false \
       --input-dir ./vllm_logs \
       --nas-dir /mnt/nas/benchmark_root \
       --gpu-type H800 \
-      --model Qwen2.5-72B --model-version v2.5.1 \
+      --model Qwen2.5-72B \
       --launch-cmd "vllm serve Qwen2.5-72B -tp 8 --enable-expert-parallel" \
       --bench-cmd "vllm bench serve --random-input-len 1024 --percentile-metrics ttft,tpot,itl,e2el"
 
@@ -156,8 +168,10 @@ def _dig(record, key):
 # ============================================================================
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import param_map as pm  # noqa: E402
 import gpu_count as gc  # noqa: E402
+from autores.db import schema as db_schema  # noqa: E402
 
 
 def _iter_flag_tokens(tokens):
@@ -423,48 +437,93 @@ def write_outputs(out_dir, rows, metadata):
     return csv_path, meta_path
 
 
-def build_metadata(args, params, extra):
-    """组织 metadata.json 结构（§5.3）。"""
-    return {
-        "framework": args.framework,
-        "framework_version": args.framework_version,
-        "model": args.model,
-        "model_version": args.model_version,
-        "gpu_type": args.gpu_type,
-        "launch_cmd": args.launch_cmd,
-        "bench_cmd": args.bench_cmd,
-        "params": params,
-        "extra": extra,
-        "gpu_count": extra.get("gpu_count"),
-    }
+def _cli_flag(field: str) -> str:
+    """DB/metadata 字段名 → argparse CLI 名（--model_version → --model-version）。"""
+    return f"--{field.replace('_', '-')}"
+
+
+def _collect_metadata_from_args(args) -> dict:
+    """
+    从 argparse 结果收集 metadata 顶层字段。
+    键集合与 schema.METADATA_DIRECT_FIELDS 一致，供 build_metadata / 校验复用。
+    """
+    meta = {}
+    for field in db_schema.METADATA_DIRECT_FIELDS:
+        if field == "bench_flush_cache":
+            meta[field] = args.bench_flush_cache == "true"
+        else:
+            meta[field] = getattr(args, field)
+    return meta
+
+
+def build_metadata(meta: dict, params: dict, extra: dict, bench_cmd: str = "") -> dict:
+    """
+    组织 metadata.json（§5.3）。
+    顶层键仅含 schema.METADATA_DIRECT_FIELDS + 派生块 params/extra/gpu_count。
+    bench_cmd 非 DB 列，若提供则写入 extra 供追溯。
+    """
+    if bench_cmd:
+        extra = dict(extra)
+        extra["bench_cmd"] = bench_cmd
+    out = {k: meta[k] for k in db_schema.METADATA_DIRECT_FIELDS}
+    out["params"] = params
+    out["extra"] = extra
+    out["gpu_count"] = extra.get("gpu_count")
+    return out
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="性能测试结果落盘脚本：整理 bench 输出为 result.csv + metadata.json"
+        description="性能测试结果落盘脚本：整理 bench 输出为 result.csv + metadata.json。"
+                    "metadata 字段与 autores/db/schema.py METADATA_DIRECT_FIELDS 对齐。"
     )
-    p.add_argument("--framework", required=True, choices=["sglang", "vllm", "vllm-ascend"],
-                   help="推理框架，决定 bench 字段映射与参数提取规则")
-    p.add_argument("--framework-version", required=True,
-                   help="框架版本（如 0.4.6 / 0.5.12），手动传入")
+    # ── 落盘路径（非 DB 列，脚本运行参数）──
     p.add_argument("--input-dir", required=True,
-                   help="bench 原始输出目录（sglang 为 JSONL，vllm 为多个 JSON）")
+                   help="bench 原始输出目录（sglang / vllm 均为 *.json）")
     p.add_argument("--nas-dir", required=True,
                    help="NAS 挂载根路径，脚本在其下创建时间戳目录")
-    p.add_argument("--gpu-type", required=True, help="显卡类型，如 H20-141G")
-    p.add_argument("--model", required=True, help="模型名")
-    p.add_argument("--model-version", required=True, help="模型版本")
-    p.add_argument("--launch-cmd", required=True,
-                   help="完整服务启动命令字符串，用于提取 tp/dp/hicache 等参数")
-    p.add_argument("--bench-cmd", default="",
-                   help="完整 benchmark 命令字符串（vllm 场景用于补 random_input_len）")
     p.add_argument("--timestamp", default="",
                    help="可选，指定时间戳目录名（默认用当前时刻 YYYYMMDD_HHMMSS）")
+    p.add_argument("--bench-cmd", default="",
+                   help="（非 DB 列）vllm bench 完整命令，用于补 JSON 里没有的 Input_Length；"
+                        "写入 extra.bench_cmd 供追溯")
+
+    # ── metadata 直接列（与 test_runs / METADATA_DIRECT_FIELDS 一一对应）──
+    for field in db_schema.METADATA_DIRECT_FIELDS:
+        flag = _cli_flag(field)
+        if field == "framework":
+            p.add_argument(flag, required=True, choices=list(db_schema.FRAMEWORK_CHOICES),
+                           help="server（推理服务）框架 → test_runs.framework")
+        elif field == "bench_framework":
+            p.add_argument(flag, required=True, choices=list(db_schema.FRAMEWORK_CHOICES),
+                           help="压测工具框架 → test_runs.bench_framework（必填，禁止默认等于 framework）")
+        elif field == "bench_flush_cache":
+            p.add_argument(flag, required=True, choices=["true", "false"],
+                           help="压测前是否清 KV 缓存 → test_runs.bench_flush_cache")
+        elif field == "deployment_mode":
+            p.add_argument(flag, default=db_schema.METADATA_OPTIONAL_DEFAULTS[field],
+                           choices=list(db_schema.DEPLOYMENT_MODES),
+                           help="部署模式 → test_runs.deployment_mode")
+        elif field in db_schema.METADATA_OPTIONAL_DEFAULTS:
+            default = db_schema.METADATA_OPTIONAL_DEFAULTS[field]
+            p.add_argument(flag, default=default,
+                           help=f"→ test_runs.{field}（可选，默认 {default!r}）")
+        elif field in db_schema.METADATA_REQUIRED:
+            help_map = {
+                "framework_version": "server 框架版本 → test_runs.framework_version",
+                "gpu_type": "显卡型号 → test_runs.gpu_type",
+                "model": "模型名 → test_runs.model",
+                "launch_cmd": "server 启动命令原文 → test_runs.launch_cmd",
+            }
+            p.add_argument(flag, required=True, help=help_map.get(field, f"→ test_runs.{field}"))
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    meta = _collect_metadata_from_args(args)
+    bench_framework = meta["bench_framework"]
+    bench_flush_cache = meta["bench_flush_cache"]
 
     # 时间戳目录（唯一标识）
     ts = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -474,28 +533,31 @@ def main():
     if os.path.exists(out_dir):
         raise SystemExit(f"[ERR] 目标目录已存在，避免覆盖: {out_dir}")
 
-    # 解析 bench 输出
-    records = load_bench_records(args.framework, args.input_dir)
+    # 解析 bench 输出（按 bench 框架，因为 JSON 结构由压测工具决定）
+    records = load_bench_records(bench_framework, args.input_dir)
     if not records:
-        raise SystemExit(f"[ERR] 在 {args.input_dir} 未找到有效 bench 结果，请检查 --framework 与路径")
+        raise SystemExit(
+            f"[ERR] 在 {args.input_dir} 未找到有效 bench 结果，请检查 --bench-framework 与路径")
 
     fallback_input_len = parse_bench_cmd_input_len(args.bench_cmd)
-    if args.framework in ("vllm", "vllm-ascend") and fallback_input_len is None:
-        print("⚠️  vllm 场景未能从 --bench-cmd 解析出 --random-input-len，Input_Length 将填 N/A")
+    if bench_framework in ("vllm", "vllm-ascend") and fallback_input_len is None:
+        print("⚠️  vllm bench 场景未能从 --bench-cmd 解析出 --random-input-len，Input_Length 将填 N/A")
 
-    rows = build_rows(args.framework, records, fallback_input_len)
+    rows = build_rows(bench_framework, records, fallback_input_len)
 
-    # 提取启动参数
-    params, extra = extract_launch_params(args.framework, args.launch_cmd)
+    # 提取启动参数（按 server 框架，因为 launch_cmd 是服务端启动命令）
+    params, extra = extract_launch_params(meta["framework"], meta["launch_cmd"])
 
-    # 组织并落盘
-    metadata = build_metadata(args, params, extra)
+    # 组织并落盘（metadata 顶层键与 schema.METADATA_DIRECT_FIELDS 一致）
+    metadata = build_metadata(meta, params, extra, bench_cmd=args.bench_cmd)
     csv_path, meta_path = write_outputs(out_dir, rows, metadata)
 
     print(f"[OK] 落盘完成：{len(rows)} 条指标记录")
     print(f"[目录] {out_dir}")
     print(f"       - {os.path.basename(csv_path)}")
     print(f"       - {os.path.basename(meta_path)}")
+    print(f"[bench] server={meta['framework']} bench={bench_framework} "
+          f"flush_cache={bench_flush_cache}")
     print(f"[参数] tp={params['tp']} dp={params['dp']} pp={params['pp']} "
           f"ep={params['ep']} cp={params['cp']} hicache={params['hicache_enabled']} "
           f"flexkv={params['flexkv_enabled']}")

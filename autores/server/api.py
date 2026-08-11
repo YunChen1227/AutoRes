@@ -94,10 +94,25 @@ def upload_options():
     """上传表单可选项（框架 / 显卡 / 路由策略由后端规则表提供，避免前后端各写一份）。"""
     return JSONResponse({
         "frameworks": launch_params.supported_frameworks(),
+        "bench_frameworks": upload_mod.supported_bench_frameworks(),
         "gpu_types": upload_mod.supported_gpu_types(),
         "router_policies": launch_params.router_policies(),
         "transfer_backends": launch_params.transfer_backends(),
     })
+
+
+@router.post("/api/upload/detect-bench")
+async def upload_detect_bench(csv_file: UploadFile = File(...)):
+    """
+    读一遍 CSV，按 spec decoding 列是否有值粗判 bench_framework，供前端预填。
+    返回 {bench_framework, sglang_spec_present, vllm_spec_present}；
+    bench_framework 为 null 时表示无法判断，需用户手选。
+    """
+    try:
+        csv_bytes = await csv_file.read()
+        return JSONResponse(upload_mod.detect_bench_framework(csv_bytes))
+    except UploadError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @router.post("/api/upload/detect")
@@ -125,6 +140,8 @@ async def upload_run(
     model: str = Form(...),
     gpu_type: str = Form(...),
     model_version: str = Form(""),
+    bench_framework: str = Form(...),
+    bench_flush_cache: str = Form(...),
     deployment_mode: str = Form("colocated"),
     launch_cmd: str = Form(""),
     prefill_cmd: str = Form(""),
@@ -143,6 +160,8 @@ async def upload_run(
         "model": model,
         "model_version": model_version,
         "gpu_type": gpu_type,
+        "bench_framework": bench_framework,
+        "bench_flush_cache": bench_flush_cache,
     }
     try:
         csv_bytes = await csv_file.read()

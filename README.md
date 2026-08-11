@@ -145,35 +145,46 @@ bash vllm_sgl_benchs.sh
 
 ```bash
 python tools/to_csv.py \
-  --framework sglang \
+  --framework sglang --bench-framework sglang \
+  --bench-flush-cache false \
   --framework-version 0.4.6 \
   --input-dir ./tools/logs_910b_cjb_dsv4flashint8_8_260723 \
   --nas-dir /mnt/nas/benchmark_root \
   --gpu-type H20-141G \
-  --model DeepSeek-V4 --model-version flash-int8 \
+  --model DeepSeek-V4 \
   --launch-cmd "python -m sglang.launch_server --tp-size 8 --enable-cache-report --speculative-algorithm EAGLE"
 ```
+
+> `--framework`（server 框架）与 `--bench-framework`（压测工具框架）**相互独立、均必填**，禁止默认一致——
+> sglang bench 可打 vllm server，反之亦然，共 4 种组合。`--bench-flush-cache true/false` 记录压测前是否清缓存，
+> 作为结果对比的区分维度入库（**必填**）。
 
 **vllm 示例：**
 
 ```bash
 python tools/to_csv.py \
-  --framework vllm \
+  --framework vllm --bench-framework vllm \
+  --bench-flush-cache false \
   --framework-version 0.5.12 \
   --input-dir ./tools/logs_vllm \
   --nas-dir /mnt/nas/benchmark_root \
   --gpu-type H800 \
-  --model Qwen2.5-72B --model-version v2.5.1 \
+  --model Qwen2.5-72B \
   --launch-cmd "vllm serve Qwen2.5-72B -tp 8 --enable-prefix-caching" \
   --bench-cmd "vllm bench serve --random-input-len 1024 --percentile-metrics ttft,tpot,itl,e2el"
 ```
+
+> 压测脚本 `vllm_sgl_benchs.sh` 顶部把 `RUN_TO_CSV=1` 时，**压测跑完会自动调用一次 `to_csv.py`**
+> （`--bench-flush-cache` 由脚本的 `FLUSH_CACHE` 派生，server/bench 框架用脚本内的两个变量），无需手动执行本步。
 
 **vllm-ascend：** 与 vllm 相同，仅 `--framework vllm-ascend`；参数解析走 vllm 分支，入库 `framework` 仍存 `vllm-ascend`。
 
 **要点：**
 
 - `--input-dir`：压测 JSON 所在目录（sglang / vllm 均为 `*.json` 整文件解析）。
-- `--framework`：必须与压测时 `FRAMEWORK` 一致，否则字段映射错误。
+- `--framework` / `--bench-framework`：分别是 server 框架与压测工具框架，**均必填且相互独立**。
+  `--bench-framework` 决定 bench JSON 字段解析（须与压测所用工具一致），`--framework` 决定 `--launch-cmd` 的参数提取。
+- `--bench-flush-cache`：`true/false`，**必填**，记录压测前是否清缓存（flush=冷启动、不 flush=复用缓存，结果差异大，作为入库对比维度）。
 - vllm / vllm-ascend 建议传 `--bench-cmd`，用于补 JSON 里没有的 `Input_Length`（从 `--random-input-len` 解析）。
 - vllm bench 须含 `--percentile-metrics ttft,tpot,itl,e2el` 才有完整 E2E/ITL 列（压测脚本已包含）。
 - `--launch-cmd`：完整服务启动命令；脚本提取 tp/dp/pp、投机解码、prefix caching 等入库维度，并计算 `gpu_count`。
@@ -202,10 +213,14 @@ python tools/to_csv.py \
 
 服务启动后打开 `http://<服务器>:8080/upload`：
 
-1. 上传符合固定 schema 的结果 CSV（须含 `Input_Length`、`Concurrency`）
+1. 上传符合固定 schema 的结果 CSV（须含 `Input_Length`、`Concurrency`）——**选好文件后会自动按 spec 列识别 bench 框架**
 2. 上传启动命令 txt（支持 `#` 注释、空行、反斜杠续行）
 3. 选择 **单机/分布式** 或 **PD 分离**（检测到 disaggregation / kv-transfer 参数会自动切换）
-4. 填写 `framework`（`sglang` / `vllm` / `vllm-ascend`）、`framework_version`、`model`，选择 `gpu_type`
+4. 填写 `framework`（server 框架：`sglang` / `vllm` / `vllm-ascend`）、`framework_version`、`model`，选择 `gpu_type`
+5. **bench 参数（必填）**：
+   - **bench 框架**：与 server 框架相互独立。上传 CSV 后按 spec decoding 列是否有值自动预填
+     （仅 vLLM 列有值→`vllm`，仅 SGLang 列有值→`sglang`；两者都有/都无则需手选），可手动改。
+   - **是否 flush cache**：无法从 CSV 推断，**必须手动勾选**（flush=冷启动、不 flush=复用缓存）。
 
 启动参数提取与 `to_csv.py` 同一套规则；PD 模式下分别填写 prefill / decode / router 启动命令。
 

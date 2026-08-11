@@ -49,24 +49,19 @@ def build_metadata(
     deployment_mode: str = "colocated",
     pd: dict | None = None,
 ) -> dict:
-    """组织 metadata.json（与 tools/to_csv.py build_metadata 字段对齐）。
-
-    PD 分离（deployment_mode='pd_disagg'）时额外写入 pd 块：
-      pd = {transfer_backend, prefill:{params,launch_cmd,disagg,unrecognized},
-            decode:{...}, router:{policy,prefill_policy,decode_policy,_extra,launch_cmd}}
-    """
-    out = {
-        "framework": meta["framework"],
-        "framework_version": meta["framework_version"],
-        "model": meta["model"],
-        "model_version": meta["model_version"],
-        "gpu_type": meta["gpu_type"],
-        "launch_cmd": launch_cmd,
-        "deployment_mode": deployment_mode,
-        "params": params,
-        "extra": extra,
-        "gpu_count": extra.get("gpu_count"),
-    }
+    """组织 metadata.json（顶层键与 schema.METADATA_DIRECT_FIELDS 一致）。"""
+    out: dict = {}
+    for field in schema.METADATA_DIRECT_FIELDS:
+        if field == "launch_cmd":
+            out[field] = launch_cmd
+        elif field == "deployment_mode":
+            out[field] = deployment_mode
+        else:
+            default = schema.METADATA_OPTIONAL_DEFAULTS.get(field)
+            out[field] = meta.get(field, default)
+    out["params"] = params
+    out["extra"] = extra
+    out["gpu_count"] = extra.get("gpu_count")
     if deployment_mode == "pd_disagg" and pd is not None:
         out["pd"] = pd
         out["gpu_count"] = pd.get("gpu_count", out["gpu_count"])

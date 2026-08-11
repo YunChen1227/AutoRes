@@ -26,6 +26,7 @@ from autores.db import schema
 from autores.scanner.parser import _to_number
 from autores.server.ingest import launch_params
 from autores.server.ingest.csv_columns import (
+    SPEC_COLUMNS,
     build_header_map,
     check_required_dimensions,
     format_mapping_summary,
@@ -37,6 +38,38 @@ log = get_logger("upload")
 # 表单必填的元信息字段（metadata.json 在上传流里的替代品）
 # 模型无版本时只填 model；model_version 入库写空串，不要求用户填写。
 REQUIRED_META = ["framework", "framework_version", "model", "gpu_type"]
+
+# 压测工具框架（bench framework）可选值。与 server framework 相互独立、禁止默认一致。
+SUPPORTED_BENCH_FRAMEWORKS = ["sglang", "vllm"]
+
+# CSV 单元格里视为"无值"的取值（判断 spec 列是否有值时用）；注意 "0" 算有值。
+_NA_CELLS = frozenset({"", "n/a", "na", "none", "null"})
+
+
+def supported_bench_frameworks() -> list[str]:
+    return list(SUPPORTED_BENCH_FRAMEWORKS)
+
+
+def _parse_bool_form(val) -> bool | None:
+    """表单布尔值解析：识别 true/false/1/0/yes/no/on/off；无法识别返回 None。"""
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return None
+
+
+def _cell_has_value(raw) -> bool:
+    """CSV 单元格是否为真实取值（非空、非 N/A）；数值 0 视为有值。"""
+    if raw is None:
+        return False
+    s = str(raw).strip()
+    return bool(s) and s.lower() not in _NA_CELLS
 
 _GPU_PRESETS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
@@ -135,6 +168,51 @@ def parse_csv_text(text: str) -> list[dict]:
     return metrics
 
 
+def detect_bench_framework(csv_bytes: bytes) -> dict:
+    """
+    仅凭 CSV 的 spec decoding 列是否有值，粗判 bench_framework（供前端预填）。
+
+    规则（与用户约定一致）：
+      · 只有 vLLM_* spec 列有值   → 建议 vllm
+      · 只有 SGLang_* spec 列有值 → 建议 sglang
+      · 两者都有 / 都无           → None（交由用户手填）
+    最终以用户提交的表单为准；此处不做强校验，返回诊断信息即可。
+    """
+    text = _decode(csv_bytes, "CSV 文件", MAX_CSV_BYTES)
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames is None:
+        raise UploadError("CSV 无表头")
+
+    header_map = build_header_map(list(reader.fieldnames))
+    # 规范列名 → 原始表头（用于回到原始行取值）
+    canon_to_raw: dict[str, str] = {}
+    for raw, canon in header_map.items():
+        if canon and canon not in canon_to_raw:
+            canon_to_raw[canon] = raw
+    rows = list(reader)
+
+    def any_value(canon_cols) -> bool:
+        raws = [canon_to_raw[c] for c in canon_cols if c in canon_to_raw]
+        if not raws:
+            return False
+        return any(_cell_has_value(row.get(rc)) for row in rows for rc in raws)
+
+    sgl_has = any_value(SPEC_COLUMNS["sglang"])
+    vllm_has = any_value(SPEC_COLUMNS["vllm"])
+    if vllm_has and not sgl_has:
+        suggestion = "vllm"
+    elif sgl_has and not vllm_has:
+        suggestion = "sglang"
+    else:
+        suggestion = None
+
+    return {
+        "bench_framework": suggestion,
+        "sglang_spec_present": sgl_has,
+        "vllm_spec_present": vllm_has,
+    }
+
+
 def parse_launch_txt(text: str) -> str:
     """
     从启动命令文本提取命令原文。
@@ -172,6 +250,22 @@ def validate_meta(form: dict) -> dict:
     gpus = supported_gpu_types()
     if meta["gpu_type"] not in gpus:
         raise UploadError(f"gpu_type 必须是 {gpus} 之一，收到: {meta['gpu_type']}")
+
+    # ── bench 维度：必填，且与 server framework 相互独立 ──
+    # bench_framework 可由 CSV 的 spec 列自动预填，但仍需随表单显式提交。
+    bench_fw = (form.get("bench_framework") or "").strip()
+    if not bench_fw:
+        raise UploadError("缺少必填字段: bench_framework（压测工具框架，可从 CSV 自动识别或手选）")
+    if bench_fw not in SUPPORTED_BENCH_FRAMEWORKS:
+        raise UploadError(
+            f"bench_framework 必须是 {SUPPORTED_BENCH_FRAMEWORKS} 之一，收到: {bench_fw}")
+    meta["bench_framework"] = bench_fw
+
+    # bench_flush_cache 无法从 CSV 推断，必须由用户手动勾选
+    flush = _parse_bool_form(form.get("bench_flush_cache"))
+    if flush is None:
+        raise UploadError("请手动勾选压测前是否 flush cache（bench_flush_cache 必填，无法从 CSV 推断）")
+    meta["bench_flush_cache"] = flush
     return meta
 
 

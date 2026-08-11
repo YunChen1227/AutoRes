@@ -83,6 +83,22 @@ PARAM_DIMENSIONS = [name for name, _t, _b in _PARAM_SPECS]
 _PARAM_SQL_TYPE = {name: t for name, t, _b in _PARAM_SPECS}
 _BASE_BOOL = {name for name, _t, b in _PARAM_SPECS if b}
 
+# ── bench（压测）相关维度 ──
+#
+# 与 launch 参数不同：这些描述的是"压测本身"，会影响结果、必须作为对比轴区分。
+#   bench_framework   : 压测工具框架（sglang / vllm）。可与 server 侧 framework 不同
+#                       （sglang bench 能打 vllm server，反之亦然，共 4 种组合）。
+#   bench_flush_cache : 压测前是否清空 server KV 缓存（bool）。
+#                       flush=冷启动无前缀命中；不 flush=复用缓存，两者结果差异大。
+# 二者在入库/上传两条流里都是"必填"，但列本身可空，方便老数据迁移后留 NULL。
+_BENCH_SPECS = [
+    ("bench_framework", "TEXT", False),
+    ("bench_flush_cache", "INTEGER", True),
+]
+BENCH_DIMENSIONS = [name for name, _t, _b in _BENCH_SPECS]
+_BENCH_SQL_TYPE = {name: t for name, t, _b in _BENCH_SPECS}
+_BENCH_BOOL = {name for name, _t, b in _BENCH_SPECS if b}
+
 # ── PD 分离（D22）──
 DEPLOYMENT_MODES = ("colocated", "pd_disagg")
 PD_ROLES = ("prefill", "decode")
@@ -120,16 +136,56 @@ def _base_dim(dim: str) -> str:
 
 
 def is_bool_dim(dim: str) -> bool:
-    return _base_dim(dim) in _BASE_BOOL
+    base = _base_dim(dim)
+    return base in _BASE_BOOL or base in _BENCH_BOOL
 
 
 # Agent 可用于对比/筛选的维度（design.md §7.2 list_dimension_values 枚举）。
 # 加入 deployment_mode 作为"单机分布式 vs PD"的对比轴；prefill_/decode_/router_ 明细
 # 已作为物理列存储与展示，如需让 Agent 直接对比可后续追加到此列表。
-ALL_DIMENSIONS = META_DIMENSIONS + PARAM_DIMENSIONS + ["deployment_mode"]
+ALL_DIMENSIONS = (META_DIMENSIONS + PARAM_DIMENSIONS
+                  + ["deployment_mode"] + BENCH_DIMENSIONS)
 
 # 指标里的两个"维度列"（不是性能数值，而是测试条件）
 METRIC_DIMENSION_KEYS = ["Input_Length", "Concurrency"]
+
+# ── metadata.json 顶层字段 ↔ test_runs 直接列（to_csv / upload / parser 共用）──
+#
+# 仅列「用户/脚本提供、入库为 test_runs 直接列」的键；params/extra/metrics 等
+# 由 launch_cmd 解析或 bench 输出派生，不在此清单。
+# CLI 名 = 字段名把 _ 换成 -（argparse 惯例），如 model_version → --model-version。
+METADATA_DIRECT_FIELDS: tuple[str, ...] = (
+    "model",
+    "model_version",       # DB NOT NULL，但允许空串；upload 不要求用户填写
+    "framework",           # server（推理服务）框架
+    "framework_version",
+    "gpu_type",
+    "launch_cmd",
+    "deployment_mode",     # 默认 colocated
+    "bench_framework",
+    "bench_flush_cache",
+)
+
+# to_csv.py / 上传入库时用户必须提供的 metadata 字段（model_version 可缺省为空串）
+# Scanner 读老 NAS 目录时不强制 bench_*（缺了入库为 NULL）。
+METADATA_REQUIRED: frozenset[str] = frozenset({
+    "model",
+    "framework",
+    "framework_version",
+    "gpu_type",
+    "launch_cmd",
+    "bench_framework",
+    "bench_flush_cache",
+})
+
+# to_csv.py 可选 metadata 字段 → 默认值
+METADATA_OPTIONAL_DEFAULTS: dict[str, object] = {
+    "model_version": "",
+    "deployment_mode": "colocated",
+}
+
+# server / bench 框架 CLI 可选值（与 launch_params.supported_frameworks 对齐）
+FRAMEWORK_CHOICES: tuple[str, ...] = ("sglang", "vllm", "vllm-ascend")
 
 
 # ── test_runs 列清单（DDL 与迁移共用同一份定义）──
@@ -146,6 +202,9 @@ def _test_runs_columns() -> list[tuple[str, str]]:
         ("launch_cmd", "TEXT NOT NULL"),
         ("deployment_mode", "TEXT NOT NULL DEFAULT 'colocated'"),
     ]
+    # bench 维度列（可空：老数据迁移后为 NULL；新数据在 ingest 层强制必填）
+    for name in BENCH_DIMENSIONS:
+        cols.append((name, _BENCH_SQL_TYPE[name]))
     # 单机/分布式参数列
     for name in PARAM_DIMENSIONS:
         cols.append((name, _PARAM_SQL_TYPE[name]))
@@ -256,6 +315,8 @@ def doc_to_row(doc: dict) -> dict:
         "gpu_type": doc["gpu_type"],
         "launch_cmd": doc["launch_cmd"],
         "deployment_mode": deployment,
+        "bench_framework": doc.get("bench_framework"),
+        "bench_flush_cache": _store_val("bench_flush_cache", doc.get("bench_flush_cache")),
         "gpu_count": doc.get("gpu_count") or extra_raw.get("gpu_count"),
         "prefill_gpu_count": doc.get("prefill_gpu_count"),
         "decode_gpu_count": doc.get("decode_gpu_count"),
@@ -290,6 +351,8 @@ def row_to_doc(row) -> dict:
         "gpu_type": row["gpu_type"],
         "launch_cmd": row["launch_cmd"],
         "deployment_mode": deployment,
+        "bench_framework": _rget(row, "bench_framework"),
+        "bench_flush_cache": _load_val("bench_flush_cache", _rget(row, "bench_flush_cache")),
         "gpu_count": _rget(row, "gpu_count"),
         "prefill_gpu_count": _rget(row, "prefill_gpu_count"),
         "decode_gpu_count": _rget(row, "decode_gpu_count"),

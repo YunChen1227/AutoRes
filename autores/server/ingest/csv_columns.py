@@ -47,6 +47,13 @@ CANONICAL_COLUMNS: tuple[str, ...] = (
 
 _CANONICAL_SET = frozenset(CANONICAL_COLUMNS)
 
+# spec decoding 规范列，按框架分组。上传时据"哪边列有值"粗判 bench_framework：
+#   只有 vllm 列有值 → vllm；只有 sglang 列有值 → sglang；都有/都无 → 需手填。
+SPEC_COLUMNS: dict[str, tuple[str, ...]] = {
+    "sglang": ("SGLang_Spec_Accept_Length",),
+    "vllm": ("vLLM_Spec_Accept_Rate(%)", "vLLM_Spec_Accept_Length"),
+}
+
 
 def _norm_key(name: str) -> str:
     """忽略大小写、空格、下划线、括号、单位后缀，便于别名匹配。"""

@@ -77,12 +77,13 @@ def _parse_metadata(meta_path: str) -> dict:
     except json.JSONDecodeError as e:
         raise ParseError(f"metadata.json 解析失败: {meta_path}: {e}") from e
 
-    # 校验必备字段
-    required = ["framework", "framework_version", "model", "model_version",
-                "gpu_type", "launch_cmd", "params"]
+    # 必备字段（Scanner 读 NAS 老目录：bench 字段后加，缺了仍允许入库，列留 NULL）
+    required = ["model", "framework", "framework_version", "gpu_type", "launch_cmd", "params"]
     missing = [k for k in required if k not in meta]
     if missing:
         raise ParseError(f"metadata.json 缺字段 {missing}: {meta_path}")
+    for field, default in schema.METADATA_OPTIONAL_DEFAULTS.items():
+        meta.setdefault(field, default)
     return meta
 
 
@@ -110,6 +111,9 @@ def parse_run_dir(dir_path: str) -> dict:
         "gpu_type": meta["gpu_type"],
         "launch_cmd": meta["launch_cmd"],
         "deployment_mode": deployment,
+        # bench 维度：新数据由 to_csv.py / 上传表单写入；老目录可能没有，留 None
+        "bench_framework": meta.get("bench_framework"),
+        "bench_flush_cache": meta.get("bench_flush_cache"),
         "gpu_count": meta.get("gpu_count") or extra.get("gpu_count"),
         "prefill_gpu_count": meta.get("prefill_gpu_count"),
         "decode_gpu_count": meta.get("decode_gpu_count"),
