@@ -170,6 +170,7 @@ def _dig(record, key):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import param_map as pm  # noqa: E402
+import param_map_pd as pm_pd  # noqa: E402  (PD 分离解析表，与网页上传同源)
 import gpu_count as gc  # noqa: E402
 from autores.db import schema as db_schema  # noqa: E402
 
@@ -332,6 +333,93 @@ def extract_launch_params(framework, launch_cmd):
     return params, extra
 
 
+# ============================================================================
+# 2b. PD 分离（Prefill-Decode Disaggregation）解析
+#     与 autores/server/ingest/launch_params.extract_role / upload._build_pd 同逻辑，
+#     同源复用 param_map_pd + gpu_count，保证脚本落盘的 pd 块与网页上传/入库一致。
+# ============================================================================
+
+def _pd_flag_names():
+    """PD 专属 flag 名集合（从 unrecognized 里剔除，避免误报"未识别"）。"""
+    return set(pm_pd.SGL_PD_FLAGS) | {pm_pd.VLLM_KV_FLAG}
+
+
+def extract_role(framework, cmd):
+    """
+    解析一条 PD 角色（prefill 或 decode）server 命令，返回：
+      {role, params, disagg, unrecognized, extra}
+    role 为 'prefill'/'decode'/'both'；非 PD 角色命令 role=None（调用方据此报错）。
+    """
+    role = pm_pd.detect_role(framework, cmd)
+    params, extra = extract_launch_params(framework, cmd)
+    disagg = pm_pd.extract_disagg(framework, cmd)
+
+    pd_flags = _pd_flag_names()
+    unrecognized = []
+    for item in extra.pop("unrecognized", []):
+        first = item.split(" ", 1)[0]
+        if first in pd_flags:
+            continue
+        unrecognized.append(item)
+
+    return {
+        "role": role,
+        "params": params,
+        "disagg": disagg,
+        "unrecognized": unrecognized,
+        "extra": extra,
+    }
+
+
+def build_pd(framework, prefill_cmd, decode_cmd, router_cmd=""):
+    """
+    解析 PD 分离三条命令 → (combined_launch_cmd, pd_meta)。
+    pd_meta 结构与 upload._build_pd 完全一致，供 scanner._split_pd 正确入库。
+    """
+    pf = extract_role(framework, prefill_cmd)
+    dc = extract_role(framework, decode_cmd)
+
+    if pf["role"] not in ("prefill", "both"):
+        raise SystemExit(
+            "[ERR] --prefill-cmd 未检测到 prefill 角色："
+            "sglang 需含 --disaggregation-mode prefill，vllm 需 kv_role=kv_producer/kv_both")
+    if dc["role"] not in ("decode", "both"):
+        raise SystemExit(
+            "[ERR] --decode-cmd 未检测到 decode 角色："
+            "sglang 需含 --disaggregation-mode decode，vllm 需 kv_role=kv_consumer/kv_both")
+
+    router = pm_pd.parse_router(router_cmd)
+    transfer_backend = (pf["disagg"].get("transfer_backend")
+                        or dc["disagg"].get("transfer_backend"))
+
+    pm_fw = "vllm" if framework == "vllm-ascend" else framework
+    pf_gpus, dc_gpus, total_gpus = gc.annotate_pd_gpu_counts(
+        pm_fw, pf["params"], dc["params"])
+
+    combined = f"# PREFILL\n{prefill_cmd}\n\n# DECODE\n{decode_cmd}"
+    if router_cmd:
+        combined += f"\n\n# ROUTER\n{router_cmd}"
+
+    pd_meta = {
+        "transfer_backend": transfer_backend,
+        "gpu_count": total_gpus,
+        "prefill_gpu_count": pf_gpus,
+        "decode_gpu_count": dc_gpus,
+        "prefill": {
+            "params": pf["params"], "launch_cmd": prefill_cmd,
+            "disagg": pf["disagg"], "unrecognized": pf["unrecognized"],
+            "gpu_count": pf_gpus,
+        },
+        "decode": {
+            "params": dc["params"], "launch_cmd": decode_cmd,
+            "disagg": dc["disagg"], "unrecognized": dc["unrecognized"],
+            "gpu_count": dc_gpus,
+        },
+        "router": {**router, "launch_cmd": router_cmd},
+    }
+    return combined, pd_meta
+
+
 def parse_bench_cmd_input_len(bench_cmd):
     """从 --bench-cmd 提取 --random-input-len（vllm 用，JSON 里没有）。返回 int 或 None。"""
     if not bench_cmd:
@@ -456,11 +544,14 @@ def _collect_metadata_from_args(args) -> dict:
     return meta
 
 
-def build_metadata(meta: dict, params: dict, extra: dict, bench_cmd: str = "") -> dict:
+def build_metadata(meta: dict, params: dict, extra: dict,
+                   bench_cmd: str = "", pd: dict | None = None) -> dict:
     """
     组织 metadata.json（§5.3）。
     顶层键仅含 schema.METADATA_DIRECT_FIELDS + 派生块 params/extra/gpu_count。
     bench_cmd 非 DB 列，若提供则写入 extra 供追溯。
+    PD 分离（deployment_mode=pd_disagg）额外写 pd 块 + prefill/decode 卡数，
+    结构与 persist.build_metadata 一致，供 scanner._split_pd 入库。
     """
     if bench_cmd:
         extra = dict(extra)
@@ -469,6 +560,11 @@ def build_metadata(meta: dict, params: dict, extra: dict, bench_cmd: str = "") -
     out["params"] = params
     out["extra"] = extra
     out["gpu_count"] = extra.get("gpu_count")
+    if meta.get("deployment_mode") == "pd_disagg" and pd is not None:
+        out["pd"] = pd
+        out["gpu_count"] = pd.get("gpu_count", out["gpu_count"])
+        out["prefill_gpu_count"] = pd.get("prefill_gpu_count")
+        out["decode_gpu_count"] = pd.get("decode_gpu_count")
     return out
 
 
@@ -487,6 +583,15 @@ def parse_args():
     p.add_argument("--bench-cmd", default="",
                    help="（非 DB 列）vllm bench 完整命令，用于补 JSON 里没有的 Input_Length；"
                         "写入 extra.bench_cmd 供追溯")
+    # ── PD 分离命令（非单独 DB 列，合并进 launch_cmd 并拆到 prefill_/decode_ 列）──
+    p.add_argument("--prefill-cmd", default="",
+                   help="（PD 分离必填）prefill 实例启动命令；需含角色标识"
+                        "（sglang --disaggregation-mode prefill / vllm kv_role=kv_producer）")
+    p.add_argument("--decode-cmd", default="",
+                   help="（PD 分离必填）decode 实例启动命令；需含角色标识"
+                        "（sglang --disaggregation-mode decode / vllm kv_role=kv_consumer）")
+    p.add_argument("--router-cmd", default="",
+                   help="（PD 分离可选）router/proxy 启动命令，解析 --policy/--prefill-policy/--decode-policy")
 
     # ── metadata 直接列（与 test_runs / METADATA_DIRECT_FIELDS 一一对应）──
     for field in db_schema.METADATA_DIRECT_FIELDS:
@@ -504,6 +609,11 @@ def parse_args():
             p.add_argument(flag, default=db_schema.METADATA_OPTIONAL_DEFAULTS[field],
                            choices=list(db_schema.DEPLOYMENT_MODES),
                            help="部署模式 → test_runs.deployment_mode")
+        elif field == "launch_cmd":
+            # colocated 必填、pd_disagg 由 prefill/decode 合成；统一改为可选，main 里按模式校验
+            p.add_argument(flag, default="",
+                           help="server 启动命令原文（colocated 必填）→ test_runs.launch_cmd；"
+                                "PD 分离改用 --prefill-cmd/--decode-cmd 自动合成")
         elif field in db_schema.METADATA_OPTIONAL_DEFAULTS:
             default = db_schema.METADATA_OPTIONAL_DEFAULTS[field]
             p.add_argument(flag, default=default,
@@ -524,6 +634,15 @@ def main():
     meta = _collect_metadata_from_args(args)
     bench_framework = meta["bench_framework"]
     bench_flush_cache = meta["bench_flush_cache"]
+    deployment = meta.get("deployment_mode", "colocated")
+
+    # 按部署模式校验命令参数（colocated 需 launch_cmd；pd_disagg 需 prefill+decode）
+    if deployment == "pd_disagg":
+        if not args.prefill_cmd or not args.decode_cmd:
+            raise SystemExit(
+                "[ERR] --deployment-mode pd_disagg 需同时提供 --prefill-cmd 与 --decode-cmd")
+    elif not meta["launch_cmd"]:
+        raise SystemExit("[ERR] colocated 模式需提供 --launch-cmd")
 
     # 时间戳目录（唯一标识）
     ts = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -546,10 +665,23 @@ def main():
     rows = build_rows(bench_framework, records, fallback_input_len)
 
     # 提取启动参数（按 server 框架，因为 launch_cmd 是服务端启动命令）
-    params, extra = extract_launch_params(meta["framework"], meta["launch_cmd"])
+    pd_meta = None
+    if deployment == "pd_disagg":
+        # PD：prefill/decode 各自解析并拆到 prefill_/decode_ 列；顶层 params 留空
+        combined, pd_meta = build_pd(
+            meta["framework"], args.prefill_cmd, args.decode_cmd, args.router_cmd)
+        meta["launch_cmd"] = combined
+        params = {}
+        extra = {
+            "gpu_count": pd_meta["gpu_count"],
+            "prefill_gpu_count": pd_meta["prefill_gpu_count"],
+            "decode_gpu_count": pd_meta["decode_gpu_count"],
+        }
+    else:
+        params, extra = extract_launch_params(meta["framework"], meta["launch_cmd"])
 
     # 组织并落盘（metadata 顶层键与 schema.METADATA_DIRECT_FIELDS 一致）
-    metadata = build_metadata(meta, params, extra, bench_cmd=args.bench_cmd)
+    metadata = build_metadata(meta, params, extra, bench_cmd=args.bench_cmd, pd=pd_meta)
     csv_path, meta_path = write_outputs(out_dir, rows, metadata)
 
     print(f"[OK] 落盘完成：{len(rows)} 条指标记录")
@@ -557,13 +689,21 @@ def main():
     print(f"       - {os.path.basename(csv_path)}")
     print(f"       - {os.path.basename(meta_path)}")
     print(f"[bench] server={meta['framework']} bench={bench_framework} "
-          f"flush_cache={bench_flush_cache}")
-    # 直接打印解析出的全部参数（字段名以 extract_launch_params 实际产出为准，
-    # 与网页上传共用同一解析器，避免写死已废弃的 key 触发 KeyError）
-    if params:
-        print("[参数] " + "  ".join(f"{k}={params[k]}" for k in sorted(params)))
-    if extra.get("unrecognized"):
-        print(f"[未识别] {' '.join(extra['unrecognized'])}")
+          f"flush_cache={bench_flush_cache} deployment={deployment}")
+    if deployment == "pd_disagg" and pd_meta is not None:
+        pf_p, dc_p = pd_meta["prefill"]["params"], pd_meta["decode"]["params"]
+        print(f"[PD] transfer_backend={pd_meta['transfer_backend']}  "
+              f"gpu={pd_meta['gpu_count']}"
+              f"(prefill {pd_meta['prefill_gpu_count']}+decode {pd_meta['decode_gpu_count']})")
+        print("[prefill] " + "  ".join(f"{k}={pf_p[k]}" for k in sorted(pf_p)))
+        print("[decode]  " + "  ".join(f"{k}={dc_p[k]}" for k in sorted(dc_p)))
+    else:
+        # 直接打印解析出的全部参数（字段名以 extract_launch_params 实际产出为准，
+        # 与网页上传共用同一解析器，避免写死已废弃的 key 触发 KeyError）
+        if params:
+            print("[参数] " + "  ".join(f"{k}={params[k]}" for k in sorted(params)))
+        if extra.get("unrecognized"):
+            print(f"[未识别] {' '.join(extra['unrecognized'])}")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,20 @@
 SERVER_FRAMEWORK="sglang"     # 推理服务框架： sglang | vllm
 BENCH_FRAMEWORK="sglang"      # 压测工具框架： sglang | vllm
 
+# ── 部署模式：colocated=单机/分布式；pd_disagg=PD 分离 ──
+#   PD 分离下 bench 打的是 router/入口（SERVER_HOST:SERVER_PORT 填 router 地址），
+#   flush / KV 需直连各实例，故另配 PREFILL_URL / DECODE_URL。
+DEPLOYMENT_MODE="colocated"   # colocated | pd_disagg
+# PD 分离必填（各是一条完整 server 启动命令，需含角色标识）：
+#   sglang: --disaggregation-mode prefill|decode
+#   vllm  : --kv-transfer-config '{"kv_role":"kv_producer|kv_consumer", ...}'
+PREFILL_CMD=""
+DECODE_CMD=""
+ROUTER_CMD=""                 # 可选：router/proxy 命令（--policy/--prefill-policy/--decode-policy）
+# PD 分离时 flush / KV 抓取直连的实例地址（BASE_URL 通常是 router，无 admin/metrics）
+PREFILL_URL=""               # 例：http://30.1.1.10:18000
+DECODE_URL=""                # 例：http://30.1.1.11:18000
+
 SERVER_HOST="30.205.160.45"
 SERVER_PORT="18000"
 
@@ -77,6 +91,21 @@ BASE_URL="http://${SERVER_HOST}:${SERVER_PORT}"
 BASE_LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${LOG_SUBDIR}"
 mkdir -p "$BASE_LOG_DIR"
 
+# ── 部署模式校验（PD 分离必须给出 prefill/decode 启动命令，供 to_csv 拆列入库）──
+if [[ "$DEPLOYMENT_MODE" != "colocated" && "$DEPLOYMENT_MODE" != "pd_disagg" ]]; then
+    echo "[ERR] DEPLOYMENT_MODE 只能是 colocated | pd_disagg，当前=$DEPLOYMENT_MODE" >&2
+    exit 1
+fi
+if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
+    if [[ -z "$PREFILL_CMD" || -z "$DECODE_CMD" ]]; then
+        echo "[ERR] DEPLOYMENT_MODE=pd_disagg 需配置 PREFILL_CMD 与 DECODE_CMD" >&2
+        exit 1
+    fi
+    if [[ "$FLUSH_CACHE" == "1" && -z "$PREFILL_URL" && -z "$DECODE_URL" ]]; then
+        echo "[WARN] PD 分离开启 FLUSH_CACHE 但未配置 PREFILL_URL/DECODE_URL，将无法清缓存"
+    fi
+fi
+
 # ── 依据组合预解析各指标的采集策略（只算一次）──
 #   CAPTURE_KV  : none | sglang_native | scrape_vllm
 #   CAPTURE_SPEC: none | native
@@ -103,7 +132,9 @@ fi
 echo "================= 压测配置 ================="
 echo "  SERVER_FRAMEWORK = $SERVER_FRAMEWORK"
 echo "  BENCH_FRAMEWORK  = $BENCH_FRAMEWORK"
+echo "  DEPLOYMENT_MODE  = $DEPLOYMENT_MODE"
 echo "  BASE_URL         = $BASE_URL"
+[[ "$DEPLOYMENT_MODE" == "pd_disagg" ]] && echo "  PD admin URLs    = prefill:${PREFILL_URL:-N/A}  decode:${DECODE_URL:-N/A}"
 echo "  KV 采集策略      = $CAPTURE_KV"
 echo "  spec 采集策略    = $CAPTURE_SPEC"
 echo "  FLUSH_CACHE      = $FLUSH_CACHE"
@@ -114,21 +145,45 @@ echo "============================================"
 
 # ---- 工具函数 ----
 
-# 清空 server 缓存（端点按 SERVER_FRAMEWORK 选；失败仅告警不阻断）
-flush_server_cache() {
-    [[ "$FLUSH_CACHE" == "1" ]] || return 0
-    if [[ "$SERVER_FRAMEWORK" == "vllm" ]]; then
-        curl -s -X POST "${BASE_URL}/reset_prefix_cache" >/dev/null 2>&1 \
-            || echo "[WARN] reset_prefix_cache 失败（vllm server 需 VLLM_SERVER_DEV_MODE=1）"
+# admin/metrics 目标地址列表：
+#   colocated → BASE_URL；pd_disagg → PREFILL_URL + DECODE_URL（各实例独立，需分别命中）
+_admin_urls() {
+    if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
+        [[ -n "$PREFILL_URL" ]] && echo "$PREFILL_URL"
+        [[ -n "$DECODE_URL"  ]] && echo "$DECODE_URL"
     else
-        curl -s -X POST "${BASE_URL}/flush_cache?timeout=60" >/dev/null 2>&1 \
-            || echo "[WARN] flush_cache 失败"
+        echo "$BASE_URL"
     fi
 }
 
-# 抓 vllm server prefix cache 累计计数：输出 "queries hits"（抓不到输出空串）
-scrape_vllm_prefix_cache() {
-    curl -s "${BASE_URL}/metrics" 2>/dev/null | python3 - <<'PYEOF'
+# 对单个 URL 清缓存（端点按 SERVER_FRAMEWORK 选）
+_flush_one() {
+    local url="$1"
+    if [[ "$SERVER_FRAMEWORK" == "vllm" ]]; then
+        curl -s -X POST "${url}/reset_prefix_cache" >/dev/null 2>&1 \
+            || echo "[WARN] reset_prefix_cache 失败@${url}（vllm server 需 VLLM_SERVER_DEV_MODE=1）"
+    else
+        curl -s -X POST "${url}/flush_cache?timeout=60" >/dev/null 2>&1 \
+            || echo "[WARN] flush_cache 失败@${url}"
+    fi
+}
+
+# 清空 server 缓存（colocated 打 BASE_URL；PD 分离逐个打 prefill/decode 实例）
+flush_server_cache() {
+    [[ "$FLUSH_CACHE" == "1" ]] || return 0
+    local urls; urls="$(_admin_urls)"
+    if [[ -z "$urls" ]]; then
+        echo "[WARN] 无可用 admin 地址（PD 请配置 PREFILL_URL/DECODE_URL），跳过清缓存"; return 0
+    fi
+    local u
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && _flush_one "$u"
+    done <<< "$urls"
+}
+
+# 抓单个 URL 的 vllm prefix cache 累计计数：输出 "queries hits"（抓不到输出空串）
+_scrape_one_url() {
+    curl -s "${1}/metrics" 2>/dev/null | python3 - <<'PYEOF'
 import sys
 q = h = 0.0
 found = False
@@ -151,6 +206,23 @@ for line in sys.stdin:
 if found:
     print(f"{q} {h}")
 PYEOF
+}
+
+# 汇总所有 admin 地址的 vllm prefix cache 计数（PD 分离 = prefill+decode 求和）。
+# 输出 "queries hits"；任一地址都抓不到则输出空串。
+scrape_vllm_prefix_cache() {
+    local urls; urls="$(_admin_urls)"
+    local total_q=0 total_h=0 found=0 u one q h
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        one="$(_scrape_one_url "$u")"
+        [[ -z "$one" ]] && continue
+        q=$(echo "$one" | awk '{print $1}'); h=$(echo "$one" | awk '{print $2}')
+        total_q=$(python3 -c "print($total_q+$q)")
+        total_h=$(python3 -c "print($total_h+$h)")
+        found=1
+    done <<< "$urls"
+    [[ "$found" == "1" ]] && echo "$total_q $total_h"
 }
 
 # 把 KV hit rate 注入结果 JSON。
@@ -289,17 +361,26 @@ if [[ "$RUN_TO_CSV" == "1" ]]; then
         BENCH_FLUSH_CACHE="false"
     fi
     TO_CSV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/to_csv.py"
-    echo -e "\n[to_csv] 落盘：server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK flush_cache=$BENCH_FLUSH_CACHE"
-    python3 "$TO_CSV" \
-        --framework "$SERVER_FRAMEWORK" \
-        --bench-framework "$BENCH_FRAMEWORK" \
-        --bench-flush-cache "$BENCH_FLUSH_CACHE" \
-        --framework-version "$FRAMEWORK_VERSION" \
-        --input-dir "$BASE_LOG_DIR" \
-        --nas-dir "$NAS_DIR" \
-        --gpu-type "$GPU_TYPE" \
-        --model "$MODEL" \
-        --launch-cmd "$LAUNCH_CMD" \
-        --bench-cmd "$BENCH_CMD" \
+    echo -e "\n[to_csv] 落盘：server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK flush_cache=$BENCH_FLUSH_CACHE deployment=$DEPLOYMENT_MODE"
+    # 通用参数；启动命令按部署模式追加（colocated=--launch-cmd；pd_disagg=--prefill/decode/router-cmd）
+    TO_CSV_ARGS=(
+        --framework "$SERVER_FRAMEWORK"
+        --bench-framework "$BENCH_FRAMEWORK"
+        --bench-flush-cache "$BENCH_FLUSH_CACHE"
+        --framework-version "$FRAMEWORK_VERSION"
+        --input-dir "$BASE_LOG_DIR"
+        --nas-dir "$NAS_DIR"
+        --gpu-type "$GPU_TYPE"
+        --model "$MODEL"
+        --bench-cmd "$BENCH_CMD"
+        --deployment-mode "$DEPLOYMENT_MODE"
+    )
+    if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
+        TO_CSV_ARGS+=(--prefill-cmd "$PREFILL_CMD" --decode-cmd "$DECODE_CMD")
+        [[ -n "$ROUTER_CMD" ]] && TO_CSV_ARGS+=(--router-cmd "$ROUTER_CMD")
+    else
+        TO_CSV_ARGS+=(--launch-cmd "$LAUNCH_CMD")
+    fi
+    python3 "$TO_CSV" "${TO_CSV_ARGS[@]}" \
         || echo "[WARN] to_csv.py 落盘失败，请检查参数（可手动重跑，日志已在 $BASE_LOG_DIR）"
 fi

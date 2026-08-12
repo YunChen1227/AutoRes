@@ -8,3 +8,4 @@ config.yaml
 /test/
 *.egg-info/
 .pytest_cache/
+_local_test/
