@@ -32,8 +32,8 @@ SERVER_FRAMEWORK="sglang"     # 推理服务框架： sglang | vllm
 BENCH_FRAMEWORK="sglang"      # 压测工具框架： sglang | vllm
 
 # ── 部署模式：colocated=单机/分布式；pd_disagg=PD 分离 ──
-#   PD 分离下 bench 打的是 router/入口（SERVER_HOST:SERVER_PORT 填 router 地址），
-#   flush / KV 需直连各实例，故另配 PREFILL_URL / DECODE_URL。
+#   PD 分离时 bench / flush / KV 均只打单一入口（router 或 proxy 的 base url），
+#   与 sglang/vllm 官方 bench 一致；PREFILL_CMD/DECODE_CMD 仅用于 to_csv 落盘解析。
 DEPLOYMENT_MODE="colocated"   # colocated | pd_disagg
 # PD 分离必填（各是一条完整 server 启动命令，需含角色标识）：
 #   sglang: --disaggregation-mode prefill|decode
@@ -41,12 +41,18 @@ DEPLOYMENT_MODE="colocated"   # colocated | pd_disagg
 PREFILL_CMD=""
 DECODE_CMD=""
 ROUTER_CMD=""                 # 可选：router/proxy 命令（--policy/--prefill-policy/--decode-policy）
-# PD 分离时 flush / KV 抓取直连的实例地址（BASE_URL 通常是 router，无 admin/metrics）
-PREFILL_URL=""               # 例：http://30.1.1.10:18000
-DECODE_URL=""                # 例：http://30.1.1.11:18000
 
+# ── 压测入口（单一 base url，与 sglang/vllm bench 一致）──
+#   host_port —— 等价于 http://SERVER_HOST:SERVER_PORT（bench 传 --host/--port）
+#   url       —— 完整 base url（bench 传 --base-url；PD 填 router/proxy 地址）
+ENDPOINT_MODE="host_port"    # host_port | url
 SERVER_HOST="30.205.160.45"
 SERVER_PORT="18000"
+SERVER_URL=""                # url 模式示例：https://gateway.example.com/v1/sglang
+
+# Token 认证（可选）：sglang/vllm bench 读 OPENAI_API_KEY → Authorization: Bearer …
+# 脚本会在压测 / flush / metrics 抓取前 export；留空表示无鉴权
+API_KEY=""
 
 MODEL="deepseek_v4"
 TOKENIZER="/mnt/pvc/pvc-sfe-platform-id10001749-vol633083-prd/llm_model/DeepSeek-V4-Flash-w8a8-mtp"
@@ -87,7 +93,49 @@ declare -A input_length_map=(
 )
 # └────────────────────────────────────────────────────────────────────────┘
 
-BASE_URL="http://${SERVER_HOST}:${SERVER_PORT}"
+# ── 解析压测入口 & 鉴权（sglang/vllm bench 与 curl admin 共用）──
+if [[ "$ENDPOINT_MODE" != "host_port" && "$ENDPOINT_MODE" != "url" ]]; then
+    echo "[ERR] ENDPOINT_MODE 只能是 host_port | url，当前=$ENDPOINT_MODE" >&2
+    exit 1
+fi
+if [[ "$ENDPOINT_MODE" == "url" ]]; then
+    if [[ -z "$SERVER_URL" ]]; then
+        echo "[ERR] ENDPOINT_MODE=url 需配置 SERVER_URL（完整 base url）" >&2
+        exit 1
+    fi
+    BASE_URL="${SERVER_URL%/}"
+else
+    if [[ -z "$SERVER_HOST" || -z "$SERVER_PORT" ]]; then
+        echo "[ERR] ENDPOINT_MODE=host_port 需配置 SERVER_HOST 与 SERVER_PORT" >&2
+        exit 1
+    fi
+    BASE_URL="http://${SERVER_HOST}:${SERVER_PORT}"
+fi
+
+CURL_AUTH=()
+if [[ -n "$API_KEY" ]]; then
+    export OPENAI_API_KEY="$API_KEY"
+    export API_KEY="$API_KEY"
+    CURL_AUTH=(-H "Authorization: Bearer ${API_KEY}")
+fi
+
+# vllm / sglang bench 的 endpoint 参数（host_port 与 url 二选一，禁止同时传）
+_vllm_endpoint_args() {
+    if [[ "$ENDPOINT_MODE" == "url" ]]; then
+        printf '%s\n' --base-url "$BASE_URL"
+    else
+        printf '%s\n' --host "$SERVER_HOST" --port "$SERVER_PORT"
+    fi
+}
+
+_sglang_endpoint_args() {
+    if [[ "$ENDPOINT_MODE" == "url" ]]; then
+        printf '%s\n' --base-url "$BASE_URL"
+    else
+        printf '%s\n' --host "$SERVER_HOST" --port "$SERVER_PORT"
+    fi
+}
+
 BASE_LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${LOG_SUBDIR}"
 mkdir -p "$BASE_LOG_DIR"
 
@@ -100,9 +148,6 @@ if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
     if [[ -z "$PREFILL_CMD" || -z "$DECODE_CMD" ]]; then
         echo "[ERR] DEPLOYMENT_MODE=pd_disagg 需配置 PREFILL_CMD 与 DECODE_CMD" >&2
         exit 1
-    fi
-    if [[ "$FLUSH_CACHE" == "1" && -z "$PREFILL_URL" && -z "$DECODE_URL" ]]; then
-        echo "[WARN] PD 分离开启 FLUSH_CACHE 但未配置 PREFILL_URL/DECODE_URL，将无法清缓存"
     fi
 fi
 
@@ -133,8 +178,13 @@ echo "================= 压测配置 ================="
 echo "  SERVER_FRAMEWORK = $SERVER_FRAMEWORK"
 echo "  BENCH_FRAMEWORK  = $BENCH_FRAMEWORK"
 echo "  DEPLOYMENT_MODE  = $DEPLOYMENT_MODE"
-echo "  BASE_URL         = $BASE_URL"
-[[ "$DEPLOYMENT_MODE" == "pd_disagg" ]] && echo "  PD admin URLs    = prefill:${PREFILL_URL:-N/A}  decode:${DECODE_URL:-N/A}"
+echo "  ENDPOINT_MODE    = $ENDPOINT_MODE"
+if [[ "$ENDPOINT_MODE" == "url" ]]; then
+    echo "  BASE_URL         = $BASE_URL"
+else
+    echo "  BASE_URL         = $BASE_URL  (host_port: ${SERVER_HOST}:${SERVER_PORT})"
+fi
+[[ -n "$API_KEY" ]] && echo "  API_KEY          = (已配置，bench/flush/metrics 带 Bearer)"
 echo "  KV 采集策略      = $CAPTURE_KV"
 echo "  spec 采集策略    = $CAPTURE_SPEC"
 echo "  FLUSH_CACHE      = $FLUSH_CACHE"
@@ -143,47 +193,23 @@ echo "  ⚠ 落盘请执行: to_csv.py --framework $BENCH_FRAMEWORK ..."
 [[ "$CAPTURE_SPEC" == "none" && ( "$SERVER_FRAMEWORK" != "$BENCH_FRAMEWORK" ) ]] && echo "  ⚠ server≠bench：spec 指标颗粒度错位，本轮不采集（避免误贴标签）"
 echo "============================================"
 
-# ---- 工具函数 ----
+# ---- 工具函数（flush / metrics 均只打 BASE_URL，与官方 bench 一致）----
 
-# admin/metrics 目标地址列表：
-#   colocated → BASE_URL；pd_disagg → PREFILL_URL + DECODE_URL（各实例独立，需分别命中）
-_admin_urls() {
-    if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
-        [[ -n "$PREFILL_URL" ]] && echo "$PREFILL_URL"
-        [[ -n "$DECODE_URL"  ]] && echo "$DECODE_URL"
-    else
-        echo "$BASE_URL"
-    fi
-}
-
-# 对单个 URL 清缓存（端点按 SERVER_FRAMEWORK 选）
-_flush_one() {
-    local url="$1"
-    if [[ "$SERVER_FRAMEWORK" == "vllm" ]]; then
-        curl -s -X POST "${url}/reset_prefix_cache" >/dev/null 2>&1 \
-            || echo "[WARN] reset_prefix_cache 失败@${url}（vllm server 需 VLLM_SERVER_DEV_MODE=1）"
-    else
-        curl -s -X POST "${url}/flush_cache?timeout=60" >/dev/null 2>&1 \
-            || echo "[WARN] flush_cache 失败@${url}"
-    fi
-}
-
-# 清空 server 缓存（colocated 打 BASE_URL；PD 分离逐个打 prefill/decode 实例）
+# 清空 server 缓存（sglang: /flush_cache；vllm: /reset_prefix_cache）
 flush_server_cache() {
     [[ "$FLUSH_CACHE" == "1" ]] || return 0
-    local urls; urls="$(_admin_urls)"
-    if [[ -z "$urls" ]]; then
-        echo "[WARN] 无可用 admin 地址（PD 请配置 PREFILL_URL/DECODE_URL），跳过清缓存"; return 0
+    if [[ "$SERVER_FRAMEWORK" == "vllm" ]]; then
+        curl -s "${CURL_AUTH[@]}" -X POST "${BASE_URL}/reset_prefix_cache" >/dev/null 2>&1 \
+            || echo "[WARN] reset_prefix_cache 失败（vllm server 需 VLLM_SERVER_DEV_MODE=1）"
+    else
+        curl -s "${CURL_AUTH[@]}" -X POST "${BASE_URL}/flush_cache?timeout=60" >/dev/null 2>&1 \
+            || echo "[WARN] flush_cache 失败"
     fi
-    local u
-    while IFS= read -r u; do
-        [[ -n "$u" ]] && _flush_one "$u"
-    done <<< "$urls"
 }
 
-# 抓单个 URL 的 vllm prefix cache 累计计数：输出 "queries hits"（抓不到输出空串）
-_scrape_one_url() {
-    curl -s "${1}/metrics" 2>/dev/null | python3 - <<'PYEOF'
+# 抓 BASE_URL 的 vllm prefix cache 累计计数：输出 "queries hits"（抓不到输出空串）
+scrape_vllm_prefix_cache() {
+    curl -s "${CURL_AUTH[@]}" "${BASE_URL}/metrics" 2>/dev/null | python3 - <<'PYEOF'
 import sys
 q = h = 0.0
 found = False
@@ -206,23 +232,6 @@ for line in sys.stdin:
 if found:
     print(f"{q} {h}")
 PYEOF
-}
-
-# 汇总所有 admin 地址的 vllm prefix cache 计数（PD 分离 = prefill+decode 求和）。
-# 输出 "queries hits"；任一地址都抓不到则输出空串。
-scrape_vllm_prefix_cache() {
-    local urls; urls="$(_admin_urls)"
-    local total_q=0 total_h=0 found=0 u one q h
-    while IFS= read -r u; do
-        [[ -z "$u" ]] && continue
-        one="$(_scrape_one_url "$u")"
-        [[ -z "$one" ]] && continue
-        q=$(echo "$one" | awk '{print $1}'); h=$(echo "$one" | awk '{print $2}')
-        total_q=$(python3 -c "print($total_q+$q)")
-        total_h=$(python3 -c "print($total_h+$h)")
-        found=1
-    done <<< "$urls"
-    [[ "$found" == "1" ]] && echo "$total_q $total_h"
 }
 
 # 把 KV hit rate 注入结果 JSON。
@@ -303,10 +312,10 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
         # ── 跑 bench（命令按 BENCH_FRAMEWORK；backend 按 SERVER_FRAMEWORK）──
         if [[ "$BENCH_FRAMEWORK" == "vllm" ]]; then
             # vllm bench serve：spec_decode_* 仅在 server=vllm 时由 bench 原生写入 JSON
+            mapfile -t _VLLM_EP < <(_vllm_endpoint_args)
             vllm bench serve \
                 --backend openai \
-                --host "$SERVER_HOST" \
-                --port "$SERVER_PORT" \
+                "${_VLLM_EP[@]}" \
                 --tokenizer "$TOKENIZER" \
                 --model "$MODEL" \
                 --dataset-name random \
@@ -325,8 +334,9 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
             #   accept_length 仅在 backend 含 sglang（即 server=sglang）时由 bench 自动查 /server_info
             SGL_EXTRA=()
             [[ "$CAPTURE_KV" == "sglang_native" ]] && SGL_EXTRA+=(--cache-report)
+            mapfile -t _SGL_EP < <(_sglang_endpoint_args)
             python3 -m sglang.bench_serving --backend "$SGLANG_BENCH_BACKEND" \
-                --base-url "$BASE_URL" \
+                "${_SGL_EP[@]}" \
                 --dataset-name random-ids \
                 --random-input-len "$INPUT_LEN" \
                 --random-output-len "$OUTPUT_LEN" \
