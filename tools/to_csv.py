@@ -558,9 +558,12 @@ def main():
     print(f"       - {os.path.basename(meta_path)}")
     print(f"[bench] server={meta['framework']} bench={bench_framework} "
           f"flush_cache={bench_flush_cache}")
-    print(f"[参数] tp={params['tp']} dp={params['dp']} pp={params['pp']} "
-          f"ep={params['ep']} cp={params['cp']} hicache={params['hicache_enabled']} "
-          f"flexkv={params['flexkv_enabled']}")
+    # 直接打印解析出的全部参数（字段名以 extract_launch_params 实际产出为准，
+    # 与网页上传共用同一解析器，避免写死已废弃的 key 触发 KeyError）
+    if params:
+        print("[参数] " + "  ".join(f"{k}={params[k]}" for k in sorted(params)))
+    if extra.get("unrecognized"):
+        print(f"[未识别] {' '.join(extra['unrecognized'])}")
 
 
 if __name__ == "__main__":
