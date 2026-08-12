@@ -249,9 +249,25 @@ class Agent:
 
 def _llm_error_text(err: Exception) -> str:
     s = str(err)
-    if "429" in s or "1302" in s or "1305" in s or "ReachLimit" in s or "并发" in s:
+    status = getattr(err, "status_code", None)
+    if status == 429 or "429" in s or "1302" in s or "1305" in s or "ReachLimit" in s or "并发" in s:
         return "模型请求过于频繁（智谱 API 限流），请等待 10～30 秒后重试。"
+    # 4xx = 请求/配置问题（模型名错、不支持 tools、参数非法等），把服务端原因透出便于排查
+    detail = _extract_err_detail(err) or s
+    if isinstance(status, int) and 400 <= status < 500:
+        return f"模型请求被拒绝（HTTP {status}）：{detail}"
     return "模型服务暂不可用，请稍后重试。"
+
+
+def _extract_err_detail(err: Exception) -> str:
+    """尽力从 OpenAI/兼容端点异常里取出服务端返回的原因文本。"""
+    body = getattr(err, "body", None)
+    if isinstance(body, dict):
+        if isinstance(body.get("error"), dict) and body["error"].get("message"):
+            return str(body["error"]["message"])
+        if body.get("message"):
+            return str(body["message"])
+    return str(getattr(err, "message", "") or "")
 
 
 def _normalize_tool_calls(raw) -> list[dict]:
