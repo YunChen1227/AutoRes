@@ -124,6 +124,14 @@ bash vllm_sgl_benchs.sh
 | `SERVER_HOST` / `SERVER_PORT` | 见脚本 | 推理服务地址 |
 | `MODEL` / `TOKENIZER` | 见脚本 | 模型名与 tokenizer 路径 |
 | `FLUSH_CACHE` | `0` | `1` = 每轮压测前清 server KV/prefix cache |
+| `PREFIX_RATE` | `0.0` | 共享前缀占输入长度的比例（`0~1`，如 `0.2/0.5/0.8`）。每轮真实前缀长度 = `round(INPUT_LEN × PREFIX_RATE)`，正文 = `INPUT_LEN − 前缀`（总输入仍 = `INPUT_LEN`）。作为对比维度入库 `test_runs.prefix_rate` |
+
+> **关于 `PREFIX_RATE`**（共享前缀，测前缀缓存命中）：
+> - `vllm` bench：用 `random` 数据集的 `--random-prefix-len`（单一全局前缀，全体请求共享）。
+> - `sglang` bench：`random` 数据集**无前缀参数**，脚本在 `PREFIX_RATE>0` 时自动改用
+>   `generated-shared-prefix` 数据集（`--gsp-num-groups 1` 单一全局前缀 + `--gsp-system-prompt-len=前缀` +
+>   `--gsp-question-len=正文`）逆向映射逼近 vllm，落盘 `Input_Length` 仍为总输入。
+> - `PREFIX_RATE=0` → 无前缀（vllm `--random-prefix-len 0`；sglang 沿用 `random-ids`），行为与旧版一致。
 
 **输出：** 脚本内 `LOG_SUBDIR` 目录（默认 `tools/logs_910b_cjb_dsv4flashint8_8_260723/`）下多个 JSON。已存在的文件会跳过，可断点续跑。
 
@@ -147,6 +155,7 @@ bash vllm_sgl_benchs.sh
 python tools/to_csv.py \
   --framework sglang --bench-framework sglang \
   --bench-flush-cache false \
+  --prefix-rate 0.0 \
   --framework-version 0.4.6 \
   --input-dir ./tools/logs_910b_cjb_dsv4flashint8_8_260723 \
   --nas-dir /mnt/nas/benchmark_root \
@@ -165,6 +174,7 @@ python tools/to_csv.py \
 python tools/to_csv.py \
   --framework vllm --bench-framework vllm \
   --bench-flush-cache false \
+  --prefix-rate 0.5 \
   --framework-version 0.5.12 \
   --input-dir ./tools/logs_vllm \
   --nas-dir /mnt/nas/benchmark_root \
@@ -175,7 +185,8 @@ python tools/to_csv.py \
 ```
 
 > 压测脚本 `vllm_sgl_benchs.sh` 顶部把 `RUN_TO_CSV=1` 时，**压测跑完会自动调用一次 `to_csv.py`**
-> （`--bench-flush-cache` 由脚本的 `FLUSH_CACHE` 派生，server/bench 框架用脚本内的两个变量），无需手动执行本步。
+> （`--bench-flush-cache` 由脚本的 `FLUSH_CACHE` 派生，`--prefix-rate` 直接用脚本的 `PREFIX_RATE`，
+> server/bench 框架用脚本内的两个变量），无需手动执行本步。
 
 **vllm-ascend：** 与 vllm 相同，仅 `--framework vllm-ascend`；参数解析走 vllm 分支，入库 `framework` 仍存 `vllm-ascend`。
 
@@ -185,6 +196,7 @@ python tools/to_csv.py \
 - `--framework` / `--bench-framework`：分别是 server 框架与压测工具框架，**均必填且相互独立**。
   `--bench-framework` 决定 bench JSON 字段解析（须与压测所用工具一致），`--framework` 决定 `--launch-cmd` 的参数提取。
 - `--bench-flush-cache`：`true/false`，**必填**，记录压测前是否清缓存（flush=冷启动、不 flush=复用缓存，结果差异大，作为入库对比维度）。
+- `--prefix-rate`：`0~1` 的小数，**必填**，本次压测共享前缀占输入长度的比例（与输入长度、并发一样是对比维度）→ `test_runs.prefix_rate`；旧数据无此字段时入库默认 `0`。
 - vllm / vllm-ascend 建议传 `--bench-cmd`，用于补 JSON 里没有的 `Input_Length`（从 `--random-input-len` 解析）。
 - vllm bench 须含 `--percentile-metrics ttft,tpot,itl,e2el` 才有完整 E2E/ITL 列（压测脚本已包含）。
 - `--launch-cmd`：完整服务启动命令；脚本提取 tp/dp/pp、投机解码、prefix caching 等入库维度，并计算 `gpu_count`。

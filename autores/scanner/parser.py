@@ -114,6 +114,8 @@ def parse_run_dir(dir_path: str) -> dict:
         # bench 维度：新数据由 to_csv.py / 上传表单写入；老目录可能没有，留 None
         "bench_framework": meta.get("bench_framework"),
         "bench_flush_cache": meta.get("bench_flush_cache"),
+        # prefix_rate：老目录无此字段 → 默认 0（无前缀），与 schema 约定一致
+        "prefix_rate": meta.get("prefix_rate", 0),
         "gpu_count": meta.get("gpu_count") or extra.get("gpu_count"),
         "prefill_gpu_count": meta.get("prefill_gpu_count"),
         "decode_gpu_count": meta.get("decode_gpu_count"),

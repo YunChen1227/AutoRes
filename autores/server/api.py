@@ -142,6 +142,7 @@ async def upload_run(
     model_version: str = Form(""),
     bench_framework: str = Form(...),
     bench_flush_cache: str = Form(...),
+    prefix_rate: str = Form(...),
     deployment_mode: str = Form("colocated"),
     launch_cmd: str = Form(""),
     prefill_cmd: str = Form(""),
@@ -162,6 +163,7 @@ async def upload_run(
         "gpu_type": gpu_type,
         "bench_framework": bench_framework,
         "bench_flush_cache": bench_flush_cache,
+        "prefix_rate": prefix_rate,
     }
     try:
         csv_bytes = await csv_file.read()

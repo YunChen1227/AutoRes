@@ -266,7 +266,25 @@ def validate_meta(form: dict) -> dict:
     if flush is None:
         raise UploadError("请手动勾选压测前是否 flush cache（bench_flush_cache 必填，无法从 CSV 推断）")
     meta["bench_flush_cache"] = flush
+
+    # prefix_rate 必填：本次压测共享前缀占输入长度的比例（0~1），与 input_length/concurrency
+    # 同为可比对轴，无法从 CSV 推断，需用户填写。
+    meta["prefix_rate"] = _parse_prefix_rate(form.get("prefix_rate"))
     return meta
+
+
+def _parse_prefix_rate(raw) -> float:
+    """校验并解析共享前缀占比：必填、可转 float、取值域 [0, 1)。"""
+    s = ("" if raw is None else str(raw)).strip()
+    if not s:
+        raise UploadError("缺少必填字段: prefix_rate（本次压测共享前缀占输入长度的比例，0~1）")
+    try:
+        val = float(s)
+    except ValueError:
+        raise UploadError(f"prefix_rate 必须是数字（0~1），收到: {s}") from None
+    if not (0.0 <= val < 1.0):
+        raise UploadError(f"prefix_rate 必须在 [0, 1) 之间，收到: {val}")
+    return val
 
 
 def resolve_launch_text(launch_text: str | None) -> str:

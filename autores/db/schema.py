@@ -90,10 +90,15 @@ _BASE_BOOL = {name for name, _t, b in _PARAM_SPECS if b}
 #                       （sglang bench 能打 vllm server，反之亦然，共 4 种组合）。
 #   bench_flush_cache : 压测前是否清空 server KV 缓存（bool）。
 #                       flush=冷启动无前缀命中；不 flush=复用缓存，两者结果差异大。
-# 二者在入库/上传两条流里都是"必填"，但列本身可空，方便老数据迁移后留 NULL。
+#   prefix_rate       : 本次压测共享前缀占输入长度的比例（0~1，REAL）。
+#                       真实前缀长度 = round(input_length * prefix_rate)，
+#                       与 input_length / concurrency 同为可比对轴。
+#                       老数据无此字段 → 默认 0（无前缀）。
+# 前三者在入库/上传两条流里都是"必填"，但列本身可空/可缺省，方便老数据迁移。
 _BENCH_SPECS = [
     ("bench_framework", "TEXT", False),
     ("bench_flush_cache", "INTEGER", True),
+    ("prefix_rate", "REAL", False),
 ]
 BENCH_DIMENSIONS = [name for name, _t, _b in _BENCH_SPECS]
 _BENCH_SQL_TYPE = {name: t for name, t, _b in _BENCH_SPECS}
@@ -164,6 +169,7 @@ METADATA_DIRECT_FIELDS: tuple[str, ...] = (
     "deployment_mode",     # 默认 colocated
     "bench_framework",
     "bench_flush_cache",
+    "prefix_rate",         # 共享前缀占比（0~1）；老数据缺省 0
 )
 
 # to_csv.py / 上传入库时用户必须提供的 metadata 字段（model_version 可缺省为空串）
@@ -179,9 +185,13 @@ METADATA_REQUIRED: frozenset[str] = frozenset({
 })
 
 # to_csv.py 可选 metadata 字段 → 默认值
+# prefix_rate 在 to_csv/上传两条流里都强制必填（各自单独校验），此处的默认值只用于
+# 「老目录 metadata.json 缺该字段时」的兜底（persist.build_metadata / parser 读取），
+# 与用户要求「旧数据默认 0」一致。
 METADATA_OPTIONAL_DEFAULTS: dict[str, object] = {
     "model_version": "",
     "deployment_mode": "colocated",
+    "prefix_rate": 0.0,
 }
 
 # server / bench 框架 CLI 可选值（与 launch_params.supported_frameworks 对齐）
@@ -323,6 +333,8 @@ def doc_to_row(doc: dict) -> dict:
         "deployment_mode": deployment,
         "bench_framework": doc.get("bench_framework"),
         "bench_flush_cache": _store_val("bench_flush_cache", doc.get("bench_flush_cache")),
+        # prefix_rate 为 REAL，非布尔；老数据缺失记 0（无前缀）
+        "prefix_rate": doc.get("prefix_rate") if doc.get("prefix_rate") is not None else 0,
         "gpu_count": doc.get("gpu_count") or extra_raw.get("gpu_count"),
         "prefill_gpu_count": doc.get("prefill_gpu_count"),
         "decode_gpu_count": doc.get("decode_gpu_count"),
@@ -359,6 +371,8 @@ def row_to_doc(row) -> dict:
         "deployment_mode": deployment,
         "bench_framework": _rget(row, "bench_framework"),
         "bench_flush_cache": _load_val("bench_flush_cache", _rget(row, "bench_flush_cache")),
+        # 迁移后老行该列为 NULL → 读出统一还原为 0（无前缀）
+        "prefix_rate": _rget(row, "prefix_rate") if _rget(row, "prefix_rate") is not None else 0,
         "gpu_count": _rget(row, "gpu_count"),
         "prefill_gpu_count": _rget(row, "prefill_gpu_count"),
         "decode_gpu_count": _rget(row, "decode_gpu_count"),

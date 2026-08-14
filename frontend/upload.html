@@ -173,6 +173,13 @@
               <label><input type="radio" name="bench_flush_cache" value="false"> 否（复用缓存）</label>
             </div>
           </div>
+          <div class="field">
+            <label>prefix rate（共享前缀占比）<span class="req">*</span></label>
+            <input type="number" name="prefix_rate" id="prefix_rate"
+                   min="0" max="0.99" step="0.05" placeholder="0 ~ 1，如 0.2 / 0.5 / 0.8" required>
+            <div class="autohint">本次压测共享前缀占输入长度的比例（真实前缀长度 = 输入长度 × 该比例）。
+              与输入长度、并发一样是可比对维度；无前缀填 0。</div>
+          </div>
         </div>
       </div>
 
@@ -400,6 +407,12 @@
     if (!benchSel.value) return "请选择 bench 框架（可上传 CSV 自动识别）";
     if (!form.querySelector('input[name="bench_flush_cache"]:checked')) {
       return "请选择压测前是否 flush cache";
+    }
+    const prVal = document.getElementById("prefix_rate").value.trim();
+    if (prVal === "") return "请填写 prefix rate（共享前缀占比，0~1）";
+    const pr = Number(prVal);
+    if (!Number.isFinite(pr) || pr < 0 || pr >= 1) {
+      return "prefix rate 必须在 [0, 1) 之间，如 0 / 0.2 / 0.5 / 0.8";
     }
     return null;
   }

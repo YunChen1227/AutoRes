@@ -12,6 +12,7 @@
       --framework sglang --bench-framework sglang \
       --framework-version 0.4.6 \
       --bench-flush-cache false \
+      --prefix-rate 0.0 \
       --input-dir ./logs_H20G144_GLM52 \
       --nas-dir /mnt/nas/benchmark_root \
       --gpu-type H20-141G \
@@ -23,6 +24,7 @@
       --framework vllm --bench-framework sglang \
       --framework-version 0.5.12 \
       --bench-flush-cache true \
+      --prefix-rate 0.5 \
       --input-dir ./logs --nas-dir /mnt/nas/benchmark_root \
       --gpu-type H800 --model Qwen2.5-72B \
       --launch-cmd "vllm serve Qwen2.5-72B -tp 8"
@@ -32,6 +34,7 @@
       --framework vllm --bench-framework vllm \
       --framework-version 0.5.12 \
       --bench-flush-cache false \
+      --prefix-rate 0.0 \
       --input-dir ./vllm_logs \
       --nas-dir /mnt/nas/benchmark_root \
       --gpu-type H800 \
@@ -614,6 +617,11 @@ def parse_args():
             p.add_argument(flag, default="",
                            help="server 启动命令原文（colocated 必填）→ test_runs.launch_cmd；"
                                 "PD 分离改用 --prefill-cmd/--decode-cmd 自动合成")
+        elif field == "prefix_rate":
+            # 共享前缀占比（0~1）→ test_runs.prefix_rate；与 input_length/concurrency 同为可比对轴。
+            # 必填（虽在 OPTIONAL_DEFAULTS 里，但那只是老数据兜底；新落盘一律显式给值）。
+            p.add_argument(flag, required=True, type=float,
+                           help="共享前缀占输入长度的比例（0~1）→ test_runs.prefix_rate（必填）")
         elif field in db_schema.METADATA_OPTIONAL_DEFAULTS:
             default = db_schema.METADATA_OPTIONAL_DEFAULTS[field]
             p.add_argument(flag, default=default,
@@ -635,6 +643,12 @@ def main():
     bench_framework = meta["bench_framework"]
     bench_flush_cache = meta["bench_flush_cache"]
     deployment = meta.get("deployment_mode", "colocated")
+
+    # prefix_rate 取值域校验（0~1，1 表示整段都是前缀无实际正文，故不含 1）
+    prefix_rate = meta.get("prefix_rate", 0.0)
+    if not (0.0 <= prefix_rate < 1.0):
+        raise SystemExit(
+            f"[ERR] --prefix-rate 必须在 [0, 1) 之间，收到: {prefix_rate}")
 
     # 按部署模式校验命令参数（colocated 需 launch_cmd；pd_disagg 需 prefill+decode）
     if deployment == "pd_disagg":
@@ -689,7 +703,7 @@ def main():
     print(f"       - {os.path.basename(csv_path)}")
     print(f"       - {os.path.basename(meta_path)}")
     print(f"[bench] server={meta['framework']} bench={bench_framework} "
-          f"flush_cache={bench_flush_cache} deployment={deployment}")
+          f"flush_cache={bench_flush_cache} prefix_rate={prefix_rate} deployment={deployment}")
     if deployment == "pd_disagg" and pd_meta is not None:
         pf_p, dc_p = pd_meta["prefill"]["params"], pd_meta["decode"]["params"]
         print(f"[PD] transfer_backend={pd_meta['transfer_backend']}  "

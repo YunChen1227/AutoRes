@@ -60,6 +60,15 @@ TOKENIZER="/mnt/pvc/pvc-sfe-platform-id10001749-vol633083-prd/llm_model/DeepSeek
 OUTPUT_LEN=1024
 FLUSH_CACHE=0                 # 1=每轮压测前清 server 缓存（会把 KV hit rate 压到冷启动）
 
+# ── 共享前缀比例（0~1，可比对维度，入库 test_runs.prefix_rate）──
+#   每轮真实前缀长度 = round(INPUT_LEN * PREFIX_RATE)，正文长度 = INPUT_LEN - 前缀，
+#   保证两框架的「总输入 = INPUT_LEN」一致，可横向比较。
+#   PREFIX_RATE=0 → 无前缀（vllm: --random-prefix-len 0；sglang: 沿用 random-ids）。
+#   PREFIX_RATE>0 → vllm 用 random 数据集的 --random-prefix-len；
+#                   sglang random 数据集无前缀参数，改用 generated-shared-prefix
+#                   （--gsp-num-groups 1 单一全局前缀，逆向映射逼近 vllm，强行可比）。
+PREFIX_RATE=0.0
+
 LOG_SUBDIR="logs_910b_cjb_dsv4flashint8_8_260723"
 FILE_PREFIX="dsv4_jk_ori"     # 输出文件名前缀
 
@@ -151,6 +160,18 @@ if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
     fi
 fi
 
+# ── 共享前缀比例校验（0~1，不含 1）+ 是否启用前缀 ──
+if ! awk -v r="$PREFIX_RATE" 'BEGIN{exit !(r+0==r && r>=0 && r<1)}' </dev/null 2>/dev/null; then
+    echo "[ERR] PREFIX_RATE 必须是 [0,1) 之间的数字，当前=$PREFIX_RATE" >&2
+    exit 1
+fi
+# HAS_PREFIX=1 表示本轮启用共享前缀（rate>0）
+if awk -v r="$PREFIX_RATE" 'BEGIN{exit !(r>0)}' </dev/null 2>/dev/null; then
+    HAS_PREFIX=1
+else
+    HAS_PREFIX=0
+fi
+
 # ── 依据组合预解析各指标的采集策略（只算一次）──
 #   CAPTURE_KV  : none | sglang_native | scrape_vllm
 #   CAPTURE_SPEC: none | native
@@ -188,6 +209,15 @@ fi
 echo "  KV 采集策略      = $CAPTURE_KV"
 echo "  spec 采集策略    = $CAPTURE_SPEC"
 echo "  FLUSH_CACHE      = $FLUSH_CACHE"
+if [[ "$HAS_PREFIX" == "1" ]]; then
+    if [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
+        echo "  PREFIX_RATE      = $PREFIX_RATE  (sglang: generated-shared-prefix, num-groups=1)"
+    else
+        echo "  PREFIX_RATE      = $PREFIX_RATE  (vllm: --random-prefix-len)"
+    fi
+else
+    echo "  PREFIX_RATE      = $PREFIX_RATE  (无前缀)"
+fi
 echo "  ⚠ 落盘请执行: to_csv.py --framework $BENCH_FRAMEWORK ..."
 [[ "$CAPTURE_KV" == "none" ]] && echo "  ⚠ 该组合无法可靠获取 KV hit rate（sglang server 请改用 sglang bench + --cache-report）"
 [[ "$CAPTURE_SPEC" == "none" && ( "$SERVER_FRAMEWORK" != "$BENCH_FRAMEWORK" ) ]] && echo "  ⚠ server≠bench：spec 指标颗粒度错位，本轮不采集（避免误贴标签）"
@@ -296,8 +326,19 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
             echo "Skipping: $OUTPUT_FILE already exists."
             continue
         fi
+        # 共享前缀：真实前缀长度 = round(INPUT_LEN * PREFIX_RATE)，正文 = INPUT_LEN - 前缀，
+        # 保证两框架「总输入 = INPUT_LEN」一致可比。REMAIN 至少留 1，避免正文为 0。
+        if [[ "$HAS_PREFIX" == "1" ]]; then
+            PREFIX_LEN=$(awk -v i="$INPUT_LEN" -v r="$PREFIX_RATE" 'BEGIN{printf "%d", (i*r)+0.5}')
+            REMAIN=$((INPUT_LEN - PREFIX_LEN))
+            if (( REMAIN < 1 )); then REMAIN=1; PREFIX_LEN=$((INPUT_LEN - 1)); fi
+        else
+            PREFIX_LEN=0
+            REMAIN=$INPUT_LEN
+        fi
+
         echo -e "\n\n********************start********************"
-        echo "[server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK] input_length=$INPUT_LEN, concurrency=$CONCURRENCY, prompts=$PROMPTS"
+        echo "[server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK] input_length=$INPUT_LEN, concurrency=$CONCURRENCY, prompts=$PROMPTS, prefix_len=$PREFIX_LEN(rate=$PREFIX_RATE)"
         echo "Output file: $OUTPUT_FILE"
 
         # 压测前清缓存（可选，端点按 server 选）
@@ -321,8 +362,8 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
                 --dataset-name random \
                 --max-concurrency "$CONCURRENCY" \
                 --num-prompts "$PROMPTS" \
-                --random-prefix-len 0 \
-                --random-input-len "$INPUT_LEN" \
+                --random-prefix-len "$PREFIX_LEN" \
+                --random-input-len "$REMAIN" \
                 --random-output-len "$OUTPUT_LEN" \
                 --save-result \
                 --result-dir "$BASE_LOG_DIR" \
@@ -335,12 +376,37 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
             SGL_EXTRA=()
             [[ "$CAPTURE_KV" == "sglang_native" ]] && SGL_EXTRA+=(--cache-report)
             mapfile -t _SGL_EP < <(_sglang_endpoint_args)
+            # 数据集选择：
+            #   无前缀 → random-ids（原有行为）
+            #   有前缀 → generated-shared-prefix（sglang random 无前缀参数）。
+            #     逆向映射逼近 vllm 的单一全局前缀：num-groups=1（全体共享同一前缀）、
+            #     prompts-per-group=PROMPTS（总请求数=PROMPTS，GSP 忽略 --num-prompts）、
+            #     gsp-system-prompt-len=前缀、gsp-question-len=正文，总输入≈INPUT_LEN。
+            #     另传 --random-input-len INPUT_LEN：GSP 不用它生成数据，但 bench 会把它
+            #     原样回显进结果 JSON 的 random_input_len（= Input_Length 列），保证落盘正确。
+            if [[ "$HAS_PREFIX" == "1" ]]; then
+                SGL_DATASET_ARGS=(
+                    --dataset-name generated-shared-prefix
+                    --gsp-num-groups 1
+                    --gsp-prompts-per-group "$PROMPTS"
+                    --gsp-system-prompt-len "$PREFIX_LEN"
+                    --gsp-question-len "$REMAIN"
+                    --gsp-output-len "$OUTPUT_LEN"
+                    --gsp-range-ratio 1
+                    --random-input-len "$INPUT_LEN"
+                    --random-output-len "$OUTPUT_LEN"
+                )
+            else
+                SGL_DATASET_ARGS=(
+                    --dataset-name random-ids
+                    --random-input-len "$INPUT_LEN"
+                    --random-output-len "$OUTPUT_LEN"
+                    --random-range-ratio 1
+                )
+            fi
             python3 -m sglang.bench_serving --backend "$SGLANG_BENCH_BACKEND" \
                 "${_SGL_EP[@]}" \
-                --dataset-name random-ids \
-                --random-input-len "$INPUT_LEN" \
-                --random-output-len "$OUTPUT_LEN" \
-                --random-range-ratio 1 \
+                "${SGL_DATASET_ARGS[@]}" \
                 --max-concurrency "$CONCURRENCY" \
                 --num-prompts "$PROMPTS" \
                 --tokenizer "$TOKENIZER" \
@@ -371,12 +437,13 @@ if [[ "$RUN_TO_CSV" == "1" ]]; then
         BENCH_FLUSH_CACHE="false"
     fi
     TO_CSV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/to_csv.py"
-    echo -e "\n[to_csv] 落盘：server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK flush_cache=$BENCH_FLUSH_CACHE deployment=$DEPLOYMENT_MODE"
+    echo -e "\n[to_csv] 落盘：server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK flush_cache=$BENCH_FLUSH_CACHE prefix_rate=$PREFIX_RATE deployment=$DEPLOYMENT_MODE"
     # 通用参数；启动命令按部署模式追加（colocated=--launch-cmd；pd_disagg=--prefill/decode/router-cmd）
     TO_CSV_ARGS=(
         --framework "$SERVER_FRAMEWORK"
         --bench-framework "$BENCH_FRAMEWORK"
         --bench-flush-cache "$BENCH_FLUSH_CACHE"
+        --prefix-rate "$PREFIX_RATE"
         --framework-version "$FRAMEWORK_VERSION"
         --input-dir "$BASE_LOG_DIR"
         --nas-dir "$NAS_DIR"
