@@ -102,6 +102,7 @@ def supported_gpu_types() -> list[str]:
 
 # 上传体积上限（防止超大文件打满内存/磁盘）
 MAX_CSV_BYTES = 5 * 1024 * 1024
+MAX_XLSX_BYTES = 10 * 1024 * 1024   # xlsx 为压缩包，放宽到 10MB
 MAX_TXT_BYTES = 64 * 1024
 
 
@@ -122,35 +123,133 @@ def _decode(raw: bytes, label: str, limit: int) -> str:
     raise UploadError(f"{label} 编码无法识别（请用 UTF-8 保存）")
 
 
-def parse_csv_text(text: str) -> list[dict]:
+def _is_blank_cell(c) -> bool:
+    return c is None or (isinstance(c, str) and c.strip() == "")
+
+
+def _norm_cell(v):
+    """Excel 单元格值归一：None→''；int/float/str 原样；日期等其它类型转字符串。"""
+    if v is None:
+        return ""
+    if isinstance(v, (int, float, str)):
+        return v
+    return str(v)
+
+
+def _looks_like_xlsx(raw: bytes) -> bool:
+    """xlsx = zip 包，固定以本地文件头魔数 PK\\x03\\x04 开头。"""
+    return raw[:4] == b"PK\x03\x04"
+
+
+def _looks_like_xls(raw: bytes) -> bool:
+    """旧版 .xls = OLE2 复合文档，魔数 D0 CF 11 E0。"""
+    return raw[:4] == b"\xd0\xcf\x11\xe0"
+
+
+def _read_xlsx_table(raw: bytes) -> tuple[list[str], list[dict]]:
     """
-    把 CSV 文本转为 metric 记录列表。
-    表头会先 remap 到 to_csv.py 规范列名；列名归一与数值转换与 scanner 一致。
+    读取 .xlsx 首个（且必须唯一）sheet → (表头列表, 行dict列表)。
+    行 dict 的 key 为去空白后的表头字符串，与 CSV 分支保持一致。
+    仅支持单 sheet；多 sheet / 无法解析 / 无表头一律报错（格式不兼容）。
     """
+    if len(raw) > MAX_XLSX_BYTES:
+        raise UploadError(f"Excel 文件超过大小上限（{MAX_XLSX_BYTES // 1024 // 1024} MB）")
+    try:
+        from openpyxl import load_workbook
+    except ImportError as e:  # 运行时依赖已含 openpyxl，这里只是兜底
+        raise UploadError("服务器缺少 openpyxl，无法解析 Excel，请改用 CSV") from e
+
+    try:
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as e:  # noqa: BLE001  非法/损坏 xlsx
+        raise UploadError(f"Excel 文件无法解析（需标准 .xlsx）：{e}") from e
+
+    try:
+        sheets = wb.sheetnames
+        if len(sheets) != 1:
+            raise UploadError(
+                f"Excel 仅支持单个 sheet，当前有 {len(sheets)} 个：{sheets}。"
+                "请只保留结果所在的一个工作表后重新上传。")
+        ws = wb[sheets[0]]
+
+        header_cols: list[tuple[int, str]] = []
+        fieldnames: list[str] = []
+        rows: list[dict] = []
+        for cells in ws.iter_rows(values_only=True):
+            if not header_cols:
+                # 跳过顶部整行空白；首个有值的行作为表头
+                if cells is None or all(_is_blank_cell(c) for c in cells):
+                    continue
+                header_cols = [(i, str(c).strip())
+                               for i, c in enumerate(cells) if not _is_blank_cell(c)]
+                fieldnames = [name for _, name in header_cols]
+                continue
+            if cells is None or all(_is_blank_cell(c) for c in cells):
+                continue  # 跳过空行
+            record: dict = {}
+            for i, name in header_cols:
+                record[name] = _norm_cell(cells[i] if i < len(cells) else None)
+            rows.append(record)
+    finally:
+        wb.close()
+
+    if not fieldnames:
+        raise UploadError("Excel 无表头（首个 sheet 为空）")
+    return fieldnames, rows
+
+
+def read_upload_table(raw: bytes) -> tuple[list[str], list[dict]]:
+    """
+    统一把上传文件读成 (表头列表, 行dict列表)，按内容自动识别 CSV / xlsx：
+      · xlsx（PK\\x03\\x04 开头）→ openpyxl 解析（仅单 sheet）
+      · 旧版 .xls               → 明确报错，提示另存为 xlsx / CSV
+      · 其它                     → 按 CSV 文本解析
+    两分支的行 dict key 统一去首尾空白，保证下游列名映射一致。
+    """
+    if _looks_like_xlsx(raw):
+        return _read_xlsx_table(raw)
+    if _looks_like_xls(raw):
+        raise UploadError("暂不支持旧版 .xls，请在 Excel 中另存为 .xlsx 或导出 CSV 后重新上传")
+
+    text = _decode(raw, "CSV 文件", MAX_CSV_BYTES)
     reader = csv.DictReader(io.StringIO(text))
     if reader.fieldnames is None:
         raise UploadError("CSV 无表头")
+    fieldnames = [h.strip() if isinstance(h, str) else h for h in reader.fieldnames]
+    rows = [{(k.strip() if isinstance(k, str) else k): v for k, v in r.items()}
+            for r in reader]
+    return fieldnames, rows
 
-    header_map = build_header_map(list(reader.fieldnames))
+
+def _build_metrics(fieldnames: list[str], rows: list[dict]) -> list[dict]:
+    """
+    表头 + 行数据 → metric 记录列表（CSV / Excel 共用）。
+    表头会 remap 到 to_csv.py 规范列名；列名归一与数值转换与 scanner 一致。
+    """
+    if not fieldnames:
+        raise UploadError("表格无表头")
+
+    header_map = build_header_map(list(fieldnames))
     missing = check_required_dimensions(header_map)
     if missing:
-        raw = [h.strip() for h in reader.fieldnames if h]
+        raw_headers = [str(h).strip() for h in fieldnames
+                       if h is not None and str(h).strip()]
         raise UploadError(
-            f"CSV 缺少必需列 {missing}；当前表头: {raw}。"
+            f"表格缺少必需列 {missing}；当前表头: {raw_headers}。"
             "请确认含 Input Length/Input_Length 与 Concurrency，或改用 to_csv.py 产出。"
         )
 
     remapped = format_mapping_summary(header_map)
     if remapped:
-        log.info("CSV 列名已自动映射", extra={"fields": {"mapping": remapped}})
+        log.info("表格列名已自动映射", extra={"fields": {"mapping": remapped}})
 
     metrics: list[dict] = []
-    for lineno, row in enumerate(reader, start=2):
+    for lineno, row in enumerate(rows, start=2):
         record: dict = {}
         for col, raw in row.items():
             if col is None:
                 continue
-            col = col.strip()
+            col = str(col).strip()
             if not col:
                 continue
             canon = header_map.get(col)
@@ -160,17 +259,24 @@ def parse_csv_text(text: str) -> list[dict]:
             record[key] = _to_number(raw.strip() if isinstance(raw, str) else raw)
         for dim in ("input_length", "concurrency"):
             if record.get(dim) is None:
-                raise UploadError(f"CSV 第 {lineno} 行的 {dim} 为空或非数值")
+                raise UploadError(f"表格第 {lineno} 行的 {dim} 为空或非数值")
         metrics.append(record)
 
     if not metrics:
-        raise UploadError("CSV 无数据行")
+        raise UploadError("表格无数据行")
     return metrics
+
+
+def parse_table(raw: bytes) -> list[dict]:
+    """上传文件字节 → metric 记录列表（自动识别 CSV / xlsx）。"""
+    fieldnames, rows = read_upload_table(raw)
+    return _build_metrics(fieldnames, rows)
 
 
 def detect_bench_framework(csv_bytes: bytes) -> dict:
     """
-    仅凭 CSV 的 spec decoding 列是否有值，粗判 bench_framework（供前端预填）。
+    仅凭表格的 spec decoding 列是否有值，粗判 bench_framework（供前端预填）。
+    支持 CSV 与 .xlsx（自动识别）。
 
     规则（与用户约定一致）：
       · 只有 vLLM_* spec 列有值   → 建议 vllm
@@ -178,18 +284,16 @@ def detect_bench_framework(csv_bytes: bytes) -> dict:
       · 两者都有 / 都无           → None（交由用户手填）
     最终以用户提交的表单为准；此处不做强校验，返回诊断信息即可。
     """
-    text = _decode(csv_bytes, "CSV 文件", MAX_CSV_BYTES)
-    reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None:
-        raise UploadError("CSV 无表头")
+    fieldnames, rows = read_upload_table(csv_bytes)
+    if not fieldnames:
+        raise UploadError("表格无表头")
 
-    header_map = build_header_map(list(reader.fieldnames))
-    # 规范列名 → 原始表头（用于回到原始行取值）
+    header_map = build_header_map(list(fieldnames))
+    # 规范列名 → 表头（去空白后，与 rows 的 key 一致）
     canon_to_raw: dict[str, str] = {}
     for raw, canon in header_map.items():
         if canon and canon not in canon_to_raw:
             canon_to_raw[canon] = raw
-    rows = list(reader)
 
     def any_value(canon_cols) -> bool:
         raws = [canon_to_raw[c] for c in canon_cols if c in canon_to_raw]
@@ -381,8 +485,7 @@ def ingest(
         raise UploadError(f"deployment_mode 非法: {deployment_mode}")
 
     meta = validate_meta(meta_form)
-    csv_text = _decode(csv_bytes, "CSV 文件", MAX_CSV_BYTES)
-    metrics = parse_csv_text(csv_text)
+    metrics = parse_table(csv_bytes)  # 自动识别 CSV / .xlsx
 
     extra: dict = {"ingest_source": "manual_upload"}
 

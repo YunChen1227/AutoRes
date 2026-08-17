@@ -102,17 +102,20 @@
       <div class="card">
         <h3>1. 上传数据</h3>
         <div class="desc">
-          CSV 需含 <b>Input Length / Input_Length</b> 与 <b>Concurrency</b> 两列（维度）；
-          其他指标列名会自动映射到 to_csv.py 规范 schema。启动命令直接粘贴，支持 # 注释行与反斜杠续行。<br>
+          支持 <b>CSV</b> 或 <b>Excel（.xlsx）</b>；表格需含 <b>Input Length / Input_Length</b> 与 <b>Concurrency</b> 两列（维度）；
+          其他指标列名会自动映射到 to_csv.py 规范 schema。Excel <b>仅支持单个 sheet</b>，多 sheet / 旧版 .xls 会报错。
+          启动命令直接粘贴，支持 # 注释行与反斜杠续行。<br>
           默认「单机 / 分布式」；<b>若命令里出现 disaggregation / kv-transfer-config 等 PD 参数，会自动切到「PD 分离」</b>，
           需分别填写 prefill、decode（router 可选）。
         </div>
 
         <div class="field">
-          <label>结果 CSV <span class="req">*</span></label>
+          <label>结果 CSV / Excel <span class="req">*</span></label>
           <div class="filebox">
-            <input type="file" name="csv_file" accept=".csv,text/csv" required>
-            <span class="tag">result.csv（一次测试一份，PD 也是打整体服务的一份）</span>
+            <input type="file" name="csv_file"
+                   accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                   required>
+            <span class="tag">result.csv 或 .xlsx（一次测试一份，PD 也是打整体服务的一份）</span>
           </div>
         </div>
 
@@ -278,13 +281,13 @@
         if (d.bench_framework) {
           benchSel.value = d.bench_framework;
           benchHint.style.color = "#0a7c42";
-          benchHint.textContent = "已按 CSV spec 列自动识别为 " + d.bench_framework + "，如有误请手动改。";
+          benchHint.textContent = "已按表格 spec 列自动识别为 " + d.bench_framework + "，如有误请手动改。";
         } else {
           benchHint.style.color = "#8a6d00";
           const both = d.sglang_spec_present && d.vllm_spec_present;
           benchHint.textContent = both
-            ? "CSV 中 SGLang 与 vLLM spec 列都有值，无法自动判断，请手选。"
-            : "CSV 无可判断的 spec 列，请手选 bench 框架。";
+            ? "表格中 SGLang 与 vLLM spec 列都有值，无法自动判断，请手选。"
+            : "表格无可判断的 spec 列，请手选 bench 框架。";
         }
       })
       .catch(function () {
