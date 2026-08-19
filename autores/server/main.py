@@ -12,30 +12,16 @@ from autores.config import get_config
 from autores.db import client as dbc
 from autores.server.agent.loop import Agent
 from autores.server.api import router
+from autores.server.mcp_server import build_mcp_server
 from autores.server.reports_store import ReportStore
 from autores.server.session import SessionStore
 
 log = get_logger("server")
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI):
-    # 启动：起报告清理后台任务
-    task = asyncio.create_task(_cleanup_loop(app))
-    log.info("API 启动完成")
-    try:
-        yield
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
 def create_app() -> FastAPI:
     setup_logging()
     cfg = get_config()
-
-    app = FastAPI(title="AutoRes 性能测试报告 Agent", lifespan=_lifespan)
 
     db = dbc.connect(cfg.database)
     reports = ReportStore(cfg.report.ttl_minutes)
@@ -47,6 +33,26 @@ def create_app() -> FastAPI:
         report_registry=reports.register,
     )
 
+    # MCP server：把 chatbot 能力封装为标准 MCP 工具，挂在 /mcp（Streamable HTTP）。
+    # 用 stateless_http 免去会话保持；把内部路由设为 "/" 后挂到 /mcp，最终端点即 /mcp。
+    mcp = build_mcp_server(db, cfg, reports)
+    mcp_app = mcp.streamable_http_app(streamable_http_path="/", stateless_http=True)
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        # 启动：报告清理后台任务 + MCP 会话管理器（Streamable HTTP 必须在其上下文内运行）
+        task = asyncio.create_task(_cleanup_loop(app))
+        async with mcp.session_manager.run():
+            log.info("API 启动完成（含 MCP /mcp）")
+            try:
+                yield
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    app = FastAPI(title="AutoRes 性能测试报告 Agent", lifespan=_lifespan)
+
     app.state.db = db
     app.state.reports = reports
     app.state.sessions = sessions
@@ -54,6 +60,7 @@ def create_app() -> FastAPI:
     app.state.config = cfg
 
     app.include_router(router)
+    app.mount("/mcp", mcp_app)
     return app
 
 

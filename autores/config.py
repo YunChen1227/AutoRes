@@ -38,6 +38,10 @@ class ScannerConfig:
 class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8080
+    # MCP 工具生成报告后返回的下载链接前缀（绝对地址）。
+    # 留空时按 host:port 自动推导（0.0.0.0 → 127.0.0.1）。
+    # 反向代理 / 容器场景可显式配置为对外可访问地址，如 https://autores.example.com
+    public_base_url: str = ""
 
 
 @dataclass
