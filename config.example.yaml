@@ -50,6 +50,10 @@ server:
   # （0.0.0.0 → 127.0.0.1）。反代/容器/公网访问时填对外可达地址，例如：
   # public_base_url: "https://autores.example.com"
   public_base_url: ""
+  # 经代理域名访问 MCP 时，把代理 Host 加入白名单（也可只配 public_base_url，域名会自动加入）
+  # mcp_allowed_hosts:
+  #   - "model-download.example.com:*"
+  # mcp_disable_host_check: false   # 内网调试可设 true 完全关闭 Host 校验
 
 session:
   ttl_minutes: 60

@@ -18,8 +18,10 @@ MCP server（挂载在主应用 /mcp 路径下）。
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from autores.common.logging import get_logger
 from autores.config import Config
@@ -46,6 +48,53 @@ def _base_url(cfg: Config) -> str:
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
     return f"http://{host}:{cfg.server.port}"
+
+
+def _host_pattern(host: str) -> str:
+    """Host 白名单项：无端口则补 :*（任意端口）。"""
+    host = host.strip()
+    if not host:
+        return host
+    if host.endswith(":*") or (host.startswith("[") and "]:" in host):
+        return host
+    if host.count(":") == 1 and not host.startswith("["):
+        return host  # 已带端口，如 example.com:8080
+    return f"{host}:*"
+
+
+def build_mcp_transport_security(cfg: Config) -> TransportSecuritySettings | None:
+    """MCP Streamable HTTP 的 Host/Origin 校验策略。
+
+    MCP SDK 在 host=127.0.0.1 时会默认只放行 localhost，经代理域名访问会 421。
+    策略：
+      - mcp_disable_host_check=true → 完全关闭
+      - 配置了 mcp_allowed_hosts 或 public_base_url → 启用白名单（含 localhost）
+      - server.host 为 0.0.0.0/:: 且无上述配置 → 关闭（K8s/反代常见场景）
+      - 其余 → None，走 SDK 默认 localhost 保护
+    """
+    srv = cfg.server
+    if srv.mcp_disable_host_check:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    hosts: list[str] = list(srv.mcp_allowed_hosts)
+    if srv.public_base_url:
+        hostname = urlparse(srv.public_base_url).hostname
+        if hostname and hostname not in hosts:
+            hosts.append(hostname)
+
+    if hosts:
+        patterns = sorted({_host_pattern(h) for h in hosts if h.strip()})
+        patterns.extend(["127.0.0.1:*", "localhost:*", "[::1]:*"])
+        allowed = sorted(set(patterns))
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed,
+        )
+
+    if srv.host in ("0.0.0.0", "::"):
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    return None
 
 
 def build_mcp_server(db, cfg: Config, reports) -> MCPServer:

@@ -175,12 +175,27 @@ server:
   # 反代 / 容器 / 公网访问场景请填对外可达地址：
   # public_base_url: "https://autores.example.com"
   public_base_url: ""
+  # 经代理域名访问 MCP 时的 Host 白名单（配 public_base_url 时会自动加入其域名）
+  # mcp_allowed_hosts:
+  #   - "model-download.example.com:*"
+  # mcp_disable_host_check: false   # 内网调试可设 true 完全关闭 Host 校验
 ```
 
 也可用环境变量覆盖：`AUTORES_SERVER_PUBLIC_BASE_URL=https://autores.example.com`。
 
 > 若客户端与服务不在同一台机器，务必设置 `public_base_url`（或确保 host 对外可达），
 > 否则返回的下载链接会指向 `127.0.0.1` 而无法访问。
+
+**代理域名访问 MCP：** 服务 `host` 为 `0.0.0.0` 时默认已关闭 Host 校验，一般无需额外配置。
+若仍见 `421 Misdirected Request` / `Invalid Host header`，在 `config.yaml` 中配置：
+
+```yaml
+server:
+  public_base_url: "http://你的代理域名"   # 推荐：同时修正报告下载链接
+  # 或显式白名单：
+  mcp_allowed_hosts:
+    - "你的代理域名:*"
+```
 
 ---
 
@@ -189,6 +204,7 @@ server:
 | 现象 | 排查 |
 |------|------|
 | 客户端连不上 `/mcp` | 确认服务已启动且日志含 `含 MCP /mcp`；确认端口、防火墙；URL 结尾是 `/mcp` |
+| `421 Misdirected Request` / `Invalid Host header` | MCP SDK 拒绝了代理域名的 Host 头。`host=0.0.0.0` 部署后重启服务通常已修复；否则在 `config.yaml` 配 `public_base_url` 或 `mcp_allowed_hosts`（见 §4） |
 | `406 Not Acceptable` | 请求头缺 `Accept: application/json, text/event-stream`（用 SDK 则无需手动加） |
 | 下载链接打不开 | 链接指向 `127.0.0.1` 但客户端在别的机器 → 配置 `server.public_base_url`；或报告已过期（超过 `report.ttl_minutes`）重新生成 |
 | `ModuleNotFoundError: mcp` | 重新 `pip install -r requirements.txt` |

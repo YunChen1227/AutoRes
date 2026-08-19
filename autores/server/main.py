@@ -12,7 +12,7 @@ from autores.config import get_config
 from autores.db import client as dbc
 from autores.server.agent.loop import Agent
 from autores.server.api import router
-from autores.server.mcp_server import build_mcp_server
+from autores.server.mcp_server import build_mcp_server, build_mcp_transport_security
 from autores.server.reports_store import ReportStore
 from autores.server.session import SessionStore
 
@@ -36,7 +36,12 @@ def create_app() -> FastAPI:
     # MCP server：把 chatbot 能力封装为标准 MCP 工具，挂在 /mcp（Streamable HTTP）。
     # 用 stateless_http 免去会话保持；把内部路由设为 "/" 后挂到 /mcp，最终端点即 /mcp。
     mcp = build_mcp_server(db, cfg, reports)
-    mcp_app = mcp.streamable_http_app(streamable_http_path="/", stateless_http=True)
+    mcp_app = mcp.streamable_http_app(
+        streamable_http_path="/",
+        stateless_http=True,
+        host=cfg.server.host,
+        transport_security=build_mcp_transport_security(cfg),
+    )
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):

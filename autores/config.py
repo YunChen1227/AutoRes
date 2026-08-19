@@ -42,6 +42,12 @@ class ServerConfig:
     # 留空时按 host:port 自动推导（0.0.0.0 → 127.0.0.1）。
     # 反向代理 / 容器场景可显式配置为对外可访问地址，如 https://autores.example.com
     public_base_url: str = ""
+    # MCP Host 头白名单（代理/反代域名）。留空时：host=0.0.0.0 关闭校验；
+    # 若配置了 public_base_url 则自动把其域名加入白名单。
+    # 示例：["model-download.example.com:*", "127.0.0.1:*"]
+    mcp_allowed_hosts: list[str] = field(default_factory=list)
+    # 设为 true 可完全关闭 MCP 的 Host/Origin 校验（仅建议内网调试）
+    mcp_disable_host_check: bool = False
 
 
 @dataclass
