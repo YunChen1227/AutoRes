@@ -1,14 +1,17 @@
 """
-Agent 工具（design.md §7.2）。三个工具，刻意保持最小集：
-  - list_dimension_values : 拉取库内某维度的真实取值（归一化对齐 + 澄清列候选）
-  - count_matching_runs   : 提交前预检命中数量
-  - submit_query_spec     : 工具循环唯一出口，触发报告流水线
+Agent 工具（design.md §7.2）：
+  - summarize_reports      : 按显卡×模型盘点库内测试记录数量
+  - list_dimension_values  : 拉取库内某维度的真实取值（归一化对齐 + 澄清列候选）
+  - count_matching_runs    : 提交前预检命中数量
+  - analyze_saturation     : 性能饱和点 / hardware wall 分析（JSON + Markdown）
+  - submit_query_spec      : 触发生成 Excel 对比报告（对比任务的出口）
 
-工具的 JSON Schema 供 LLM function-calling 使用；实现直接查 SQLite。
+工具的 JSON Schema 供 LLM function-calling 使用；实现直接查 SQLite / 确定性分析。
 """
 from __future__ import annotations
 
 from autores.db import schema
+from autores.server.analysis.saturation import analyze_saturation_runs
 from autores.server.report.query import (
     QuerySpec,
     QuerySpecError,
@@ -139,6 +142,77 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_saturation",
+            "description": (
+                "分析性能饱和点（hardware wall）：对匹配的压测记录按 input_length 给出"
+                "墙并发、推荐运行点、瓶颈归因与置信度。用于回答'饱和并发多少''性能墙'"
+                "'推荐并发''膝点'等容量规划问题。禁止凭肉眼扫指标表估墙，必须用本工具。"
+                "命中超过 max_runs（默认 5）时会要求加约束；结果含 markdown 摘要与 caveats。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filters": {
+                        "type": "object",
+                        "description": (
+                            "维度等值条件，键必须取自可用维度列表"
+                            f"（{', '.join(schema.ALL_DIMENSIONS)}）；值可为数组（多选）"
+                        ),
+                    },
+                    "exclude": {
+                        "type": "object",
+                        "description": "可选：排除项，键为维度名、值为要排除的取值数组",
+                    },
+                    "run_id": {
+                        "type": "string",
+                        "description": "可选：精确指定一条 test_runs.run_id",
+                    },
+                    "slo_ttft_p99": {
+                        "type": "number",
+                        "description": "可选：TTFT P99 SLO 上限（ms）",
+                    },
+                    "slo_tpot_mean": {
+                        "type": "number",
+                        "description": "可选：TPOT Mean SLO 上限（ms）",
+                    },
+                    "slo_itl_p95": {
+                        "type": "number",
+                        "description": "可选：ITL P95 SLO 上限（ms）",
+                    },
+                    "slo_e2e_p99": {
+                        "type": "number",
+                        "description": "可选：E2E P99 SLO 上限（ms）",
+                    },
+                    "plateau_gain": {
+                        "type": "number",
+                        "description": "可选：吞吐边际增益平台阈值，默认 0.10",
+                    },
+                    "latency_factor": {
+                        "type": "number",
+                        "description": "可选：延迟相对基线膝点倍数，默认 2.0",
+                    },
+                    "headroom": {
+                        "type": "number",
+                        "description": "可选：推荐运行点 = wall × headroom，默认 0.8",
+                    },
+                    "include_points": {
+                        "type": "boolean",
+                        "description": (
+                            "可选，默认 false：是否附带逐并发点明细（会显著增大上下文）；"
+                            "通常汇总表已够用"
+                        ),
+                    },
+                    "max_runs": {
+                        "type": "integer",
+                        "description": "可选：最多分析几条 run，默认 5；超出则要求加约束",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -207,3 +281,30 @@ def validate_query_spec(spec_dict: dict) -> tuple[QuerySpec | None, str | None]:
         return QuerySpec.from_dict(spec_dict), None
     except QuerySpecError as e:
         return None, str(e)
+
+
+def analyze_saturation(db, args: dict | None = None) -> dict:
+    """性能饱和点分析；args 为 LLM/MCP 传入的参数字典。"""
+    args = args or {}
+    slo = {
+        "ttft_p99": args.get("slo_ttft_p99"),
+        "tpot_mean": args.get("slo_tpot_mean"),
+        "itl_p95": args.get("slo_itl_p95"),
+        "e2e_p99": args.get("slo_e2e_p99"),
+    }
+    kwargs: dict = {
+        "filters": args.get("filters"),
+        "exclude": args.get("exclude"),
+        "run_id": args.get("run_id") or None,
+        "slo": slo,
+        "include_points": bool(args.get("include_points", False)),
+    }
+    if args.get("plateau_gain") is not None:
+        kwargs["plateau_gain"] = float(args["plateau_gain"])
+    if args.get("latency_factor") is not None:
+        kwargs["latency_factor"] = float(args["latency_factor"])
+    if args.get("headroom") is not None:
+        kwargs["headroom"] = float(args["headroom"])
+    if args.get("max_runs") is not None:
+        kwargs["max_runs"] = int(args["max_runs"])
+    return analyze_saturation_runs(db, **kwargs)

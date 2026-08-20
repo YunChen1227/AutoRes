@@ -152,6 +152,9 @@ class Agent:
             return agent_tools.count_matching_runs(
                 self.db, args.get("filters", {}), args.get("exclude")), None
 
+        if name == "analyze_saturation":
+            return agent_tools.analyze_saturation(self.db, args), None
+
         if name == "submit_query_spec":
             spec, err = agent_tools.validate_query_spec(args)
             if err:
@@ -298,6 +301,8 @@ def _status_text(name: str, args: dict) -> str:
         return f"正在查询库内「{args.get('dimension', '')}」的可选值…"
     if name == "count_matching_runs":
         return "正在预检匹配的测试记录数量…"
+    if name == "analyze_saturation":
+        return "正在分析性能饱和点…"
     if name == "submit_query_spec":
         return "正在生成对比报告…"
     return f"正在执行 {name}…"

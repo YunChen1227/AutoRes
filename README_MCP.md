@@ -50,6 +50,7 @@ pip install -r requirements.txt
 | `summarize_reports` | 按 **显卡 × 模型** 盘点库内测试记录数量 | `filters?` |
 | `list_dimension_values` | 列出某维度在库内的**真实取值**及各值计数（把口语如 `4090` 对齐到真实值） | `dimension`，`filters?` |
 | `count_matching_runs` | 生成报告前**预检**一组条件命中多少条记录（1~20 条会附带明细） | `filters`，`exclude?` |
+| `analyze_saturation` | 分析**性能饱和点**（hardware wall）：按 `input_length` 给出墙并发、推荐运行点、瓶颈与置信度（JSON + Markdown） | `filters?`，`exclude?`，`run_id?`，`slo_*?`，`include_points?`，`max_runs?` |
 | `generate_comparison_report` | 生成 **Excel 对比报告**，返回下载链接与摘要 | `compare_on`，`filters?`，`compare_values?`，`exclude?`，`metrics?`，`metric_filters?`，`normalize_gpu_scale?` |
 | `health` | 健康检查（数据库连通性） | 无 |
 
@@ -57,7 +58,24 @@ pip install -r requirements.txt
 
 1. `list_dimension_values` —— 把用户口语对齐到库内真实值（如 `4090` → `NVIDIA RTX 4090`）；
 2. `count_matching_runs` —— 预检命中数量：0 条则提示无数据，过多则加约束或排除取值；
-3. `generate_comparison_report` —— 生成报告并把返回的 `download_url` 交给用户下载。
+3. 按任务分支：
+   - **饱和点 / 推荐并发 / 性能墙** → `analyze_saturation`（返回 `markdown` + `runs` + `caveats`，无需 Excel）；
+   - **横向对比报告** → `generate_comparison_report`，把返回的 `download_url` 交给用户下载。
+
+### `analyze_saturation` 返回示例
+
+```json
+{
+  "ok": true,
+  "n_runs": 1,
+  "settings": {"plateau_gain": 0.1, "latency_factor": 2.0, "headroom": 0.8, "slo": {}},
+  "runs": [{"run_id": "...", "by_input_length": [{"input_length": 8192, "wall_c": 16, "recommended_c": 8, "bottleneck": "decode_bound", "confidence": "medium"}]}],
+  "markdown": "# Hardware Wall 分析结果\n...",
+  "caveats": []
+}
+```
+
+命中过多（默认 >5 条）时返回 `{"ok": false, "reason": "命中 N 条…", "n_matched": N}`，请加约束后重试。
 
 ### `generate_comparison_report` 返回示例
 
@@ -98,7 +116,7 @@ pip install -r requirements.txt
 }
 ```
 
-保存后在 Cursor 的 MCP 设置里应能看到 `autores` 及其 6 个工具。
+保存后在 Cursor 的 MCP 设置里应能看到 `autores` 及其 7 个工具。
 
 ### 3.2 Claude Desktop / 其他仅支持 stdio 的客户端
 

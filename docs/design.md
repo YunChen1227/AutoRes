@@ -374,26 +374,29 @@ CREATE TABLE ingest_log (
 
 ### 7.2 阶段一：LLM 工具循环
 
-标准 function-calling 循环：把用户消息 + 会话历史发给 LLM，LLM 或者回复文本（澄清/闲聊），或者调用工具；工具结果回填后继续循环，直到 LLM 调用 `submit_query_spec` 或输出纯文本回复。单轮循环上限 `llm.max_tool_rounds`（默认 8）防失控。
+标准 function-calling 循环：把用户消息 + 会话历史发给 LLM，LLM 或者回复文本（澄清/闲聊），或者调用工具；工具结果回填后继续循环，直到 LLM 调用 `submit_query_spec`（触发 Excel 报告）、完成 `analyze_saturation` 后输出结论文本，或直接输出纯文本回复。单轮循环上限 `llm.max_tool_rounds`（默认 8）防失控。
 
-**工具清单**（3 个，刻意保持最小集）：
+**工具清单**（5 个）：
 
 | 工具 | 入参 | 返回 | 用途 |
 |------|------|------|------|
-| `list_dimension_values` | `dimension`（枚举：model / model_version / framework / framework_version / gpu_type / tp / dp / pp / ep / cp / kv_cache_dtype / hicache_enabled / flexkv_enabled / metric_name），可选 `filters`（其他维度的等值约束） | 库内该维度的去重值列表 + 各值的记录数 | 归一化对齐（D14）：用户说"4090"，LLM 拉取 gpu_type 实际值后自行对齐到"NVIDIA RTX 4090"；也用于澄清时向用户列候选 |
-| `count_matching_runs` | 一组维度等值/排除条件 | 命中的记录数量 + 若数量 ≤ 20 则附简要清单（目录名、时间戳、各维度值） | 提交前预检：0 条 → 告知用户没有该数据；数量过多 → 提示用户可加约束或排除某维度值（D21） |
-| `submit_query_spec` | 完整 QuerySpec（见 7.3） | 校验结果；通过则触发阶段二 | 工具循环的**唯一出口**；后端对 spec 做严格 schema 校验，非法则把错误回给 LLM 修正 |
+| `summarize_reports` | 可选 `filters` | 按显卡×模型的记录计数 | 盘点库内有多少报告 |
+| `list_dimension_values` | `dimension`（取自 `schema.ALL_DIMENSIONS`），可选 `filters` | 库内该维度的去重值列表 + 各值的记录数 | 归一化对齐（D14）：用户说"4090"，LLM 拉取 gpu_type 实际值后自行对齐；也用于澄清时向用户列候选 |
+| `count_matching_runs` | 一组维度等值/排除条件 | 命中的记录数量 + 若数量 ≤ 20 则附简要清单 | 提交前预检：0 条 → 告知无数据；数量过多 → 提示加约束或排除（D21） |
+| `analyze_saturation` | `filters` / `exclude` / 可选 `run_id`、SLO、检测器阈值 | `{ok, runs, markdown, caveats}`；命中过多则 `ok:false` | 性能饱和点 / hardware wall：按 `input_length` 给出墙并发、推荐运行点、瓶颈与置信度；**不是**循环出口，模型整理结论文本后回复 |
+| `submit_query_spec` | 完整 QuerySpec（见 7.3） | 校验结果；通过则触发阶段二 | Excel 对比报告任务的出口；后端对 spec 做严格 schema 校验，非法则把错误回给 LLM 修正 |
 
 **System prompt 要点**（`prompts.py`，设计要求而非全文）：
 
-- 角色：性能测试数据查询助手，任务是把对比需求转化为 QuerySpec。
+- 角色：性能测试数据查询助手，任务是把对比需求转化为 QuerySpec，或调用饱和分析工具。
 - 明确"对比轴（compare_on）"与"约束项（filters）"的概念，对应初稿 §6。
 - 强制行为规则：
   1. 对齐任何用户提到的维度值之前，**必须**先调 `list_dimension_values` 确认库内真实值，禁止凭空猜测拼写；
   2. 出现歧义（一个口语值匹配多个库内值 / 用户漏说必要约束导致对比不成立）时，**必须**向用户反问并列出候选项，禁止擅自选择（D7）；
-  3. 提交前**必须**先 `count_matching_runs` 预检；
+  3. 提交 Excel 报告前**必须**先 `count_matching_runs` 预检；
   4. **取数策略（D20）**：只有当一组记录的**所有维度完全相同**时才取最新一次；框架版本不同（如 vllm 0.5.11 与 0.5.12）视为不同记录，**全部取出**，不做去重；**不同框架**（vllm 与 sglang）的版本号**不可跨框架比较**，须各自独立呈现。向用户说明这一行为。
   5. **排除逻辑（D21）**：当结果过多、或用户明确要求"去掉某某"时，用 QuerySpec 的 `exclude` 字段剔除指定维度值，而非重新构造复杂 filter。
+  6. **饱和分析**：用户问饱和点/性能墙/推荐并发时调用 `analyze_saturation`，禁止肉眼估墙；汇报须含前提、wall、推荐并发、瓶颈、置信度，并转述 `caveats`。
 - 回复语言与用户一致（默认中文）。
 
 ### 7.3 QuerySpec（两阶段之间的契约）

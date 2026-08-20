@@ -9,6 +9,7 @@ MCP server（挂载在主应用 /mcp 路径下）。
   - summarize_reports      : 按显卡×模型盘点库内测试记录数量
   - list_dimension_values  : 列出某维度在库内的真实取值及计数（口语→真实值对齐）
   - count_matching_runs    : 提交前预检一组条件命中多少条记录
+  - analyze_saturation     : 性能饱和点 / hardware wall 分析（JSON + Markdown）
   - generate_comparison_report : 生成 Excel 对比报告，返回下载链接
   - health                 : 健康检查（DB 连通性）
 
@@ -32,11 +33,12 @@ from autores.server.report.pipeline import generate_report
 log = get_logger("mcp")
 
 _INSTRUCTIONS = (
-    "AutoRes 性能测试报告工具集。用于查询 sglang / vllm / vllm-ascend 的压测记录"
-    "并生成 Excel 对比报告。典型流程：\n"
+    "AutoRes 性能测试工具集。用于查询 sglang / vllm / vllm-ascend 的压测记录、"
+    "分析性能饱和点，并生成 Excel 对比报告。典型流程：\n"
     "1) 用 list_dimension_values 把用户口语（如 '4090'）对齐到库内真实值；\n"
     "2) 用 count_matching_runs 预检命中数量，0 条则提示无数据、过多则加约束；\n"
-    "3) 用 generate_comparison_report 生成报告并返回下载链接。"
+    "3a) 查饱和点 / 推荐并发 / 性能墙 → 调用 analyze_saturation（无需生成 Excel）；\n"
+    "3b) 横向对比 → 用 generate_comparison_report 生成报告并返回下载链接。"
 )
 
 
@@ -146,6 +148,53 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
         filters: 维度等值条件，值可为数组（表示多选）。
         exclude: 可选，排除项，键为维度名、值为要排除的取值数组。"""
         return agent_tools.count_matching_runs(db, filters, exclude)
+
+    @mcp.tool()
+    def analyze_saturation(
+        filters: dict[str, Any] | None = None,
+        exclude: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        slo_ttft_p99: float | None = None,
+        slo_tpot_mean: float | None = None,
+        slo_itl_p95: float | None = None,
+        slo_e2e_p99: float | None = None,
+        plateau_gain: float | None = None,
+        latency_factor: float | None = None,
+        headroom: float | None = None,
+        include_points: bool = False,
+        max_runs: int | None = None,
+    ) -> dict:
+        """分析性能饱和点（hardware wall）：按 input_length 给出墙并发、推荐运行点、
+        瓶颈归因与置信度。查饱和点 / 推荐并发时用本工具，无需生成 Excel。
+
+        filters: 维度等值条件（键取自 list_dimensions），值可为数组。
+        exclude: 可选，排除项。
+        run_id: 可选，精确指定一条 run。
+        slo_*: 可选，延迟 SLO 上限（ms）。
+        plateau_gain / latency_factor / headroom: 可选，检测器阈值。
+        include_points: 默认 false；true 时附带逐并发点明细（上下文更大）。
+        max_runs: 最多分析几条，默认 5；超出则返回需加约束的提示。
+
+        返回：{ok, n_runs, settings, runs, markdown, caveats} 或 {ok:false, ...}。"""
+        args: dict[str, Any] = {
+            "filters": filters,
+            "exclude": exclude,
+            "run_id": run_id,
+            "slo_ttft_p99": slo_ttft_p99,
+            "slo_tpot_mean": slo_tpot_mean,
+            "slo_itl_p95": slo_itl_p95,
+            "slo_e2e_p99": slo_e2e_p99,
+            "include_points": include_points,
+        }
+        if plateau_gain is not None:
+            args["plateau_gain"] = plateau_gain
+        if latency_factor is not None:
+            args["latency_factor"] = latency_factor
+        if headroom is not None:
+            args["headroom"] = headroom
+        if max_runs is not None:
+            args["max_runs"] = max_runs
+        return agent_tools.analyze_saturation(db, args)
 
     @mcp.tool()
     def generate_comparison_report(
