@@ -31,9 +31,9 @@ def ingest_dir(db, root: str, dir_name: str) -> bool:
         return False
 
     try:
-        db.insert_run(doc)
+        db.insert_run(doc, kind=doc.get("benchmark_kind"))
     except DuplicateRunError:
-        # 崩溃边界（§6.2）：test_runs 已写、ingest_log 没写。视为已入库，补写台账。
+        # 崩溃边界（§6.2）：表已写、ingest_log 没写。视为已入库，补写台账。
         log.info("记录已存在，补写台账", extra={"fields": {"dir": dir_name}})
         db.mark_ingested(dir_name, doc["_id"])
         return True
@@ -42,7 +42,10 @@ def ingest_dir(db, root: str, dir_name: str) -> bool:
         return False
 
     db.mark_ingested(dir_name, doc["_id"])
-    log.info("入库成功", extra={"fields": {"dir": dir_name, "metrics": len(doc["metrics"])}})
+    log.info("入库成功", extra={"fields": {
+        "dir": dir_name, "metrics": len(doc["metrics"]),
+        "kind": doc.get("benchmark_kind"),
+    }})
     return True
 
 

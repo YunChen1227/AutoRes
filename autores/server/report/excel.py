@@ -2,7 +2,7 @@
 Excel 渲染（design.md §7.4 步骤 4-5）。纯数据对比表，无图表、无结论。
 
 版式（矩阵式宽表）：
-  - 行 = (Input_Length, Concurrency) 组合，按输入长度分块
+  - 行 = kind 对应的全部 metric 行键组合，按首维 Input_Length 分块
   - 列 = 每个指标一个"列组"，组内 = 对比轴各取值 + 两两差异列（≥2 个取值时）
   - 双层表头：第 1 行为指标名（跨列合并），第 2 行为对比轴取值 / "A vs B"
   - 每个 Input_Length 块结束后插入一行块汇总：该块内各差异列的均值
@@ -16,6 +16,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from autores.db import schema
 from autores.server.report import hardware
 
 _HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -43,6 +44,8 @@ def _constraints_text(constraints: dict) -> str:
         "hicache_enabled": "HiCache", "flexkv_enabled": "FlexKV",
         "torch_compile": "TorchCompile", "quantization": "量化",
         "attention_backend": "Attention后端",
+        "bench_framework": "bench框架", "bench_flush_cache": "flush cache",
+        "deployment_mode": "部署模式",
     }
     parts = [f"{label_map.get(k, k)}: {v}" for k, v in constraints.items()]
     return " | ".join(parts)
@@ -116,6 +119,11 @@ def _style_delta_cell(cell, delta, *, bold: bool = False):
         cell.fill = _DELTA_NEG_FILL
 
 
+def _dim_cell_value(val):
+    """维度单元格展示：None → N/A。"""
+    return "N/A" if val is None else val
+
+
 def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     """把对比宽表渲染为 xlsx，返回文件路径。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -127,11 +135,16 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     column_labels = list(table["column_labels"])
     matrix = table["matrix"]
     metric_names = table["metric_names"]
+    dim_labels = list(table.get("dim_labels") or schema.metric_dimension_keys())
+    dim_keys = list(table.get("dim_keys") or schema.metric_dims())
+    n_dims = len(dim_labels)
 
     gpu_scaled = table.get("gpu_scaled", False)
     column_gpus = table.get("column_gpus", {})
     column_gpu_types = table.get("column_gpu_types", {})
     column_scale = table.get("column_scale", {})
+    coverage = table.get("coverage") or {}
+    notes = table.get("notes") or {}
 
     def _col_display(label) -> str:
         """列标签：弱扩展换算时追加 (×比例) 标识。"""
@@ -151,14 +164,16 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     group_width = len(column_labels) + len(compare_pairs)
 
     # ── 标题区 ──
-    ws.cell(row=1, column=1, value=f"对比轴: {compare_on}").font = _TITLE_FONT
+    kind = notes.get("benchmark_kind") or table.get("benchmark_kind", "text")
+    ws.cell(row=1, column=1,
+            value=f"对比轴: {compare_on}　kind: {kind}").font = _TITLE_FONT
     constraints = _constraints_text(table["constraints"])
     if constraints:
         ws.cell(row=2, column=1, value=f"约束: {constraints}")
     note_bits = []
-    if table["notes"].get("multi_framework"):
+    if notes.get("multi_framework"):
         note_bits.append("含多个框架（版本号不可跨框架比较）")
-    if table["notes"].get("multi_version"):
+    if notes.get("multi_version"):
         note_bits.append("含多个框架版本（各自独立取出）")
     if len(column_labels) > 2:
         note_bits.append(f"对比轴 {len(column_labels)} 个取值，差异列为两两对比")
@@ -174,6 +189,17 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
             "已按卡数弱扩展归一：吞吐类×卡数比例、concurrency 同比对齐、"
             "延迟类(TTFT/TPOT/ITL/E2E)保持原值　" + "，".join(parts)
         )
+    total = coverage.get("total_rows", 0)
+    aligned = coverage.get("aligned_rows", 0)
+    if total:
+        rate = aligned / total if total else 0
+        note_bits.append(
+            f"对齐率 {aligned}/{total}（{rate:.0%}）：两边都有数据的场景行数 / 总场景行数")
+        if rate < 0.5 and total >= 2:
+            note_bits.append("对齐率偏低，可能两边扫描配置不一致（分辨率/图数/前缀等不同）")
+    if notes.get("merged_from"):
+        note_bits.append(
+            f"同维度多条 run 已按场景行键合并：{', '.join(notes['merged_from'])}")
     if note_bits:
         ws.cell(row=3, column=1, value="说明: " + "；".join(note_bits))
 
@@ -181,13 +207,13 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     data_start = 7
 
     # ── 双层表头 ──
-    # 左侧两列维度列：Input_Length / Concurrency，纵向合并两行
-    for idx, dim_label in enumerate(("Input_Length", "Concurrency"), start=1):
+    # 左侧维度列：按 kind 动态渲染，纵向合并两行
+    for idx, dim_label in enumerate(dim_labels, start=1):
         ws.merge_cells(start_row=top_row, start_column=idx, end_row=sub_row, end_column=idx)
         ws.cell(row=top_row, column=idx, value=dim_label)
 
     # 指标列组
-    col = 3
+    col = n_dims + 1
     delta_columns: list[int] = []
     for mname in metric_names:
         end_col = col + group_width - 1
@@ -213,7 +239,6 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
             c.border = _BORDER
 
     # ── 数据区：按 Input_Length 分块，块尾追加差异均值汇总行 ──
-    # matrix 已按 (input_length, concurrency) 排好序
     row_cursor = data_start
     delta_accum: dict[int, list[float]] = {j: [] for j in delta_columns}
     prev_input_length = None
@@ -237,20 +262,20 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
         return cursor + 1
 
     for entry in matrix:
-        il = entry["input_length"]
+        dims = entry.get("dims") or {}
+        il = dims.get("input_length", entry.get("input_length"))
         if prev_input_length is not None and il != prev_input_length:
             row_cursor = flush_block(row_cursor)
         prev_input_length = il
 
-        ws.cell(row=row_cursor, column=1, value=il)
-        ws.cell(row=row_cursor, column=2, value=entry["concurrency"])
-        for j in (1, 2):
-            c = ws.cell(row=row_cursor, column=j)
+        for j, key in enumerate(dim_keys, start=1):
+            c = ws.cell(row=row_cursor, column=j,
+                        value=_dim_cell_value(dims.get(key, entry.get(key))))
             c.fill = _DIM_FILL
             c.alignment = _CENTER
             c.border = _BORDER
 
-        col = 3
+        col = n_dims + 1
         for mname in metric_names:
             per_column = entry["metrics"].get(mname, {})
             for offset, col_label in enumerate(column_labels):
@@ -273,8 +298,8 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
     if prev_input_length is not None:
         row_cursor = flush_block(row_cursor)
 
-    # 冻结表头 + 左侧两个维度列
-    ws.freeze_panes = ws.cell(row=data_start, column=3)
+    # 冻结表头 + 左侧维度列
+    ws.freeze_panes = ws.cell(row=data_start, column=n_dims + 1)
 
     # 列宽自适应（简单估算）
     for j in range(1, last_col + 1):

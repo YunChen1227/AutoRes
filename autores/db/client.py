@@ -3,6 +3,8 @@ SQLite 访问层。Scanner 与 API 共用同一 Database 类。
 
 单节点、量小、Scanner 单进程写入；连接开 WAL 模式支持"一写多读"，
 进程内用锁串行化写操作。所有 SQL 集中在本模块，上层只操作文档 dict。
+
+表名一律经 schema.table_for(kind) 解析，禁止外部字符串拼接。
 """
 from __future__ import annotations
 
@@ -45,39 +47,48 @@ class Database:
         with self._lock:
             self._conn.close()
 
-    # ── test_runs ──
+    # ── runs（按 benchmark_kind 路由到 test_runs / vlm_test_runs）──
 
-    def insert_run(self, doc: dict) -> None:
+    def insert_run(self, doc: dict, kind: str | None = None) -> None:
         """插入一次测试。run_id 冲突抛 DuplicateRunError（sqlite3.IntegrityError）。"""
-        row = schema.doc_to_row(doc)
+        bk = schema.resolve_kind(kind or doc.get("benchmark_kind")).name
+        table = schema.table_for(bk)
+        row = schema.doc_to_row(doc, bk)
         cols = list(row.keys())
-        sql = (f"INSERT INTO test_runs ({', '.join(cols)}) "
+        sql = (f"INSERT INTO {table} ({', '.join(cols)}) "
                f"VALUES ({', '.join('?' for _ in cols)})")
         with self._lock:
             self._conn.execute(sql, [row[c] for c in cols])
             self._conn.commit()
 
-    def fetch_runs(self, where_sql: str = "", params: list | None = None) -> list[dict]:
+    def fetch_runs(self, where_sql: str = "", params: list | None = None,
+                   kind: str | None = None) -> list[dict]:
         """按条件取测试记录，返回文档形态列表（含 metrics）。"""
-        sql = "SELECT * FROM test_runs"
+        bk = schema.resolve_kind(kind).name
+        table = schema.table_for(bk)
+        sql = f"SELECT * FROM {table}"
         if where_sql:
             sql += f" WHERE {where_sql}"
         with self._lock:
             rows = self._conn.execute(sql, params or []).fetchall()
-        return [schema.row_to_doc(r) for r in rows]
+        return [schema.row_to_doc(r, bk) for r in rows]
 
-    def count_runs(self, where_sql: str = "", params: list | None = None) -> int:
-        sql = "SELECT COUNT(*) FROM test_runs"
+    def count_runs(self, where_sql: str = "", params: list | None = None,
+                   kind: str | None = None) -> int:
+        table = schema.table_for(kind)
+        sql = f"SELECT COUNT(*) FROM {table}"
         if where_sql:
             sql += f" WHERE {where_sql}"
         with self._lock:
             return self._conn.execute(sql, params or []).fetchone()[0]
 
     def dimension_values(self, dimension: str,
-                         where_sql: str = "", params: list | None = None) -> list[dict]:
+                         where_sql: str = "", params: list | None = None,
+                         kind: str | None = None) -> list[dict]:
         """某维度的去重取值及记录数，按记录数降序。"""
+        table = schema.table_for(kind)
         col = schema.dimension_column(dimension)
-        sql = f"SELECT {col} AS value, COUNT(*) AS cnt FROM test_runs"
+        sql = f"SELECT {col} AS value, COUNT(*) AS cnt FROM {table}"
         if where_sql:
             sql += f" WHERE {where_sql}"
         sql += f" GROUP BY {col} ORDER BY cnt DESC"
@@ -92,14 +103,16 @@ class Database:
         return out
 
     def group_counts(self, dimensions: list[str],
-                     where_sql: str = "", params: list | None = None) -> list[dict]:
+                     where_sql: str = "", params: list | None = None,
+                     kind: str | None = None) -> list[dict]:
         """
         按一个或多个维度分组统计记录数。
         返回 [{dim1: v1, dim2: v2, ..., "count": n}, ...]，按 count 降序。
         """
+        table = schema.table_for(kind)
         cols = [schema.dimension_column(d) for d in dimensions]
         col_list = ", ".join(cols)
-        sql = f"SELECT {col_list}, COUNT(*) AS cnt FROM test_runs"
+        sql = f"SELECT {col_list}, COUNT(*) AS cnt FROM {table}"
         if where_sql:
             sql += f" WHERE {where_sql}"
         sql += f" GROUP BY {col_list} ORDER BY cnt DESC"

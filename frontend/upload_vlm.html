@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>上传测试结果 - 性能测试报告助手</title>
+<title>上传 VLM 测试结果 - 性能测试报告助手</title>
 <style>
   :root {
     --bg: #f5f6f8; --panel: #ffffff; --border: #e3e5e9;
@@ -92,9 +92,9 @@
 </head>
 <body>
   <header>
-    <span class="dot"></span>上传测试结果（文本）
+    <span class="dot"></span>上传测试结果（VLM）
     <span class="spacer"></span>
-    <a href="/upload/vlm">VLM 上传 →</a>
+    <a href="/upload">← 文本上传</a>
     <a href="/">← 返回对比助手</a>
   </header>
 
@@ -105,14 +105,13 @@
         <div class="desc">
           支持 <b>CSV</b> 或 <b>Excel（.xlsx）</b>。<b>必需列</b>：
           <code>Input Length</code>、<code>Concurrency</code>；
-          <b>可选列</b>：<code>Prefix Rate</code>（缺失则整列记为 N/A，且不与有值的行对齐）。
-          其他指标列名会自动映射到 to_csv.py 规范 schema。Excel <b>仅支持单个 sheet</b>，多 sheet / 旧版 .xls 会报错。
-          启动命令直接粘贴，支持 # 注释行与反斜杠续行。<br>
-          默认「单机 / 分布式」；<b>若命令里出现 disaggregation / kv-transfer-config 等 PD 参数，会自动切到「PD 分离」</b>，
-          需分别填写 prefill、decode（router 可选）。
+          <b>可选列</b>：<code>Image Count</code>、<code>Video Count</code>、<code>Image Resolution</code>
+          （缺失则整列记为 N/A，且不与有值的行对齐；Video Count 目前仅支持 0）。
+          其他指标列名会自动映射到 to_csv.py 规范 schema。Excel <b>仅支持单个 sheet</b>。<br>
+          默认「单机 / 分布式」；若命令里出现 PD 参数会自动切到「PD 分离」。
         </div>
 
-        <input type="hidden" name="benchmark_kind" value="text">
+        <input type="hidden" name="benchmark_kind" value="vlm">
         <div class="field">
           <label>结果 CSV / Excel <span class="req">*</span></label>
           <div class="filebox">
@@ -163,8 +162,8 @@
           <b>bench 框架</b>与上面的 server 框架相互独立（sglang bench 可打 vllm server，反之亦然）。
           上传 CSV 后会按 spec decoding 列是否有值<b>自动识别</b>：仅 vLLM 列有值→vllm，仅 SGLang 列有值→sglang；
           两者都有 / 都无则需手选。<br>
-          <b>是否 flush cache</b> 无法从 CSV 推断，必须手动选择（flush=冷启动无前缀命中，不 flush=复用缓存，结果差异大）。
-          <code>Prefix Rate</code> 已下沉为 CSV 行键，请写在表格里；本表单不再单独填写。
+          <b>是否 flush cache</b> 无法从 CSV 推断，必须手动选择。
+          图像数量 / 分辨率等请写在 CSV 行键列里；本表单不再单独填写。
         </div>
         <div class="grid">
           <div class="field">

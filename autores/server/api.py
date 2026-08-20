@@ -20,6 +20,7 @@ _FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__f
                              "frontend")
 _FRONTEND = os.path.join(_FRONTEND_DIR, "index.html")
 _UPLOAD_PAGE = os.path.join(_FRONTEND_DIR, "upload.html")
+_UPLOAD_VLM_PAGE = os.path.join(_FRONTEND_DIR, "upload_vlm.html")
 
 
 def _sse(event: dict) -> str:
@@ -85,8 +86,14 @@ async def chat(request: Request):
 
 @router.get("/upload")
 def upload_page():
-    """手工上传子页面（CSV + 启动命令文本）。"""
+    """手工上传子页面（文本压测 CSV + 启动命令文本）。"""
     return FileResponse(_UPLOAD_PAGE, media_type="text/html")
+
+
+@router.get("/upload/vlm")
+def upload_vlm_page():
+    """VLM 多模态压测手工上传子页面。"""
+    return FileResponse(_UPLOAD_VLM_PAGE, media_type="text/html")
 
 
 @router.get("/api/upload/options")
@@ -98,6 +105,7 @@ def upload_options():
         "gpu_types": upload_mod.supported_gpu_types(),
         "router_policies": launch_params.router_policies(),
         "transfer_backends": launch_params.transfer_backends(),
+        "benchmark_kinds": ["text", "vlm"],
     })
 
 
@@ -142,7 +150,7 @@ async def upload_run(
     model_version: str = Form(""),
     bench_framework: str = Form(...),
     bench_flush_cache: str = Form(...),
-    prefix_rate: str = Form(...),
+    benchmark_kind: str = Form("text"),
     deployment_mode: str = Form("colocated"),
     launch_cmd: str = Form(""),
     prefill_cmd: str = Form(""),
@@ -163,7 +171,7 @@ async def upload_run(
         "gpu_type": gpu_type,
         "bench_framework": bench_framework,
         "bench_flush_cache": bench_flush_cache,
-        "prefix_rate": prefix_rate,
+        "benchmark_kind": benchmark_kind,
     }
     try:
         csv_bytes = await csv_file.read()
@@ -175,6 +183,7 @@ async def upload_run(
             prefill_text=prefill_cmd,
             decode_text=decode_cmd,
             router_text=router_cmd,
+            benchmark_kind=benchmark_kind,
         )
     except UploadError as e:
         log.info("上传校验失败", extra={"fields": {"error": str(e)}})
@@ -188,7 +197,8 @@ async def upload_run(
         return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
 
     log.info("上传入库成功", extra={"fields": {
-        "run_id": summary["run_id"], "metrics": summary["num_metrics"]}})
+        "run_id": summary["run_id"], "metrics": summary["num_metrics"],
+        "kind": summary.get("benchmark_kind")}})
     return JSONResponse(summary)
 
 

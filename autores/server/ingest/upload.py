@@ -221,16 +221,23 @@ def read_upload_table(raw: bytes) -> tuple[list[str], list[dict]]:
     return fieldnames, rows
 
 
-def _build_metrics(fieldnames: list[str], rows: list[dict]) -> list[dict]:
+def _build_metrics(fieldnames: list[str], rows: list[dict],
+                   kind: str | None = None) -> list[dict]:
     """
     表头 + 行数据 → metric 记录列表（CSV / Excel 共用）。
     表头会 remap 到 to_csv.py 规范列名；列名归一与数值转换与 scanner 一致。
+    硬必填只有 Input_Length / Concurrency；其余行键缺列填 None。
     """
+    import re
+
+    bk = schema.resolve_kind(kind).name
+    dim_keys = set(schema.metric_dimension_keys(bk))
+
     if not fieldnames:
         raise UploadError("表格无表头")
 
     header_map = build_header_map(list(fieldnames))
-    missing = check_required_dimensions(header_map)
+    missing = check_required_dimensions(header_map, bk)
     if missing:
         raw_headers = [str(h).strip() for h in fieldnames
                        if h is not None and str(h).strip()]
@@ -243,6 +250,7 @@ def _build_metrics(fieldnames: list[str], rows: list[dict]) -> list[dict]:
     if remapped:
         log.info("表格列名已自动映射", extra={"fields": {"mapping": remapped}})
 
+    res_re = re.compile(r"^\d+x\d+$", re.IGNORECASE)
     metrics: list[dict] = []
     for lineno, row in enumerate(rows, start=2):
         record: dict = {}
@@ -255,11 +263,26 @@ def _build_metrics(fieldnames: list[str], rows: list[dict]) -> list[dict]:
             canon = header_map.get(col)
             if canon is None:
                 continue
-            key = canon.lower() if canon in schema.METRIC_DIMENSION_KEYS else canon
+            key = canon.lower() if canon in dim_keys else canon
             record[key] = _to_number(raw.strip() if isinstance(raw, str) else raw)
         for dim in ("input_length", "concurrency"):
             if record.get(dim) is None:
                 raise UploadError(f"表格第 {lineno} 行的 {dim} 为空或非数值")
+        # Image_Resolution 有值时校验格式
+        res = record.get("image_resolution")
+        if res is not None and not res_re.match(str(res)):
+            raise UploadError(
+                f"表格第 {lineno} 行的 Image_Resolution 格式非法（需 HxW，如 720x1280）：{res}")
+        # Video_Count 有值且非 0 时报错（保留字段）
+        vc = record.get("video_count")
+        if vc is not None:
+            try:
+                if float(vc) != 0:
+                    raise UploadError(
+                        f"表格第 {lineno} 行 Video_Count={vc}：当前不支持视频，请填 0 或不填")
+            except (TypeError, ValueError):
+                raise UploadError(
+                    f"表格第 {lineno} 行 Video_Count 非数值：{vc}") from None
         metrics.append(record)
 
     if not metrics:
@@ -267,10 +290,10 @@ def _build_metrics(fieldnames: list[str], rows: list[dict]) -> list[dict]:
     return metrics
 
 
-def parse_table(raw: bytes) -> list[dict]:
+def parse_table(raw: bytes, kind: str | None = None) -> list[dict]:
     """上传文件字节 → metric 记录列表（自动识别 CSV / xlsx）。"""
     fieldnames, rows = read_upload_table(raw)
-    return _build_metrics(fieldnames, rows)
+    return _build_metrics(fieldnames, rows, kind)
 
 
 def detect_bench_framework(csv_bytes: bytes) -> dict:
@@ -371,24 +394,13 @@ def validate_meta(form: dict) -> dict:
         raise UploadError("请手动勾选压测前是否 flush cache（bench_flush_cache 必填，无法从 CSV 推断）")
     meta["bench_flush_cache"] = flush
 
-    # prefix_rate 必填：本次压测共享前缀占输入长度的比例（0~1），与 input_length/concurrency
-    # 同为可比对轴，无法从 CSV 推断，需用户填写。
-    meta["prefix_rate"] = _parse_prefix_rate(form.get("prefix_rate"))
-    return meta
-
-
-def _parse_prefix_rate(raw) -> float:
-    """校验并解析共享前缀占比：必填、可转 float、取值域 [0, 1)。"""
-    s = ("" if raw is None else str(raw)).strip()
-    if not s:
-        raise UploadError("缺少必填字段: prefix_rate（本次压测共享前缀占输入长度的比例，0~1）")
+    # benchmark_kind：表单或隐藏字段；缺省 text
+    raw_kind = (form.get("benchmark_kind") or "").strip() or schema.DEFAULT_BENCH_KIND
     try:
-        val = float(s)
-    except ValueError:
-        raise UploadError(f"prefix_rate 必须是数字（0~1），收到: {s}") from None
-    if not (0.0 <= val < 1.0):
-        raise UploadError(f"prefix_rate 必须在 [0, 1) 之间，收到: {val}")
-    return val
+        meta["benchmark_kind"] = schema.resolve_kind(raw_kind).name
+    except ValueError as e:
+        raise UploadError(str(e)) from e
+    return meta
 
 
 def resolve_launch_text(launch_text: str | None) -> str:
@@ -472,6 +484,7 @@ def ingest(
     prefill_text: str | None = None,
     decode_text: str | None = None,
     router_text: str | None = None,
+    benchmark_kind: str | None = None,
 ) -> dict:
     """
     完整上传流程：校验 → 解析 → 落盘 → 扫描入库。
@@ -484,8 +497,14 @@ def ingest(
     if deployment_mode not in ("colocated", "pd_disagg"):
         raise UploadError(f"deployment_mode 非法: {deployment_mode}")
 
+    # 表单可带 benchmark_kind；参数优先
+    if benchmark_kind:
+        meta_form = dict(meta_form)
+        meta_form["benchmark_kind"] = benchmark_kind
+
     meta = validate_meta(meta_form)
-    metrics = parse_table(csv_bytes)  # 自动识别 CSV / .xlsx
+    kind = meta["benchmark_kind"]
+    metrics = parse_table(csv_bytes, kind)
 
     extra: dict = {"ingest_source": "manual_upload"}
 
@@ -513,7 +532,7 @@ def ingest(
     try:
         dir_name, dir_path = persist.persist_upload(
             benchmark_root, db, now, meta, metrics, launch_cmd, params, extra,
-            deployment_mode=deployment_mode, pd=pd_block,
+            deployment_mode=deployment_mode, pd=pd_block, benchmark_kind=kind,
         )
     except persist.PersistError as e:
         raise UploadError(str(e)) from e
@@ -521,14 +540,15 @@ def ingest(
     from autores.scanner.main import scan_once
 
     pending, ok, fail = scan_once(db, benchmark_root, dir_pattern)
-    runs = db.fetch_runs("run_id = ?", [dir_name])
+    runs = db.fetch_runs("run_id = ?", [dir_name], kind=kind)
     if not runs:
         raise UploadError(
             f"已落盘至 {dir_path}，但扫描入库失败（pending={pending}, ok={ok}, fail={fail}）"
         )
     doc = runs[0]
     log.info("上传落盘并扫描入库", extra={"fields": {
-        "dir": dir_path, "run_id": doc["_id"], "deployment_mode": deployment_mode}})
+        "dir": dir_path, "run_id": doc["_id"], "deployment_mode": deployment_mode,
+        "kind": kind}})
 
     summary = {
         "run_id": doc["_id"],
@@ -536,6 +556,7 @@ def ingest(
         "disk_path": dir_path,
         "num_metrics": len(doc["metrics"]),
         "deployment_mode": deployment_mode,
+        "benchmark_kind": kind,
         "gpu_count": doc.get("gpu_count"),
         "launch_cmd": doc["launch_cmd"],
     }

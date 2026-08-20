@@ -3,7 +3,8 @@ QuerySpec → SQLite 查询（design.md §7.3、§7.4 步骤 1-2）。
 
 QuerySpec 结构：
 {
-  "compare_on": "gpu_type",                 # 对比轴（单个维度）
+  "benchmark_kind": "text",                 # text | vlm
+  "compare_on": "gpu_type",                 # 对比轴（单个 run 级维度）
   "filters": {"model": "GLM-4.5", "tp": 8}, # 约束项（等值，值可为数组）
   "compare_values": ["H20-141G", "H800"],   # 可选：对比轴目标值
   "exclude": {"gpu_type": ["H20-96G"]},      # 可选：排除项
@@ -32,6 +33,7 @@ class QuerySpec:
     metrics: list[str] | None = None
     metric_filters: dict[str, list[Any]] = field(default_factory=dict)
     normalize_gpu_scale: bool = True
+    benchmark_kind: str = schema.DEFAULT_BENCH_KIND
 
     @staticmethod
     def from_dict(d: dict) -> "QuerySpec":
@@ -44,21 +46,35 @@ class QuerySpec:
             metrics=d.get("metrics"),
             metric_filters=d.get("metric_filters") or {},
             normalize_gpu_scale=True if raw_scale is None else bool(raw_scale),
+            benchmark_kind=d.get("benchmark_kind") or schema.DEFAULT_BENCH_KIND,
         )
         spec.validate()
         return spec
 
     def validate(self) -> None:
+        try:
+            self.benchmark_kind = schema.resolve_kind(self.benchmark_kind).name
+        except ValueError as e:
+            raise QuerySpecError(str(e)) from e
         if not self.compare_on:
             raise QuerySpecError("compare_on 不能为空")
         if self.compare_on not in schema.ALL_DIMENSIONS:
-            raise QuerySpecError(f"compare_on 非法维度: {self.compare_on}")
+            raise QuerySpecError(
+                f"compare_on 非法维度: {self.compare_on}（行键不能做 compare_on）")
         for dim in list(self.filters) + list(self.exclude):
             if dim not in schema.ALL_DIMENSIONS:
                 raise QuerySpecError(f"未知维度: {dim}")
         if self.compare_on in self.filters:
-            raise QuerySpecError("compare_on 不应同时出现在 filters 中（用 compare_values 指定目标值）")
+            raise QuerySpecError(
+                "compare_on 不应同时出现在 filters 中（用 compare_values 指定目标值）")
         # 注意：compare_on 允许出现在 exclude 中——即"在该轴上对比、但排除某些取值"（D21）。
+        # metric_filters 键校验：允许 kind 对应的行键
+        allowed_metric = set(schema.metric_dims(self.benchmark_kind))
+        for key in self.metric_filters:
+            if key not in allowed_metric:
+                raise QuerySpecError(
+                    f"metric_filters 非法键: {key}；"
+                    f"当前 kind={self.benchmark_kind} 可用: {sorted(allowed_metric)}")
 
 
 def build_conditions(filters: dict, exclude: dict | None = None) -> tuple[str, list]:
@@ -108,4 +124,4 @@ def build_where(spec: QuerySpec) -> tuple[str, list]:
 def run_query(db, spec: QuerySpec) -> list[dict]:
     """执行查询，返回匹配的测试记录（文档形态，含 metrics）。"""
     where_sql, params = build_where(spec)
-    return db.fetch_runs(where_sql, params)
+    return db.fetch_runs(where_sql, params, kind=spec.benchmark_kind)

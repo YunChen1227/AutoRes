@@ -126,7 +126,11 @@ TOOL_DEFINITIONS = [
                     },
                     "metric_filters": {
                         "type": "object",
-                        "description": "可选：按 input_length / concurrency 进一步筛选，值为数组",
+                        "description": (
+                            "可选：按 metric 行键进一步筛选（text: input_length/"
+                            "concurrency/prefix_rate；vlm: 另含 image_count/"
+                            "video_count/image_resolution），值为数组"
+                        ),
                     },
                     "normalize_gpu_scale": {
                         "type": "boolean",
@@ -218,12 +222,31 @@ TOOL_DEFINITIONS = [
 
 # ── 工具实现 ──
 
-def summarize_reports(db, filters: dict | None = None) -> dict:
+_BK_PROP = {
+    "type": "string",
+    "enum": list(schema.BENCH_KIND_CHOICES),
+    "description": "压测类型 text|vlm，默认 text；决定查哪张表与行键集合",
+}
+
+
+def _inject_benchmark_kind_into_defs() -> None:
+    """给每个带 parameters.properties 的工具补上 benchmark_kind。"""
+    for tool in TOOL_DEFINITIONS:
+        props = tool["function"]["parameters"].setdefault("properties", {})
+        props.setdefault("benchmark_kind", _BK_PROP)
+
+
+_inject_benchmark_kind_into_defs()
+
+
+def summarize_reports(db, filters: dict | None = None,
+                      benchmark_kind: str | None = None) -> dict:
     """按显卡×模型盘点报告数量（忽略框架版本/参数等细节）。"""
+    kind = schema.resolve_kind(benchmark_kind).name
     valid_filters = {k: v for k, v in (filters or {}).items()
                      if k in schema.ALL_DIMENSIONS}
     where_sql, params = build_conditions(valid_filters)
-    grouped = db.group_counts(["gpu_type", "model"], where_sql, params)
+    grouped = db.group_counts(["gpu_type", "model"], where_sql, params, kind=kind)
 
     by_gpu: dict = {}
     for row in grouped:
@@ -236,30 +259,47 @@ def summarize_reports(db, filters: dict | None = None) -> dict:
     return {
         "total_reports": sum(e["total"] for e in gpus),
         "by_gpu": gpus,
+        "benchmark_kind": kind,
     }
 
 
-def list_dimension_values(db, dimension: str, filters: dict | None = None) -> dict:
+def list_dimension_values(db, dimension: str, filters: dict | None = None,
+                          benchmark_kind: str | None = None) -> dict:
+    kind = schema.resolve_kind(benchmark_kind).name
+    # dimension=None / 特殊值 → 返回两组维度
+    if dimension in (None, "", "all", "*"):
+        return {
+            "benchmark_kind": kind,
+            "run_dimensions": list(schema.ALL_DIMENSIONS),
+            "metric_dimensions": list(schema.metric_dims(kind)),
+        }
     if dimension not in schema.ALL_DIMENSIONS:
-        return {"error": f"未知维度: {dimension}", "valid_dimensions": schema.ALL_DIMENSIONS}
+        return {
+            "error": f"未知维度: {dimension}",
+            "valid_dimensions": list(schema.ALL_DIMENSIONS),
+            "metric_dimensions": list(schema.metric_dims(kind)),
+            "benchmark_kind": kind,
+        }
 
     valid_filters = {k: v for k, v in (filters or {}).items()
                      if k in schema.ALL_DIMENSIONS}
     where_sql, params = build_conditions(valid_filters)
-    values = db.dimension_values(dimension, where_sql, params)
-    return {"dimension": dimension, "values": values}
+    values = db.dimension_values(dimension, where_sql, params, kind=kind)
+    return {"dimension": dimension, "values": values, "benchmark_kind": kind}
 
 
-def count_matching_runs(db, filters: dict, exclude: dict | None = None) -> dict:
+def count_matching_runs(db, filters: dict, exclude: dict | None = None,
+                        benchmark_kind: str | None = None) -> dict:
+    kind = schema.resolve_kind(benchmark_kind).name
     for dim in list(filters or {}) + list(exclude or {}):
         if dim not in schema.ALL_DIMENSIONS:
-            return {"error": f"未知维度: {dim}"}
+            return {"error": f"未知维度: {dim}", "benchmark_kind": kind}
 
     where_sql, params = build_conditions(filters or {}, exclude)
-    count = db.count_runs(where_sql, params)
-    result: dict = {"count": count}
+    count = db.count_runs(where_sql, params, kind=kind)
+    result: dict = {"count": count, "benchmark_kind": kind}
     if 0 < count <= 20:
-        docs = db.fetch_runs(where_sql, params)
+        docs = db.fetch_runs(where_sql, params, kind=kind)
         result["runs"] = [
             {
                 "_id": d["_id"],
@@ -298,6 +338,7 @@ def analyze_saturation(db, args: dict | None = None) -> dict:
         "run_id": args.get("run_id") or None,
         "slo": slo,
         "include_points": bool(args.get("include_points", False)),
+        "benchmark_kind": args.get("benchmark_kind"),
     }
     if args.get("plateau_gain") is not None:
         kwargs["plateau_gain"] = float(args["plateau_gain"])

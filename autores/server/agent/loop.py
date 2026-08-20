@@ -142,15 +142,18 @@ class Agent:
 
     def _dispatch_tool(self, name: str, args: dict) -> tuple[dict, dict | None]:
         if name == "summarize_reports":
-            return agent_tools.summarize_reports(self.db, args.get("filters")), None
+            return agent_tools.summarize_reports(
+                self.db, args.get("filters"), args.get("benchmark_kind")), None
 
         if name == "list_dimension_values":
             return agent_tools.list_dimension_values(
-                self.db, args.get("dimension"), args.get("filters")), None
+                self.db, args.get("dimension"), args.get("filters"),
+                args.get("benchmark_kind")), None
 
         if name == "count_matching_runs":
             return agent_tools.count_matching_runs(
-                self.db, args.get("filters", {}), args.get("exclude")), None
+                self.db, args.get("filters", {}), args.get("exclude"),
+                args.get("benchmark_kind")), None
 
         if name == "analyze_saturation":
             return agent_tools.analyze_saturation(self.db, args), None
@@ -168,6 +171,7 @@ class Agent:
                 "num_metric_rows": result.num_metric_rows,
                 "columns": result.column_labels,
                 "notes": result.notes,
+                "benchmark_kind": getattr(spec, "benchmark_kind", "text"),
             }
             report_event = {
                 "type": "report",

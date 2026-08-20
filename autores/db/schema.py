@@ -1,7 +1,12 @@
 """
 SQLite 表结构定义与共享常量（design.md §6）。
 
-test_runs 表：一次测试 = 一行。
+两套 bench kind，表列结构相同，metric 行键不同：
+  text → test_runs      行键 Input_Length / Concurrency / Prefix_Rate
+  vlm  → vlm_test_runs  行键 Input_Length / Concurrency / Image_Count /
+                           Video_Count / Image_Resolution
+
+一次测试 = 一行（run 级维度为表列；场景维度在 metrics JSON 数组里）。
   run_id            : TEXT PRIMARY KEY（= timestamp 目录名，天然唯一/幂等）
   run_timestamp     : TEXT（ISO 8601）
   model / model_version / framework / framework_version / gpu_type / launch_cmd : TEXT
@@ -11,7 +16,7 @@ test_runs 表：一次测试 = 一行。
   decode_<param>    : PD 分离时 decode 实例的同名参数（非 PD 记录为 NULL）
   pd_transfer_backend / router_*  : PD 专属（传输后端、路由策略）
   extra             : TEXT（JSON，框架专属细节 + 未识别参数 + PD 原文/长尾字段）
-  metrics           : TEXT（JSON 数组，每个 (input_length, concurrency) 组合一条）
+  metrics           : TEXT（JSON 数组，每个场景行键组合一条）
   created_at        : TEXT（ISO 8601）
 
   单行存储约定（D22，用户确认）：
@@ -24,9 +29,10 @@ ingest_log 表：已入库目录台账。
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 
-# ── 元信息维度（test_runs 直接列）──
+# ── 元信息维度（表直接列）──
 META_DIMENSIONS = [
     "model",
     "model_version",
@@ -83,22 +89,17 @@ PARAM_DIMENSIONS = [name for name, _t, _b in _PARAM_SPECS]
 _PARAM_SQL_TYPE = {name: t for name, t, _b in _PARAM_SPECS}
 _BASE_BOOL = {name for name, _t, b in _PARAM_SPECS if b}
 
-# ── bench（压测）相关维度 ──
+# ── bench（压测）相关 run 级维度 ──
 #
 # 与 launch 参数不同：这些描述的是"压测本身"，会影响结果、必须作为对比轴区分。
 #   bench_framework   : 压测工具框架（sglang / vllm）。可与 server 侧 framework 不同
 #                       （sglang bench 能打 vllm server，反之亦然，共 4 种组合）。
 #   bench_flush_cache : 压测前是否清空 server KV 缓存（bool）。
 #                       flush=冷启动无前缀命中；不 flush=复用缓存，两者结果差异大。
-#   prefix_rate       : 本次压测共享前缀占输入长度的比例（0~1，REAL）。
-#                       真实前缀长度 = round(input_length * prefix_rate)，
-#                       与 input_length / concurrency 同为可比对轴。
-#                       老数据无此字段 → 默认 0（无前缀）。
-# 前三者在入库/上传两条流里都是"必填"，但列本身可空/可缺省，方便老数据迁移。
+# prefix_rate 已下沉为 metric 行键（仅 text kind），不再是表列。
 _BENCH_SPECS = [
     ("bench_framework", "TEXT", False),
     ("bench_flush_cache", "INTEGER", True),
-    ("prefix_rate", "REAL", False),
 ]
 BENCH_DIMENSIONS = [name for name, _t, _b in _BENCH_SPECS]
 _BENCH_SQL_TYPE = {name: t for name, t, _b in _BENCH_SPECS}
@@ -145,20 +146,77 @@ def is_bool_dim(dim: str) -> bool:
     return base in _BASE_BOOL or base in _BENCH_BOOL
 
 
-# Agent 可用于对比/筛选的维度（design.md §7.2 list_dimension_values 枚举）。
-# 加入 deployment_mode 作为"单机分布式 vs PD"的对比轴；prefill_/decode_/router_ 明细
-# 已作为物理列存储与展示，如需让 Agent 直接对比可后续追加到此列表。
+# Agent 可用于对比/筛选的 run 级维度（design.md §7.2 list_dimension_values 枚举）。
+# 行键（metric 维度）不在此列表——只能进 metric_filters，不能做 compare_on。
 ALL_DIMENSIONS = (META_DIMENSIONS + PARAM_DIMENSIONS
                   + ["deployment_mode"] + BENCH_DIMENSIONS)
 
-# 指标里的两个"维度列"（不是性能数值，而是测试条件）
-METRIC_DIMENSION_KEYS = ["Input_Length", "Concurrency"]
+# 硬必填的 metric 行键（两个 kind 共用）；其余行键缺列填 N/A。
+REQUIRED_METRIC_DIMENSION_KEYS = ("Input_Length", "Concurrency")
 
-# ── metadata.json 顶层字段 ↔ test_runs 直接列（to_csv / upload / parser 共用）──
+# 兼容旧代码：默认按 text kind 的行键；新代码请用 metric_dimension_keys(kind)。
+METRIC_DIMENSION_KEYS = ["Input_Length", "Concurrency", "Prefix_Rate"]
+
+
+# ── BenchKind 注册表 ──
+
+@dataclass(frozen=True)
+class BenchKind:
+    """一种压测类型：独立表 + 独立 metric 行键。"""
+    name: str
+    table: str
+    metric_dimension_keys: tuple[str, ...]
+
+
+BENCH_KINDS: dict[str, BenchKind] = {
+    "text": BenchKind(
+        name="text",
+        table="test_runs",
+        metric_dimension_keys=("Input_Length", "Concurrency", "Prefix_Rate"),
+    ),
+    "vlm": BenchKind(
+        name="vlm",
+        table="vlm_test_runs",
+        metric_dimension_keys=(
+            "Input_Length", "Concurrency",
+            "Image_Count", "Video_Count", "Image_Resolution",
+        ),
+    ),
+}
+
+DEFAULT_BENCH_KIND = "text"
+BENCH_KIND_CHOICES: tuple[str, ...] = tuple(BENCH_KINDS.keys())
+
+
+def resolve_kind(kind: str | None) -> BenchKind:
+    """校验并返回 BenchKind；None / 空串 → text。"""
+    name = (kind or DEFAULT_BENCH_KIND).strip().lower()
+    if name not in BENCH_KINDS:
+        raise ValueError(
+            f"未知 benchmark_kind: {kind!r}；可选: {list(BENCH_KINDS)}")
+    return BENCH_KINDS[name]
+
+
+def table_for(kind: str | None = None) -> str:
+    return resolve_kind(kind).table
+
+
+def metric_dimension_keys(kind: str | None = None) -> tuple[str, ...]:
+    """CSV / 表头用的规范列名（Pascal_Case）。"""
+    return resolve_kind(kind).metric_dimension_keys
+
+
+def metric_dims(kind: str | None = None) -> tuple[str, ...]:
+    """metrics JSON 里的小写键名。"""
+    return tuple(k.lower() for k in metric_dimension_keys(kind))
+
+
+# ── metadata.json 顶层字段 ↔ 表直接列（to_csv / upload / parser 共用）──
 #
-# 仅列「用户/脚本提供、入库为 test_runs 直接列」的键；params/extra/metrics 等
+# 仅列「用户/脚本提供、入库为直接列」的键；params/extra/metrics 等
 # 由 launch_cmd 解析或 bench 输出派生，不在此清单。
 # CLI 名 = 字段名把 _ 换成 -（argparse 惯例），如 model_version → --model-version。
+# benchmark_kind 写入 metadata.json，但不作为表列（由 Scanner 路由到哪张表）。
 METADATA_DIRECT_FIELDS: tuple[str, ...] = (
     "model",
     "model_version",       # DB NOT NULL，但允许空串；upload 不要求用户填写
@@ -169,7 +227,7 @@ METADATA_DIRECT_FIELDS: tuple[str, ...] = (
     "deployment_mode",     # 默认 colocated
     "bench_framework",
     "bench_flush_cache",
-    "prefix_rate",         # 共享前缀占比（0~1）；老数据缺省 0
+    "benchmark_kind",      # text | vlm；路由到哪张表，非表列
 )
 
 # to_csv.py / 上传入库时用户必须提供的 metadata 字段（model_version 可缺省为空串）
@@ -185,20 +243,17 @@ METADATA_REQUIRED: frozenset[str] = frozenset({
 })
 
 # to_csv.py 可选 metadata 字段 → 默认值
-# prefix_rate 在 to_csv/上传两条流里都强制必填（各自单独校验），此处的默认值只用于
-# 「老目录 metadata.json 缺该字段时」的兜底（persist.build_metadata / parser 读取），
-# 与用户要求「旧数据默认 0」一致。
 METADATA_OPTIONAL_DEFAULTS: dict[str, object] = {
     "model_version": "",
     "deployment_mode": "colocated",
-    "prefix_rate": 0.0,
+    "benchmark_kind": DEFAULT_BENCH_KIND,
 }
 
 # server / bench 框架 CLI 可选值（与 launch_params.supported_frameworks 对齐）
 FRAMEWORK_CHOICES: tuple[str, ...] = ("sglang", "vllm", "vllm-ascend")
 
 
-# ── test_runs 列清单（DDL 与迁移共用同一份定义）──
+# ── 表列清单（DDL 与迁移共用同一份定义；两张表列结构完全相同）──
 def _test_runs_columns() -> list[tuple[str, str]]:
     """返回 [(列名, 完整 SQL 类型定义)]，顺序即建表顺序。"""
     cols: list[tuple[str, str]] = [
@@ -243,6 +298,9 @@ DDL_TABLES = f"""
 CREATE TABLE IF NOT EXISTS test_runs (
     {_COLUMN_DEFS}
 );
+CREATE TABLE IF NOT EXISTS vlm_test_runs (
+    {_COLUMN_DEFS}
+);
 CREATE TABLE IF NOT EXISTS ingest_log (
     source_dir  TEXT PRIMARY KEY,
     run_id      TEXT,
@@ -257,6 +315,12 @@ CREATE INDEX IF NOT EXISTS idx_test_runs_parallel
     ON test_runs (tp, pp, dp, dcp, ep_enabled);
 CREATE INDEX IF NOT EXISTS idx_test_runs_deployment
     ON test_runs (deployment_mode);
+CREATE INDEX IF NOT EXISTS idx_vlm_test_runs_dims
+    ON vlm_test_runs (model, framework, framework_version, gpu_type);
+CREATE INDEX IF NOT EXISTS idx_vlm_test_runs_parallel
+    ON vlm_test_runs (tp, pp, dp, dcp, ep_enabled);
+CREATE INDEX IF NOT EXISTS idx_vlm_test_runs_deployment
+    ON vlm_test_runs (deployment_mode);
 """
 
 DDL = DDL_TABLES + DDL_INDEXES
@@ -264,24 +328,26 @@ DDL = DDL_TABLES + DDL_INDEXES
 
 def migrate(conn) -> None:
     """
-    对已存在的 test_runs 表补齐缺失列（新增 PD 相关列时用）。
+    对已存在的 test_runs / vlm_test_runs 表补齐缺失列。
     仅做 ADD COLUMN（可空或带默认值），不改动/删除既有列，安全幂等。
+    不做数据回填（prefix_rate 等已下沉到 metrics，库无旧数据）。
     """
-    existing = {r[1] for r in conn.execute("PRAGMA table_info(test_runs)").fetchall()}
-    if not existing:
-        return  # 表还不存在，DDL 会负责创建
-    for name, sqltype in TEST_RUNS_COLUMNS:
-        if name in existing:
-            continue
-        # 迁移时不能带 PRIMARY KEY / 无默认的 NOT NULL；这些列都是后加的可空/带默认列
-        add_type = sqltype
-        if "PRIMARY KEY" in add_type:
-            continue
-        conn.execute(f"ALTER TABLE test_runs ADD COLUMN {name} {add_type}")
+    for table in ("test_runs", "vlm_test_runs"):
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not existing:
+            continue  # 表还不存在，DDL 会负责创建
+        for name, sqltype in TEST_RUNS_COLUMNS:
+            if name in existing:
+                continue
+            # 迁移时不能带 PRIMARY KEY / 无默认的 NOT NULL；这些列都是后加的可空/带默认列
+            add_type = sqltype
+            if "PRIMARY KEY" in add_type:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {add_type}")
 
 
 def dimension_column(dimension: str) -> str:
-    """维度名 → 列名。所有维度都是 test_runs 的直接列；非法维度抛 ValueError。"""
+    """维度名 → 列名。所有 run 级维度都是表的直接列；非法维度抛 ValueError。"""
     if dimension not in ALL_DIMENSIONS:
         raise ValueError(f"未知维度: {dimension}")
     return dimension
@@ -311,8 +377,9 @@ def _rget(row, key, default=None):
         return default
 
 
-def doc_to_row(doc: dict) -> dict:
-    """入库文档（parser 产出的 dict 形态）→ 表行。"""
+def doc_to_row(doc: dict, kind: str | None = None) -> dict:
+    """入库文档（parser 产出的 dict 形态）→ 表行。kind 仅用于校验，不写入表列。"""
+    resolve_kind(kind or doc.get("benchmark_kind"))
     deployment = doc.get("deployment_mode", "colocated")
     params = doc.get("params") or {}
     pd = doc.get("pd") or {}
@@ -333,8 +400,6 @@ def doc_to_row(doc: dict) -> dict:
         "deployment_mode": deployment,
         "bench_framework": doc.get("bench_framework"),
         "bench_flush_cache": _store_val("bench_flush_cache", doc.get("bench_flush_cache")),
-        # prefix_rate 为 REAL，非布尔；老数据缺失记 0（无前缀）
-        "prefix_rate": doc.get("prefix_rate") if doc.get("prefix_rate") is not None else 0,
         "gpu_count": doc.get("gpu_count") or extra_raw.get("gpu_count"),
         "prefill_gpu_count": doc.get("prefill_gpu_count"),
         "decode_gpu_count": doc.get("decode_gpu_count"),
@@ -353,8 +418,9 @@ def doc_to_row(doc: dict) -> dict:
     return row
 
 
-def row_to_doc(row) -> dict:
+def row_to_doc(row, kind: str | None = None) -> dict:
     """表行（sqlite3.Row）→ 文档形态（下游对齐/工具层统一消费的 dict 结构）。"""
+    bk = resolve_kind(kind).name
     deployment = _rget(row, "deployment_mode", "colocated") or "colocated"
     params = {dim: _load_val(dim, row[dim]) for dim in PARAM_DIMENSIONS}
     extra = json.loads(row["extra"]) if _rget(row, "extra") else {}
@@ -371,8 +437,7 @@ def row_to_doc(row) -> dict:
         "deployment_mode": deployment,
         "bench_framework": _rget(row, "bench_framework"),
         "bench_flush_cache": _load_val("bench_flush_cache", _rget(row, "bench_flush_cache")),
-        # 迁移后老行该列为 NULL → 读出统一还原为 0（无前缀）
-        "prefix_rate": _rget(row, "prefix_rate") if _rget(row, "prefix_rate") is not None else 0,
+        "benchmark_kind": bk,
         "gpu_count": _rget(row, "gpu_count"),
         "prefill_gpu_count": _rget(row, "prefill_gpu_count"),
         "decode_gpu_count": _rget(row, "decode_gpu_count"),

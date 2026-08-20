@@ -26,7 +26,7 @@ def generate_report(db, spec: QuerySpec, output_dir: str) -> ReportResult:
             column_labels=[], notes={}, empty=True,
         )
 
-    docs = align.take_latest(docs)
+    docs = align.merge_duplicates(docs, kind=spec.benchmark_kind)
 
     gpu_scaled = False
     if spec.normalize_gpu_scale:
@@ -38,6 +38,7 @@ def generate_report(db, spec: QuerySpec, output_dir: str) -> ReportResult:
         metrics=spec.metrics,
         metric_filters=spec.metric_filters,
         gpu_scaled=gpu_scaled,
+        kind=spec.benchmark_kind,
     )
     path = excel.render_comparison(table, spec.compare_on, output_dir)
 

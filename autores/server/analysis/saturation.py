@@ -1,11 +1,11 @@
 """
 性能饱和点（hardware wall）分析。
 
-从 test_runs.metrics 按 input_length 分组，检测吞吐平台 / 延迟膝点 /
+从 metrics 按「除 concurrency 外全部行键」分组，检测吞吐平台 / 延迟膝点 /
 简化 Kneedle / USL N* / SLO 上限；供 chatbot、MCP、CLI 共用。
 
-指标键与入库规范一致：维度小写 input_length/concurrency，其余为
-CANONICAL_COLUMNS（Output_Throughput、ITL_P95(ms) 等）。
+指标键与入库规范一致：维度小写（input_length/concurrency/prefix_rate/...），
+其余为 CANONICAL_COLUMNS（Output_Throughput、ITL_P95(ms) 等）。
 文档形态与 schema.row_to_doc 一致（_id、嵌套 params）。
 """
 from __future__ import annotations
@@ -141,7 +141,34 @@ def simplified_kneedle(xs: list[float], ys: list[float]) -> int | None:
 # 分组与检测器
 # ══════════════════════════════════════════════════════════════════════
 
+def group_by_condition(
+    metrics: list[dict],
+    kind: str | None = None,
+) -> dict[tuple, list[dict]]:
+    """
+    按「除 concurrency 外全部 metric 行键」分组；组内按 concurrency 升序。
+    返回 {condition_tuple: [metric, ...]}，condition_tuple 与 group_dim_keys 对齐。
+    """
+    bk = schema.resolve_kind(kind).name
+    group_keys = [d for d in schema.metric_dims(bk) if d != "concurrency"]
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for m in metrics:
+        cc = _num(m.get("concurrency"))
+        if cc is None:
+            continue
+        cond = tuple(m.get(d) for d in group_keys)
+        # input_length 仍要求 >0（若存在）
+        il = _num(m.get("input_length"))
+        if il is not None and il <= 0:
+            continue
+        groups[cond].append(m)
+    for cond in groups:
+        groups[cond].sort(key=lambda r: _num(r.get("concurrency")) or 0)
+    return dict(sorted(groups.items(), key=lambda kv: str(kv[0])))
+
+
 def group_by_input_length(metrics: list[dict]) -> dict[float, list[dict]]:
+    """兼容旧接口：仅按 input_length 分组（等价于 text kind 且忽略 prefix_rate）。"""
     groups: dict[float, list[dict]] = defaultdict(list)
     for m in metrics:
         il = _num(m.get("input_length"))
@@ -172,8 +199,9 @@ class PointTrace:
 
 
 @dataclass
-class LengthAnalysis:
-    input_length: float
+class ConditionAnalysis:
+    """一个场景条件（除 concurrency 外的全部行键）下的饱和分析结果。"""
+    dims: dict[str, Any]
     n_points: int
     points: list[PointTrace]
     plateau_c: float | None = None
@@ -191,9 +219,17 @@ class LengthAnalysis:
     confidence: str = "low"
     notes: list[str] = field(default_factory=list)
 
+    @property
+    def input_length(self) -> Any:
+        return self.dims.get("input_length")
 
-def analyze_length(
-    input_length: float,
+
+# 兼容旧名
+LengthAnalysis = ConditionAnalysis
+
+
+def analyze_condition(
+    dims: dict[str, Any],
     rows: list[dict],
     *,
     plateau_gain: float,
@@ -201,7 +237,7 @@ def analyze_length(
     headroom: float,
     retro_tol: float,
     slo: dict[str, float | None],
-) -> LengthAnalysis:
+) -> ConditionAnalysis:
     traces: list[PointTrace] = []
     base_itl = None
     base_ttft = None
@@ -237,7 +273,7 @@ def analyze_length(
             tpot=tpot, e2e=e2e, completed=completed, littles_L=littles,
         ))
 
-    out = LengthAnalysis(input_length=input_length, n_points=len(traces), points=traces)
+    out = ConditionAnalysis(dims=dict(dims), n_points=len(traces), points=traces)
 
     for t in traces[1:]:
         if t.gain is not None and t.gain < plateau_gain:
@@ -335,7 +371,7 @@ def analyze_length(
     return out
 
 
-def classify_bottleneck(a: LengthAnalysis) -> tuple[str, str]:
+def classify_bottleneck(a: ConditionAnalysis) -> tuple[str, str]:
     notes_extra = []
     comps = [t.completed for t in a.points if t.completed is not None]
     if len(comps) >= 2 and comps[-1] < comps[0] * 0.9:
@@ -425,7 +461,7 @@ def _run_meta(doc: dict) -> dict[str, Any]:
         "deployment_mode": deployment,
         "bench_framework": doc.get("bench_framework"),
         "bench_flush_cache": doc.get("bench_flush_cache"),
-        "prefix_rate": doc.get("prefix_rate") if doc.get("prefix_rate") is not None else 0,
+        "benchmark_kind": doc.get("benchmark_kind") or schema.DEFAULT_BENCH_KIND,
         "tp": tp,
         "dp": dp,
         "pp": pp,
@@ -433,20 +469,34 @@ def _run_meta(doc: dict) -> dict[str, Any]:
     }
 
 
-def analyze_run(doc: dict, **kwargs) -> dict:
-    """分析单条 run（文档形态）；kwargs 传给 analyze_length。"""
+def analyze_run(doc: dict, kind: str | None = None, **kwargs) -> dict:
+    """分析单条 run（文档形态）；kwargs 传给 analyze_condition。"""
+    bk = schema.resolve_kind(kind or doc.get("benchmark_kind")).name
     meta = _run_meta(doc)
-    groups = group_by_input_length(doc.get("metrics") or [])
-    lengths = [
-        analyze_length(il, rows, **kwargs)
-        for il, rows in groups.items()
+    meta["benchmark_kind"] = bk
+    group_keys = [d for d in schema.metric_dims(bk) if d != "concurrency"]
+    groups = group_by_condition(doc.get("metrics") or [], bk)
+    conditions = [
+        analyze_condition(
+            dict(zip(group_keys, cond)),
+            rows,
+            **kwargs,
+        )
+        for cond, rows in groups.items()
     ]
     return {
         **meta,
         "n_metric_rows": len(doc.get("metrics") or []),
-        "n_input_lengths": len(lengths),
-        "by_input_length": lengths,
+        "n_conditions": len(conditions),
+        "n_input_lengths": len(conditions),  # 兼容旧字段
+        "by_condition": conditions,
+        "by_input_length": conditions,  # 兼容旧字段
     }
+
+
+def analyze_length(input_length: float, rows: list[dict], **kwargs) -> ConditionAnalysis:
+    """兼容旧接口。"""
+    return analyze_condition({"input_length": input_length}, rows, **kwargs)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -463,7 +513,8 @@ def _fmt(v: Any, nd: int = 2) -> str:
     return str(v)
 
 
-def _wall_metrics(la: LengthAnalysis) -> tuple[float | None, float | None]:
+
+def _wall_metrics(la: ConditionAnalysis) -> tuple[float | None, float | None]:
     wall_tp = None
     wall_itl = None
     if la.wall_c is None:
@@ -475,6 +526,16 @@ def _wall_metrics(la: LengthAnalysis) -> tuple[float | None, float | None]:
     if under:
         return under[-1].throughput, under[-1].itl
     return wall_tp, wall_itl
+
+
+def _fmt_dims(dims: dict[str, Any]) -> str:
+    parts = []
+    for k, v in dims.items():
+        if v is None:
+            parts.append(f"{k}=N/A")
+        else:
+            parts.append(f"{k}={_fmt(v, 0) if isinstance(v, (int, float)) else v}")
+    return ", ".join(parts) if parts else "(no dims)"
 
 
 def render_markdown(
@@ -502,30 +563,35 @@ def render_markdown(
             f"tp={res.get('tp')} dp={res.get('dp')} pp={res.get('pp')}"
         )
         if res.get("gpu_count") is not None:
-            lines.append(f"- gpu_count=`{res.get('gpu_count')}` deployment=`{res.get('deployment_mode')}`")
+            lines.append(
+                f"- gpu_count=`{res.get('gpu_count')}` "
+                f"deployment=`{res.get('deployment_mode')}`"
+            )
         lines.append(
             f"- bench_framework=`{res.get('bench_framework')}` "
             f"flush=`{res.get('bench_flush_cache')}` "
-            f"prefix_rate=`{res.get('prefix_rate')}`"
+            f"kind=`{res.get('benchmark_kind')}`"
         )
+        n_cond = res.get("n_conditions", res.get("n_input_lengths", 0))
         lines.append(
             f"- metrics={res['n_metric_rows']} rows, "
-            f"{res['n_input_lengths']} input_lengths"
+            f"{n_cond} conditions"
         )
         lines.append("")
         lines.append(
-            "| input_length | wall并发 | 推荐运行点 | 峰值吞吐 | "
+            "| condition | wall并发 | 推荐运行点 | 峰值吞吐 | "
             "wall处吞吐 | wall处ITL | USL N* | 瓶颈 | 置信度 |"
         )
         lines.append("|---|---:|---:|---:|---:|---:|---:|---|---|")
 
-        for la in res["by_input_length"]:
+        conditions = res.get("by_condition") or res.get("by_input_length") or []
+        for la in conditions:
             wall_tp, wall_itl = _wall_metrics(la)
             n_star = None
             if la.usl and la.usl.get("ok"):
                 n_star = la.usl.get("n_star")
             lines.append(
-                f"| {_fmt(la.input_length, 0)} | {_fmt(la.wall_c, 1)} | "
+                f"| {_fmt_dims(la.dims)} | {_fmt(la.wall_c, 1)} | "
                 f"{_fmt(la.recommended_c, 1)} | {_fmt(la.peak_tp)} | "
                 f"{_fmt(wall_tp)} | {_fmt(wall_itl)} | {_fmt(n_star, 1)} | "
                 f"{la.bottleneck} | {la.confidence} |"
@@ -534,8 +600,8 @@ def render_markdown(
         lines.append("")
 
         if include_points:
-            for la in res["by_input_length"]:
-                lines.append(f"### input_length = {_fmt(la.input_length, 0)}")
+            for la in conditions:
+                lines.append(f"### {_fmt_dims(la.dims)}")
                 lines.append("")
                 lines.append(
                     f"- candidates: plateau={_fmt(la.plateau_c)} peak={_fmt(la.peak_c)} "
@@ -559,7 +625,7 @@ def render_markdown(
                 lines.append("")
                 lines.append(
                     "| concurrency | throughput | gain | ITL | ITL× | TTFT | TTFT× | "
-                    "Little's L | completed |"
+                    "Little L | completed |"
                 )
                 lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
                 for t in la.points:
@@ -576,9 +642,9 @@ def render_markdown(
                 )
                 lines.append("")
         else:
-            for la in res["by_input_length"]:
+            for la in conditions:
                 lines.append(
-                    f"- **il={_fmt(la.input_length, 0)}**：墙≈c={_fmt(la.wall_c)}；"
+                    f"- **{_fmt_dims(la.dims)}**：墙≈c={_fmt(la.wall_c)}；"
                     f"推荐≤{_fmt(la.recommended_c)}；瓶颈=`{la.bottleneck}`；"
                     f"置信度=`{la.confidence}`"
                     + (f"；notes: {'; '.join(la.notes)}" if la.notes else "")
@@ -595,9 +661,10 @@ def render_markdown(
         lines.append("1. 客户端偏置（GIL）— 见 `client_bias_suspect`")
         lines.append("2. 四指标不定根因 — 结合 params / 监控")
         lines.append("3. 饱和非模型属性 — 勿跨 dataset 混比")
-        lines.append("4. 缓存混淆 — 核对 flush / prefix_rate")
+        lines.append("4. 缓存混淆 — 核对 flush / prefix_rate（行键）")
         lines.append("5. PROMPTS∝concurrency — 高并发噪声大")
         lines.append("")
+
     return "\n".join(lines)
 
 
@@ -605,9 +672,10 @@ def render_markdown(
 render_md = render_markdown
 
 
-def length_to_summary(la: LengthAnalysis, *, include_points: bool) -> dict:
-    """LengthAnalysis → 可 JSON 化的摘要（默认不含逐点明细）。"""
+def length_to_summary(la: ConditionAnalysis, *, include_points: bool) -> dict:
+    """ConditionAnalysis → 可 JSON 化的摘要（默认不含逐点明细）。"""
     d: dict[str, Any] = {
+        "dims": dict(la.dims),
         "input_length": la.input_length,
         "n_points": la.n_points,
         "wall_c": la.wall_c,
@@ -639,11 +707,15 @@ def length_to_summary(la: LengthAnalysis, *, include_points: bool) -> dict:
 def to_jsonable(results: list[dict], *, include_points: bool = True) -> list[dict]:
     out = []
     for res in results:
-        r = {k: v for k, v in res.items() if k != "by_input_length"}
-        r["by_input_length"] = [
+        r = {k: v for k, v in res.items()
+             if k not in ("by_input_length", "by_condition")}
+        conditions = res.get("by_condition") or res.get("by_input_length") or []
+        summaries = [
             length_to_summary(la, include_points=include_points)
-            for la in res["by_input_length"]
+            for la in conditions
         ]
+        r["by_condition"] = summaries
+        r["by_input_length"] = summaries
         out.append(r)
     return out
 
@@ -660,33 +732,32 @@ def collect_caveats(results: list[dict]) -> list[str]:
 
     for res in results:
         flush = res.get("bench_flush_cache")
-        pr = res.get("prefix_rate") or 0
-        try:
-            pr_f = float(pr)
-        except (TypeError, ValueError):
-            pr_f = 0.0
-        if flush is False and pr_f > 0:
-            add(
-                "cache",
-                "缓存混淆：bench_flush_cache=false 且 prefix_rate>0，吞吐可能虚高，不可与冷启动混比。",
-            )
-        for la in res["by_input_length"]:
+        conditions = res.get("by_condition") or res.get("by_input_length") or []
+        for la in conditions:
+            pr = (la.dims or {}).get("prefix_rate")
+            try:
+                pr_f = float(pr) if pr is not None else 0.0
+            except (TypeError, ValueError):
+                pr_f = 0.0
+            if flush is False and pr_f > 0:
+                add(
+                    "cache",
+                    "缓存混淆：bench_flush_cache=false 且某场景 prefix_rate>0，"
+                    "吞吐可能虚高，不可与冷启动混比。",
+                )
             if la.bottleneck == "client_bias_suspect":
                 add(
                     "client",
-                    "客户端偏置嫌疑：吞吐已平台而 TTFT 暴涨、ITL 未同步——可能是 bench 客户端 GIL，非 server 墙。",
+                    "客户端偏置嫌疑：吞吐已平台而 TTFT 暴涨、ITL 未同步——"
+                    "可能是 bench 客户端 GIL，非 server 墙。",
                 )
             if la.n_points < 3:
                 add(
                     "few_points",
-                    "部分 input_length 并发扫描点 < 3，墙点置信度低或 inconclusive。",
+                    "部分场景并发扫描点 < 3，墙点置信度低或 inconclusive。",
                 )
     return caveats
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 服务入口
-# ══════════════════════════════════════════════════════════════════════
 
 def analyze_saturation_runs(
     db,
@@ -701,6 +772,7 @@ def analyze_saturation_runs(
     retro_tol: float = 0.05,
     include_points: bool = False,
     max_runs: int = DEFAULT_MAX_RUNS,
+    benchmark_kind: str | None = None,
 ) -> dict:
     """
     服务级入口：按维度条件取 run → 分析 → 返回 JSON + Markdown。
@@ -709,6 +781,14 @@ def analyze_saturation_runs(
     """
     filters = filters or {}
     exclude = exclude or {}
+    try:
+        bk = schema.resolve_kind(benchmark_kind).name
+    except ValueError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "valid_kinds": list(schema.BENCH_KIND_CHOICES),
+        }
 
     for dim in list(filters) + list(exclude):
         if dim not in schema.ALL_DIMENSIONS:
@@ -724,13 +804,14 @@ def analyze_saturation_runs(
         where_sql = f"{where_sql} AND {clause}" if where_sql else clause
         params = list(params) + [run_id]
 
-    docs = db.fetch_runs(where_sql, params)
+    docs = db.fetch_runs(where_sql, params, kind=bk)
     n = len(docs)
     if n == 0:
         return {
             "ok": False,
             "reason": "命中 0 条记录，无法分析",
             "n_matched": 0,
+            "benchmark_kind": bk,
         }
     if n > max_runs:
         preview = []
@@ -747,6 +828,7 @@ def analyze_saturation_runs(
             "reason": f"命中 {n} 条，超过上限 {max_runs}，请加 filters/exclude 或指定 run_id",
             "n_matched": n,
             "preview": preview,
+            "benchmark_kind": bk,
         }
 
     slo_map: dict[str, float | None] = {
@@ -767,7 +849,7 @@ def analyze_saturation_runs(
         retro_tol=retro_tol,
         slo=slo_map,
     )
-    results = [analyze_run(d, **kwargs) for d in docs]
+    results = [analyze_run(d, kind=bk, **kwargs) for d in docs]
     caveats = collect_caveats(results)
     markdown = render_markdown(
         results, slo_map, include_points=include_points, caveats=caveats or None,
@@ -775,6 +857,7 @@ def analyze_saturation_runs(
     return {
         "ok": True,
         "n_runs": len(results),
+        "benchmark_kind": bk,
         "settings": {
             "plateau_gain": plateau_gain,
             "latency_factor": latency_factor,

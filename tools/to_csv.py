@@ -12,35 +12,22 @@
       --framework sglang --bench-framework sglang \
       --framework-version 0.4.6 \
       --bench-flush-cache false \
-      --prefix-rate 0.0 \
+      --benchmark-kind text \
       --input-dir ./logs_H20G144_GLM52 \
       --nas-dir /mnt/nas/benchmark_root \
       --gpu-type H20-141G \
       --model GLM-4.5 \
       --launch-cmd "python -m sglang.launch_server --tp-size 8 --enable-hierarchical-cache"
 
-  # server 与 bench 框架不同：vllm server + sglang bench，压测前清缓存
+  # VLM
   python to_csv.py \
-      --framework vllm --bench-framework sglang \
-      --framework-version 0.5.12 \
-      --bench-flush-cache true \
-      --prefix-rate 0.5 \
-      --input-dir ./logs --nas-dir /mnt/nas/benchmark_root \
-      --gpu-type H800 --model Qwen2.5-72B \
-      --launch-cmd "vllm serve Qwen2.5-72B -tp 8"
-
-  # vllm（注意 e2el / input_len 需要额外信息，见 --bench-cmd）
-  python to_csv.py \
-      --framework vllm --bench-framework vllm \
-      --framework-version 0.5.12 \
+      --framework sglang --bench-framework sglang \
+      --framework-version 0.4.6 \
       --bench-flush-cache false \
-      --prefix-rate 0.0 \
-      --input-dir ./vllm_logs \
-      --nas-dir /mnt/nas/benchmark_root \
-      --gpu-type H800 \
-      --model Qwen2.5-72B \
-      --launch-cmd "vllm serve Qwen2.5-72B -tp 8 --enable-expert-parallel" \
-      --bench-cmd "vllm bench serve --random-input-len 1024 --percentile-metrics ttft,tpot,itl,e2el"
+      --benchmark-kind vlm \
+      --input-dir ./vlm_logs --nas-dir /mnt/nas/benchmark_root \
+      --gpu-type H800 --model Qwen2.5-VL-72B \
+      --launch-cmd "python -m sglang.launch_server --tp-size 8"
 
 设计文档见 docs/design.md §5。
 """
@@ -69,10 +56,10 @@ except (AttributeError, ValueError):
 # ============================================================================
 
 # 统一列名 -> {框架: 该框架 JSON 里的 key}
-METRIC_FIELD_MAP = {
-    # 维度
-    "Input_Length":        {"sglang": "random_input_len", "vllm": None},  # vllm 从 --bench-cmd 补
-    "Concurrency":         {"sglang": "max_concurrency",   "vllm": "max_concurrency"},
+# 维度段按 kind 拆分；性能指标段两个 kind 共用。
+# 维度优先读 record["_autores_dims"].<key>（由 inject_dims.py / 脚本注入）。
+
+_SHARED_METRIC_FIELD_MAP = {
     # 吞吐
     "Request_Throughput":  {"sglang": "request_throughput", "vllm": "request_throughput"},
     # vllm 无原生 input 侧吞吐；record_to_row 用 total_token_throughput - output_throughput 派生
@@ -107,28 +94,50 @@ METRIC_FIELD_MAP = {
     "E2E_P90(ms)":         {"sglang": "p90_e2e_latency_ms",    "vllm": "p90_e2el_ms"},
     "E2E_P95(ms)":         {"sglang": "p95_e2e_latency_ms",    "vllm": "p95_e2el_ms"},
     "E2E_P99(ms)":         {"sglang": "p99_e2e_latency_ms",    "vllm": "p99_e2el_ms"},
-    # 新增建议指标（P3 已定；不含 Duration_s）
     "Completed":           {"sglang": "completed",            "vllm": "completed"},
-    # Failed：vllm 原生 failed_requests；sglang 无聚合字段，由 record_to_row 派生
     "Failed":              {"sglang": None,                   "vllm": "failed_requests"},
     "Total_Input_Tokens":  {"sglang": "total_input_tokens",   "vllm": "total_input_tokens"},
     "Total_Output_Tokens": {"sglang": "total_output_tokens",  "vllm": "total_output_tokens"},
-    # ── KV cache 命中率（强制对齐：跨框架可比，统一 0-100 百分比）──
-    #   sglang: bench --cache-report → cache_report.cache_hit_rate_pct（嵌套 key）
-    #   vllm  : bench 本身不产出，由 vllm_sgl_benchs.sh 前后拉 /metrics 的
-    #           prefix_cache_hits/queries 算 delta 注入 kv_cache_hit_rate
     "KV_Cache_Hit_Rate(%)": {"sglang": "cache_report.cache_hit_rate_pct",
                              "vllm": "kv_cache_hit_rate"},
-    # ── spec decoding 接受率（不对齐：两框架颗粒度不同，跨框架不可比）──
-    #   故意用带框架前缀的独立列名，避免报告把它们塞进同一可比列。
-    #   sglang bench 只聚合 accept length（avg_spec_accept_length）；
-    #   vllm bench 产出 acceptance_rate(%) + acceptance_length（per-position 略）。
     "SGLang_Spec_Accept_Length": {"sglang": "accept_length",              "vllm": None},
     "vLLM_Spec_Accept_Rate(%)":  {"sglang": None, "vllm": "spec_decode_acceptance_rate"},
     "vLLM_Spec_Accept_Length":   {"sglang": None, "vllm": "spec_decode_acceptance_length"},
 }
 
-# CSV 列顺序（= METRIC_FIELD_MAP 的键序）
+# 行键维度：原生 JSON key（_autores_dims 优先，见 _dim_from_record）
+_TEXT_DIM_FIELD_MAP = {
+    "Input_Length":  {"sglang": "random_input_len", "vllm": None},
+    "Concurrency":   {"sglang": "max_concurrency",   "vllm": "max_concurrency"},
+    "Prefix_Rate":   {"sglang": None, "vllm": None},  # 仅来自 _autores_dims
+}
+
+_VLM_DIM_FIELD_MAP = {
+    "Input_Length":      {"sglang": "random_input_len", "vllm": None},
+    "Concurrency":       {"sglang": "max_concurrency",   "vllm": "max_concurrency"},
+    "Image_Count":       {"sglang": None, "vllm": None},
+    "Video_Count":       {"sglang": None, "vllm": None},
+    "Image_Resolution":  {"sglang": None, "vllm": None},
+}
+
+# _autores_dims 内的键名（与 inject_dims.py 对齐）
+_AUTORES_DIM_KEYS = {
+    "Input_Length": "random_input_len",
+    "Concurrency": "max_concurrency",  # 一般不需要注入，原生有
+    "Prefix_Rate": "prefix_rate",
+    "Image_Count": "image_count",
+    "Video_Count": "video_count",
+    "Image_Resolution": "image_resolution",
+}
+
+
+def metric_field_map_for(kind: str) -> dict:
+    dims = _TEXT_DIM_FIELD_MAP if kind == "text" else _VLM_DIM_FIELD_MAP
+    return {**dims, **_SHARED_METRIC_FIELD_MAP}
+
+
+# 兼容旧名：默认 text
+METRIC_FIELD_MAP = metric_field_map_for("text")
 CSV_HEADERS = list(METRIC_FIELD_MAP.keys())
 
 NA = "N/A"
@@ -489,18 +498,41 @@ def load_bench_records(framework, input_dir):
     return records
 
 
-def record_to_row(framework, record, fallback_input_len):
+def _dim_from_record(record, col, fw_key, fallback_input_len, pm_fw):
+    """
+    取行键维度值：优先 _autores_dims，再回落原生 JSON key / fallback。
+    """
+    autores = record.get("_autores_dims")
+    if isinstance(autores, dict):
+        ak = _AUTORES_DIM_KEYS.get(col)
+        if ak and ak in autores and autores[ak] is not None:
+            return format_num(autores[ak])
+        # 也接受小写列名直接作键
+        low = col.lower()
+        if low in autores and autores[low] is not None:
+            return format_num(autores[low])
+    if fw_key is not None:
+        val = _dig(record, fw_key)
+        if val is not _MISSING:
+            return format_num(val)
+    if col == "Input_Length" and pm_fw == "vllm":
+        return fallback_input_len if fallback_input_len is not None else NA
+    return NA
+
+
+def record_to_row(framework, record, fallback_input_len, kind="text"):
     """把一条 bench record 映射为 CSV 行（统一列名）。"""
     pm_fw = "vllm" if framework == "vllm-ascend" else framework
+    field_map = metric_field_map_for(kind)
+    dim_cols = set(db_schema.metric_dimension_keys(kind))
     row = {}
-    for col, fw_keys in METRIC_FIELD_MAP.items():
+    for col, fw_keys in field_map.items():
         key = fw_keys.get(pm_fw)
+        if col in dim_cols:
+            row[col] = _dim_from_record(record, col, key, fallback_input_len, pm_fw)
+            continue
         if key is None:
-            # 该框架无此字段
-            if col == "Input_Length" and pm_fw == "vllm":
-                row[col] = fallback_input_len if fallback_input_len is not None else NA
-            else:
-                row[col] = NA
+            row[col] = NA
             continue
         val = _dig(record, key)
         row[col] = format_num(val) if val is not _MISSING else NA
@@ -520,7 +552,6 @@ def record_to_row(framework, record, fallback_input_len):
         _fill_vllm_percentiles_from_lists(row, record)
 
     # sglang 失败数：errors → num_prompts-completed → len(output_lens)-completed → N/A
-    # （需 bench --output-details 才有 errors/output_lens；明细数组不入库）
     if pm_fw == "sglang" and row.get("Failed") in (NA, None):
         comp = _dig(record, "completed")
         errs = _dig(record, "errors")
@@ -528,7 +559,7 @@ def record_to_row(framework, record, fallback_input_len):
         nprompts = _dig(record, "num_prompts")
         failed = None
         if isinstance(errs, list):
-            failed = sum(1 for e in errs if e)  # 成功项通常为 ""
+            failed = sum(1 for e in errs if e)
         elif nprompts is not _MISSING and comp is not _MISSING:
             try:
                 failed = int(nprompts) - int(comp)
@@ -577,14 +608,21 @@ def _fill_vllm_percentiles_from_lists(row: dict, record: dict) -> None:
                 row[col] = format_num(p_val[1])
 
 
-
-def build_rows(framework, records, fallback_input_len):
-    rows = [record_to_row(framework, r, fallback_input_len) for r in records]
+def build_rows(framework, records, fallback_input_len, kind="text"):
+    rows = [record_to_row(framework, r, fallback_input_len, kind) for r in records]
+    dim_cols = list(db_schema.metric_dimension_keys(kind))
 
     def sort_key(item):
-        il = item["Input_Length"] if isinstance(item["Input_Length"], (int, float)) else 0
-        cc = item["Concurrency"] if isinstance(item["Concurrency"], (int, float)) else 0
-        return (il, cc)
+        parts = []
+        for col in dim_cols:
+            v = item.get(col)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                parts.append((0, float(v), ""))
+            elif v is None or v == NA:
+                parts.append((2, 0, ""))
+            else:
+                parts.append((1, 0, str(v)))
+        return tuple(parts)
 
     rows.sort(key=sort_key)
     return rows
@@ -594,12 +632,13 @@ def build_rows(framework, records, fallback_input_len):
 # 4. 落盘（§5.1、§5.3）
 # ============================================================================
 
-def write_outputs(out_dir, rows, metadata):
+def write_outputs(out_dir, rows, metadata, kind="text"):
     os.makedirs(out_dir, exist_ok=True)
+    headers = list(metric_field_map_for(kind).keys())
 
     csv_path = os.path.join(out_dir, "result.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -694,16 +733,15 @@ def parse_args():
             p.add_argument(flag, default=db_schema.METADATA_OPTIONAL_DEFAULTS[field],
                            choices=list(db_schema.DEPLOYMENT_MODES),
                            help="部署模式 → test_runs.deployment_mode")
+        elif field == "benchmark_kind":
+            p.add_argument(flag, default=db_schema.DEFAULT_BENCH_KIND,
+                           choices=list(db_schema.BENCH_KIND_CHOICES),
+                           help="压测类型 text|vlm → metadata.benchmark_kind（路由入库表）")
         elif field == "launch_cmd":
             # colocated 必填、pd_disagg 由 prefill/decode 合成；统一改为可选，main 里按模式校验
             p.add_argument(flag, default="",
                            help="server 启动命令原文（colocated 必填）→ test_runs.launch_cmd；"
                                 "PD 分离改用 --prefill-cmd/--decode-cmd 自动合成")
-        elif field == "prefix_rate":
-            # 共享前缀占比（0~1）→ test_runs.prefix_rate；与 input_length/concurrency 同为可比对轴。
-            # 必填（虽在 OPTIONAL_DEFAULTS 里，但那只是老数据兜底；新落盘一律显式给值）。
-            p.add_argument(flag, required=True, type=float,
-                           help="共享前缀占输入长度的比例（0~1）→ test_runs.prefix_rate（必填）")
         elif field in db_schema.METADATA_OPTIONAL_DEFAULTS:
             default = db_schema.METADATA_OPTIONAL_DEFAULTS[field]
             p.add_argument(flag, default=default,
@@ -725,12 +763,11 @@ def main():
     bench_framework = meta["bench_framework"]
     bench_flush_cache = meta["bench_flush_cache"]
     deployment = meta.get("deployment_mode", "colocated")
-
-    # prefix_rate 取值域校验（0~1，1 表示整段都是前缀无实际正文，故不含 1）
-    prefix_rate = meta.get("prefix_rate", 0.0)
-    if not (0.0 <= prefix_rate < 1.0):
-        raise SystemExit(
-            f"[ERR] --prefix-rate 必须在 [0, 1) 之间，收到: {prefix_rate}")
+    try:
+        kind = db_schema.resolve_kind(meta.get("benchmark_kind")).name
+    except ValueError as e:
+        raise SystemExit(f"[ERR] {e}") from e
+    meta["benchmark_kind"] = kind
 
     # 按部署模式校验命令参数（colocated 需 launch_cmd；pd_disagg 需 prefill+decode）
     if deployment == "pd_disagg":
@@ -756,14 +793,21 @@ def main():
 
     fallback_input_len = parse_bench_cmd_input_len(args.bench_cmd)
     if bench_framework in ("vllm", "vllm-ascend") and fallback_input_len is None:
-        print("⚠️  vllm bench 场景未能从 --bench-cmd 解析出 --random-input-len，Input_Length 将填 N/A")
+        # 有 _autores_dims.random_input_len 时仍可补齐；此处仅告警
+        has_autores = any(
+            isinstance(r.get("_autores_dims"), dict)
+            and r["_autores_dims"].get("random_input_len") is not None
+            for r in records
+        )
+        if not has_autores:
+            print("⚠️  vllm bench 场景未能从 --bench-cmd / _autores_dims 解析出 "
+                  "random_input_len，Input_Length 将填 N/A")
 
-    rows = build_rows(bench_framework, records, fallback_input_len)
+    rows = build_rows(bench_framework, records, fallback_input_len, kind)
 
     # 提取启动参数（按 server 框架，因为 launch_cmd 是服务端启动命令）
     pd_meta = None
     if deployment == "pd_disagg":
-        # PD：prefill/decode 各自解析并拆到 prefill_/decode_ 列；顶层 params 留空
         combined, pd_meta = build_pd(
             meta["framework"], args.prefill_cmd, args.decode_cmd, args.router_cmd)
         meta["launch_cmd"] = combined
@@ -776,16 +820,15 @@ def main():
     else:
         params, extra = extract_launch_params(meta["framework"], meta["launch_cmd"])
 
-    # 组织并落盘（metadata 顶层键与 schema.METADATA_DIRECT_FIELDS 一致）
     metadata = build_metadata(meta, params, extra, bench_cmd=args.bench_cmd, pd=pd_meta)
-    csv_path, meta_path = write_outputs(out_dir, rows, metadata)
+    csv_path, meta_path = write_outputs(out_dir, rows, metadata, kind)
 
     print(f"[OK] 落盘完成：{len(rows)} 条指标记录")
     print(f"[目录] {out_dir}")
     print(f"       - {os.path.basename(csv_path)}")
     print(f"       - {os.path.basename(meta_path)}")
-    print(f"[bench] server={meta['framework']} bench={bench_framework} "
-          f"flush_cache={bench_flush_cache} prefix_rate={prefix_rate} deployment={deployment}")
+    print(f"[bench] kind={kind} server={meta['framework']} bench={bench_framework} "
+          f"flush_cache={bench_flush_cache} deployment={deployment}")
     if deployment == "pd_disagg" and pd_meta is not None:
         pf_p, dc_p = pd_meta["prefill"]["params"], pd_meta["decode"]["params"]
         print(f"[PD] transfer_backend={pd_meta['transfer_backend']}  "
@@ -794,8 +837,6 @@ def main():
         print("[prefill] " + "  ".join(f"{k}={pf_p[k]}" for k in sorted(pf_p)))
         print("[decode]  " + "  ".join(f"{k}={dc_p[k]}" for k in sorted(dc_p)))
     else:
-        # 直接打印解析出的全部参数（字段名以 extract_launch_params 实际产出为准，
-        # 与网页上传共用同一解析器，避免写死已废弃的 key 触发 KeyError）
         if params:
             print("[参数] " + "  ".join(f"{k}={params[k]}" for k in sorted(params)))
         if extra.get("unrecognized"):

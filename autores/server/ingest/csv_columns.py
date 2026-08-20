@@ -3,6 +3,9 @@
 
 bench 工具 / 手工整理导出的 CSV 表头写法不一（空格、缩写、是否带 (ms)），
 入库前统一 remap 到 METRIC_FIELD_MAP 的固定 schema。
+
+按 benchmark_kind 拆 canonical 列：共享性能指标 + kind 专属行键维度。
+硬必填维度只有 Input_Length / Concurrency；其余行键缺列填 N/A。
 """
 from __future__ import annotations
 
@@ -10,10 +13,8 @@ import re
 
 from autores.db import schema
 
-# 与 tools/to_csv.py METRIC_FIELD_MAP 键序一致
-CANONICAL_COLUMNS: tuple[str, ...] = (
-    "Input_Length",
-    "Concurrency",
+# 共享性能指标列（与 tools/to_csv.py 共享段一致）
+_SHARED_METRIC_COLUMNS: tuple[str, ...] = (
     "Request_Throughput",
     "Input_Throughput",
     "Output_Throughput",
@@ -54,7 +55,18 @@ CANONICAL_COLUMNS: tuple[str, ...] = (
     "vLLM_Spec_Accept_Length",
 )
 
-_CANONICAL_SET = frozenset(CANONICAL_COLUMNS)
+
+def canonical_columns(kind: str | None = None) -> tuple[str, ...]:
+    """规范 CSV 列顺序 = kind 行键 + 共享性能指标。"""
+    dims = schema.metric_dimension_keys(kind)
+    return dims + _SHARED_METRIC_COLUMNS
+
+
+# 兼容旧代码：默认 text kind
+CANONICAL_COLUMNS: tuple[str, ...] = canonical_columns("text")
+
+# 硬必填维度（两个 kind 共用）
+REQUIRED_DIMENSION_KEYS = schema.REQUIRED_METRIC_DIMENSION_KEYS
 
 # spec decoding 规范列，按框架分组。上传时据"哪边列有值"粗判 bench_framework：
 #   只有 vllm 列有值 → vllm；只有 sglang 列有值 → sglang；都有/都无 → 需手填。
@@ -81,8 +93,14 @@ _SKIP_KEYS = frozenset({
     _norm_key("Source"),
 })
 
+# 所有可能出现的规范列（两个 kind 并集）用于别名表
+_ALL_CANONICAL = tuple(dict.fromkeys(
+    list(canonical_columns("text")) + list(canonical_columns("vlm"))
+))
+_CANONICAL_SET = frozenset(_ALL_CANONICAL)
+
 # 规范列名 + 常见别名 → 规范列名
-_ALIASES: dict[str, str] = {_norm_key(c): c for c in CANONICAL_COLUMNS}
+_ALIASES: dict[str, str] = {_norm_key(c): c for c in _ALL_CANONICAL}
 
 _MANUAL_ALIASES: dict[str, str] = {
     # 维度
@@ -91,6 +109,18 @@ _MANUAL_ALIASES: dict[str, str] = {
     "randominputlen": "Input_Length",
     "maxconcurrency": "Concurrency",
     "concurrencylevel": "Concurrency",
+    "prefixrate": "Prefix_Rate",
+    "prefixratio": "Prefix_Rate",
+    "sharedprefixrate": "Prefix_Rate",
+    "imagecount": "Image_Count",
+    "numimages": "Image_Count",
+    "nimages": "Image_Count",
+    "videocount": "Video_Count",
+    "numvideos": "Video_Count",
+    "nvideos": "Video_Count",
+    "imageresolution": "Image_Resolution",
+    "resolution": "Image_Resolution",
+    "imageres": "Image_Resolution",
     # 吞吐（缩写 Thr / Throughput）
     "requestthr": "Request_Throughput",
     "requestthroughput": "Request_Throughput",
@@ -105,7 +135,7 @@ _MANUAL_ALIASES: dict[str, str] = {
     "totaltokenthroughput": "Total_Throughput",
     "totalthroughput": "Total_Throughput",
     "tokenthroughput": "Total_Throughput",
-    # TTFT / TPOT / ITL（带或不带 (ms)、Mean/Median/Std/P90/P95/P99）
+    # TTFT / TPOT / ITL
     "ttftmean": "TTFT_Mean(ms)",
     "ttftmedian": "TTFT_Median(ms)",
     "ttftstd": "TTFT_Std(ms)",
@@ -124,7 +154,7 @@ _MANUAL_ALIASES: dict[str, str] = {
     "itlp90": "ITL_P90(ms)",
     "itlp95": "ITL_P95(ms)",
     "itlp99": "ITL_P99(ms)",
-    # E2E / E2EL / 手工导出 typo（mSE2E）
+    # E2E
     "e2emean": "E2E_Mean(ms)",
     "e2emedian": "E2E_Median(ms)",
     "e2estd": "E2E_Std(ms)",
@@ -151,13 +181,13 @@ _MANUAL_ALIASES: dict[str, str] = {
     "errnum": "Failed",
     "totalinputtokens": "Total_Input_Tokens",
     "totaloutputtokens": "Total_Output_Tokens",
-    # KV cache 命中率（对齐列）—— 兼容各种拉平写法
+    # KV cache
     "cachehitrate": "KV_Cache_Hit_Rate(%)",
     "cachehitratepct": "KV_Cache_Hit_Rate(%)",
     "kvhitrate": "KV_Cache_Hit_Rate(%)",
     "prefixcachehitrate": "KV_Cache_Hit_Rate(%)",
     "kvcachehitratepct": "KV_Cache_Hit_Rate(%)",
-    # spec decoding（框架专属，非对齐列）
+    # spec decoding
     "sglangacceptlength": "SGLang_Spec_Accept_Length",
     "sglangspecacceptlength": "SGLang_Spec_Accept_Length",
     "vllmspecacceptrate": "vLLM_Spec_Accept_Rate(%)",
@@ -208,7 +238,13 @@ def format_mapping_summary(header_map: dict[str, str | None]) -> list[str]:
     return lines
 
 
-def check_required_dimensions(header_map: dict[str, str | None]) -> list[str]:
-    """返回仍缺失的维度列（规范名）。"""
+def check_required_dimensions(header_map: dict[str, str | None],
+                              kind: str | None = None) -> list[str]:
+    """
+    返回仍缺失的硬必填维度列（规范名）。
+    只有 Input_Length / Concurrency；其余行键缺列不算错。
+    kind 参数保留供调用方透传，当前不影响必需集合。
+    """
+    _ = kind  # 两个 kind 硬必填相同
     present = mapped_canonical_headers(header_map)
-    return [k for k in schema.METRIC_DIMENSION_KEYS if k not in present]
+    return [k for k in REQUIRED_DIMENSION_KEYS if k not in present]

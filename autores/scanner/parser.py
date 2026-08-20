@@ -1,8 +1,9 @@
 """
 解析器：读取一个 timestamp 目录下的 result.csv + metadata.json，
-组织为 test_runs 文档（design.md §5.5、§6.1）。
+组织为 test_runs / vlm_test_runs 文档（design.md §5.5、§6.1）。
 
 面向 to_csv.py 生成的固定 schema，不做可配置字段映射。
+路由由 metadata.benchmark_kind 决定（缺省 text）。
 """
 from __future__ import annotations
 
@@ -37,14 +38,15 @@ def _to_number(raw: str):
         # 整数值去掉小数点（Input_Length/Concurrency/Completed 等）
         return int(f) if f.is_integer() else f
     except (TypeError, ValueError):
-        return raw  # 非数字原样保留（理论上不该出现）
+        return raw  # 非数字原样保留（如 Image_Resolution=720x1280）
 
 
-def _parse_csv(csv_path: str) -> list[dict]:
-    """把 result.csv 每行转为一个 metric 记录（含 input_length/concurrency 维度）。"""
+def _parse_csv(csv_path: str, kind: str) -> list[dict]:
+    """把 result.csv 每行转为一个 metric 记录（行键维度用小写）。"""
     if not os.path.exists(csv_path):
         raise ParseError(f"缺少 result.csv: {csv_path}")
 
+    dim_keys = set(schema.metric_dimension_keys(kind))
     metrics: list[dict] = []
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -55,8 +57,8 @@ def _parse_csv(csv_path: str) -> list[dict]:
             for col, raw in row.items():
                 if col is None:
                     continue
-                # Input_Length -> input_length，Concurrency -> concurrency（维度用小写）
-                if col in schema.METRIC_DIMENSION_KEYS:
+                # Input_Length -> input_length 等（维度用小写）
+                if col in dim_keys:
                     key = col.lower()
                 else:
                     key = col
@@ -89,14 +91,18 @@ def _parse_metadata(meta_path: str) -> dict:
 
 def parse_run_dir(dir_path: str) -> dict:
     """
-    解析单个 timestamp 目录，返回可直接 insert_one 的 test_runs 文档。
+    解析单个 timestamp 目录，返回可直接 insert_run 的文档。
     失败抛 ParseError（上层跳过、不入库、下轮重试）。
     """
     dir_name = os.path.basename(os.path.normpath(dir_path))
     run_timestamp = _parse_timestamp(dir_name)
 
     meta = _parse_metadata(os.path.join(dir_path, "metadata.json"))
-    metrics = _parse_csv(os.path.join(dir_path, "result.csv"))
+    try:
+        kind = schema.resolve_kind(meta.get("benchmark_kind")).name
+    except ValueError as e:
+        raise ParseError(str(e)) from e
+    metrics = _parse_csv(os.path.join(dir_path, "result.csv"), kind)
 
     deployment = meta.get("deployment_mode", "colocated")
     extra = dict(meta.get("extra", {}))
@@ -111,11 +117,9 @@ def parse_run_dir(dir_path: str) -> dict:
         "gpu_type": meta["gpu_type"],
         "launch_cmd": meta["launch_cmd"],
         "deployment_mode": deployment,
-        # bench 维度：新数据由 to_csv.py / 上传表单写入；老目录可能没有，留 None
         "bench_framework": meta.get("bench_framework"),
         "bench_flush_cache": meta.get("bench_flush_cache"),
-        # prefix_rate：老目录无此字段 → 默认 0（无前缀），与 schema 约定一致
-        "prefix_rate": meta.get("prefix_rate", 0),
+        "benchmark_kind": kind,
         "gpu_count": meta.get("gpu_count") or extra.get("gpu_count"),
         "prefill_gpu_count": meta.get("prefill_gpu_count"),
         "decode_gpu_count": meta.get("decode_gpu_count"),

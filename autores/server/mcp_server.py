@@ -105,40 +105,55 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
     base_url = _base_url(cfg)
 
     @mcp.tool()
-    def list_dimensions() -> dict:
-        """列出所有可用于筛选（filters/exclude）与对比（compare_on）的维度名。
+    def list_dimensions(benchmark_kind: str = "text") -> dict:
+        """列出 run 级维度与当前 kind 的 metric 行键。
 
-        其他工具的 dimension / filters 键必须取自本列表。"""
-        return {"dimensions": list(schema.ALL_DIMENSIONS)}
+        benchmark_kind: text|vlm，默认 text。
+        返回 {run_dimensions, metric_dimensions, benchmark_kind}。
+        filters/compare_on 只能用 run_dimensions；行键只能进 metric_filters。"""
+        kind = schema.resolve_kind(benchmark_kind).name
+        return {
+            "benchmark_kind": kind,
+            "run_dimensions": list(schema.ALL_DIMENSIONS),
+            "metric_dimensions": list(schema.metric_dims(kind)),
+        }
 
     @mcp.tool()
-    def summarize_reports(filters: dict[str, Any] | None = None) -> dict:
+    def summarize_reports(
+        filters: dict[str, Any] | None = None,
+        benchmark_kind: str = "text",
+    ) -> dict:
         """按显卡×模型盘点库内测试记录（报告）数量。
 
         用于回答"现在有多少报告""每张卡每个模型各有多少"这类盘点问题；
         忽略框架版本、启动参数等细节，只按 gpu_type + model 归并计数。
 
-        filters: 可选，额外维度等值约束以缩小盘点范围（键取自 list_dimensions）。"""
-        return agent_tools.summarize_reports(db, filters)
+        filters: 可选，额外维度等值约束以缩小盘点范围。
+        benchmark_kind: text|vlm，默认 text。"""
+        return agent_tools.summarize_reports(db, filters, benchmark_kind)
 
     @mcp.tool()
     def list_dimension_values(
         dimension: str,
         filters: dict[str, Any] | None = None,
+        benchmark_kind: str = "text",
     ) -> dict:
         """列出数据库中某个维度的所有真实取值及各值的记录数。
 
         在把用户口语（如 '4090'）对齐到库内真实值（如 'NVIDIA RTX 4090'）之前，
         必须先用本工具确认库内实际有哪些值；也用于向用户列出候选做澄清。
 
-        dimension: 维度名（取自 list_dimensions）。
-        filters: 可选，其他维度的等值约束以缩小统计范围。"""
-        return agent_tools.list_dimension_values(db, dimension, filters)
+        dimension: 维度名（取自 list_dimensions 的 run_dimensions）。
+        filters: 可选，其他维度的等值约束以缩小统计范围。
+        benchmark_kind: text|vlm，默认 text。"""
+        return agent_tools.list_dimension_values(
+            db, dimension, filters, benchmark_kind)
 
     @mcp.tool()
     def count_matching_runs(
         filters: dict[str, Any],
         exclude: dict[str, Any] | None = None,
+        benchmark_kind: str = "text",
     ) -> dict:
         """统计满足一组维度条件的测试记录数量（生成报告前应先预检）。
 
@@ -146,8 +161,10 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
         命中 1~20 条时会附带各条记录的关键信息。
 
         filters: 维度等值条件，值可为数组（表示多选）。
-        exclude: 可选，排除项，键为维度名、值为要排除的取值数组。"""
-        return agent_tools.count_matching_runs(db, filters, exclude)
+        exclude: 可选，排除项，键为维度名、值为要排除的取值数组。
+        benchmark_kind: text|vlm，默认 text。"""
+        return agent_tools.count_matching_runs(
+            db, filters, exclude, benchmark_kind)
 
     @mcp.tool()
     def analyze_saturation(
@@ -163,8 +180,9 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
         headroom: float | None = None,
         include_points: bool = False,
         max_runs: int | None = None,
+        benchmark_kind: str = "text",
     ) -> dict:
-        """分析性能饱和点（hardware wall）：按 input_length 给出墙并发、推荐运行点、
+        """分析性能饱和点（hardware wall）：按场景条件给出墙并发、推荐运行点、
         瓶颈归因与置信度。查饱和点 / 推荐并发时用本工具，无需生成 Excel。
 
         filters: 维度等值条件（键取自 list_dimensions），值可为数组。
@@ -174,6 +192,7 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
         plateau_gain / latency_factor / headroom: 可选，检测器阈值。
         include_points: 默认 false；true 时附带逐并发点明细（上下文更大）。
         max_runs: 最多分析几条，默认 5；超出则返回需加约束的提示。
+        benchmark_kind: text|vlm，默认 text。
 
         返回：{ok, n_runs, settings, runs, markdown, caveats} 或 {ok:false, ...}。"""
         args: dict[str, Any] = {
@@ -185,6 +204,7 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
             "slo_itl_p95": slo_itl_p95,
             "slo_e2e_p99": slo_e2e_p99,
             "include_points": include_points,
+            "benchmark_kind": benchmark_kind,
         }
         if plateau_gain is not None:
             args["plateau_gain"] = plateau_gain
@@ -205,20 +225,22 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
         metrics: list[str] | None = None,
         metric_filters: dict[str, Any] | None = None,
         normalize_gpu_scale: bool = True,
+        benchmark_kind: str = "text",
     ) -> dict:
         """生成 Excel 对比报告，返回下载链接与结果摘要。
 
         提交前建议先用 count_matching_runs 预检、并消除维度歧义。
 
-        compare_on: 对比轴——在哪个维度上横向比较（取自 list_dimensions）。
+        compare_on: 对比轴——在哪个维度上横向比较（run 级，不能是行键）。
         filters: 约束项——其余维度保持一致的等值条件（值可为数组）。
         compare_values: 可选，对比轴上的目标取值；缺省=该轴下所有匹配值。
         exclude: 可选，排除项，键为维度、值为要剔除的取值数组。
         metrics: 可选，要对比的指标列名；缺省=全部指标。
-        metric_filters: 可选，按 input_length / concurrency 进一步筛选，值为数组。
+        metric_filters: 可选，按行键（如 input_length / concurrency）进一步筛选。
         normalize_gpu_scale: 可选，默认 true。各配置卡数不同时按卡数做弱扩展归一
             （吞吐×卡数比、并发同比对齐、延迟不变）以做"对齐卡数"的公平对比；
             卡数相同则自动无操作；需看原始未换算数值时设 false。
+        benchmark_kind: text|vlm，默认 text。
 
         返回：{ok, download_url, filename, summary} 或 {ok: false, error/reason}。"""
         spec_dict = {
@@ -229,6 +251,7 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
             "metrics": metrics,
             "metric_filters": metric_filters or {},
             "normalize_gpu_scale": normalize_gpu_scale,
+            "benchmark_kind": benchmark_kind,
         }
         spec, err = agent_tools.validate_query_spec(spec_dict)
         if err:
@@ -250,6 +273,7 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
                 "num_metric_rows": result.num_metric_rows,
                 "columns": result.column_labels,
                 "notes": result.notes,
+                "benchmark_kind": benchmark_kind,
             },
         }
 

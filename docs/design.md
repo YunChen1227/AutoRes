@@ -144,13 +144,18 @@ AutoRes/
 
 | 入参 | 必填 | 说明 |
 |------|------|------|
-| `--framework {sglang,vllm}` | 是 | 决定按哪套字段名解析 bench 输出（两框架字段名不同，见 §5.2） |
-| `--input-dir` | 是 | bench 原始输出所在目录（sglang 为 JSONL，vllm 为多个 JSON） |
+| `--benchmark-kind {text,vlm}` | 否（默认 text） | 压测类型 → `metadata.benchmark_kind`；Scanner 路由到 `test_runs` / `vlm_test_runs` |
+| `--framework {sglang,vllm}` | 是 | server 框架；决定启动命令参数提取规则 |
+| `--bench-framework {sglang,vllm}` | 是 | 压测工具框架；决定按哪套字段名解析 bench 输出（见 §5.2） |
+| `--bench-flush-cache {true,false}` | 是 | 压测前是否清缓存（入库对比维度） |
+| `--input-dir` | 是 | bench 原始输出所在目录 |
 | `--nas-dir` | 是 | NAS 挂载根路径（各测试人员挂载位置不同，由入参指定），脚本在其下创建时间戳目录 |
 | `--gpu-type` | 是 | 显卡类型（如 `H20-141G`），写入 metadata.json |
 | `--model` / `--model-version` | 是 | 模型名与版本 |
-| `--launch-cmd` | 是 | **完整服务启动命令字符串**（如 `"python -m sglang.launch_server --tp-size 8 --enable-hierarchical-cache ..."`）；脚本据此提取结构化启动参数（见 §5.4） |
-| `--bench-cmd` | 否 | 完整 benchmark 命令字符串；vllm 场景用于补 `random_input_len` 等 bench 侧信息（见 §5.2 注） |
+| `--launch-cmd` | 是* | **完整服务启动命令字符串**（colocated 必填；PD 分离改用 `--prefill-cmd`/`--decode-cmd`）；脚本据此提取结构化启动参数（见 §5.4） |
+| `--bench-cmd` | 否 | 完整 benchmark 命令字符串；作 `_autores_dims` 缺失时的兜底 |
+
+> `prefix_rate` **不再**是 to_csv CLI 入参（已下沉为 text metrics 行键，由 `inject_dims.py` / CSV 列提供）。
 
 脚本输出目录结构：
 
@@ -167,8 +172,10 @@ AutoRes/
 
 | 统一 metric 列 | sglang JSON key | vllm JSON key | 备注 |
 |----------------|-----------------|---------------|------|
-| Input_Length | `random_input_len` | *(无，取自 `--bench-cmd` 的 `--random-input-len`)* | vllm bench JSON 不含输入长度 |
+| Input_Length | `random_input_len` / `_autores_dims.random_input_len` | 同左（优先 `_autores_dims`） | 压测脚本经 `inject_dims.py` 写入，解决 vllm JSON 无输入长度的老问题 |
 | Concurrency | `max_concurrency` | `max_concurrency` | 一致 |
+| Prefix_Rate | `_autores_dims.prefix_rate` | 同左 | **仅 text kind**；行键维度，缺列填 N/A |
+| Image_Count / Video_Count / Image_Resolution | `_autores_dims.*` | 同左 | **仅 vlm kind**；行键维度；`Image_Resolution` 为 `HxW` 字符串 |
 | Request_Throughput | `request_throughput` | `request_throughput` | 一致 |
 | Input_Throughput | `input_throughput` | *(派生：`total_token_throughput - output_throughput`)* | vllm 无原生字段，落盘时计算 |
 | Output_Throughput | `output_throughput` | `output_throughput` | 一致 |
@@ -179,20 +186,42 @@ AutoRes/
 | E2E_{Mean,Median,Std,P90,P95,P99}(ms) | `{mean,median,std,p90,p95,p99}_e2e_latency_ms` | `{mean,median,std,p90,p95,p99}_e2el_ms` | **名称不同**（vllm 是 `e2el`） |
 | Completed | `completed` | `completed` | 成功请求数 |
 | Failed | *(派生，见下)* | `failed_requests` | sglang：`errors` 非空计数 → `num_prompts-completed` → `len(output_lens)-completed` |
-| Total_Input_Tokens / Total_Output_Tokens | `total_input_tokens` / `total_output_tokens` | 同 | 一致 |
+| Total_Input_Tokens / Total_Output_Tokens | `total_input_tokens` / `total_output_tokens` | 同 | 一致；**VLM 下是否含图像 token 两框架口径待实测，落地前不可跨框架比较** |
 | KV_Cache_Hit_Rate(%) | `cache_report.cache_hit_rate_pct` | `kv_cache_hit_rate`（脚本注入） | 跨框架对齐 |
 | SGLang_Spec_Accept_Length / vLLM_Spec_* | `accept_length` / — | — / `spec_decode_*` | 框架专属，不对齐 |
 
-> 新指标写入 `test_runs.metrics` JSON 列（schema-less），**无需改表结构**；老数据需重新 to_csv/上传才有新 key。
-
-> **vllm 落盘注意**：① 加 `--percentile-metrics ttft,tpot,itl,e2el` 才有 E2E；② 加 `--metric-percentiles 90,95,99` 才有 P90/P95 扁平字段；③ 输入长度不进 JSON，通过 `--bench-cmd` 解析 `--random-input-len`；④ `Input_Throughput` 由 total−output 派生。缺失字段一律填 `N/A`，不阻塞落盘。`vllm_sgl_benchs.sh` 已带上述参数。
+> **benchmark_kind**：`to_csv.py --benchmark-kind {text,vlm}` 写入 `metadata.benchmark_kind`，Scanner 按 kind 路由到 `test_runs` 或 `vlm_test_runs`。两套 kind **列结构相同**，差异在 metrics JSON 内的行键字段。
 >
-> **sglang 落盘注意**：输出为 **JSONL**（每行一次 run）；需 `--output-details` 才写入 `errors`/`output_lens`，供派生 `Failed`（明细数组不入库）。`vllm_sgl_benchs.sh` 已加该参数。
+> **行键缺值约定**：只有 `Input_Length` / `Concurrency` 硬必填；其余行键（`Prefix_Rate` / `Image_*`）CSV 缺列则整列 N/A，不报错、不给默认值、上传表单不提供整份回退。`(1024,32,None)` 与 `(1024,32,0.0)` 是不同场景，报告里不会横向对齐。
+>
+> **prefix_rate 层级变更**：已从 run 级表列**下沉**为 text kind 的 metric 行键，不再出现在 `test_runs` 列 / 上传表单 / `compare_on`。
+
+> 新指标写入 metrics JSON 列（schema-less），**无需改表结构**；老数据需重新 to_csv/上传才有新 key。
+
+> **vllm 落盘注意**：① 加 `--percentile-metrics ttft,tpot,itl,e2el` 才有 E2E；② 加 `--metric-percentiles 90,95,99` 才有 P90/P95 扁平字段；③ 输入长度优先读 `_autores_dims`（压测脚本注入），否则回落 `--bench-cmd` 的 `--random-input-len`；④ `Input_Throughput` 由 total−output 派生。缺失字段一律填 `N/A`，不阻塞落盘。
+>
+> **sglang 落盘注意**：输出为 **JSONL**（每行一次 run）；需 `--output-details` 才写入 `errors`/`output_lens`，供派生 `Failed`（明细数组不入库）。
+
+### 5.2.1 VLM 参数对齐与不可对齐项
+
+统一语义用 `HxW` 分辨率字符串；脚本内转换：
+
+| 统一语义 | sglang `bench_serving` | vllm `bench serve` |
+|----------|------------------------|---------------------|
+| 数据集 | `--dataset-name image` | `--dataset-name random-mm` |
+| 每请求图片数 | `--image-count N` | `--random-mm-base-items-per-request N` + limit JSON |
+| 分辨率 | `--image-resolution HxW` | `--random-mm-bucket-config '{"(H, W, 1)": 1.0}'` |
+| 格式/内容 | `--image-format jpeg --image-content random` | **无等价开关**（不可跨框架对齐） |
+| 图片数抖动 | 无 | `--random-mm-num-mm-items-range-ratio` → 脚本固定 `0` |
+| 视频 | 无合成能力 | limit 里 `"video": 0`；`VIDEO_COUNT>0` 脚本直接报错 |
+
+启动时对上述 flag 做 `--help` 探测，缺失则**硬失败**（不静默降级）。详见 `tools/vlm_benchs.sh`。
 
 ### 5.3 metadata.json：结构
 
 ```jsonc
 {
+  "benchmark_kind": "text",             // text → test_runs；vlm → vlm_test_runs
   "framework": "sglang",
   "framework_version": "0.4.6",         // 由 --framework-version 入参手动传入（P4 已定）
   "model": "GLM-4.5",
@@ -215,7 +244,7 @@ AutoRes/
 }
 ```
 
-`launch_cmd` 原文始终保留，作为提取结果的溯源与人工复核依据。
+`launch_cmd` 原文始终保留，作为提取结果的溯源与人工复核依据。`prefix_rate` **不再**写入 metadata 顶层（已下沉为 text metrics 行键）。
 
 ### 5.4 启动参数提取规则（脚本内置，D17）
 
@@ -287,11 +316,20 @@ AutoRes/
 
 ## 6. 数据模型（SQLite）
 
-两张表。`test_runs` 每行 = 一次完整测试（一张 result.csv + 其 metadata.json，D18/方案 A：一次测试=一行，指标以 JSON 列内嵌）；`ingest_log` 是**已入库目录台账**，用于区分哪些 timestamp 目录已处理、哪些未处理。
+两张业务表 + 一张台账。`test_runs`（text kind）与 `vlm_test_runs`（vlm kind）**列结构完全相同**：每行 = 一次完整测试；指标以 JSON 列内嵌，行键字段也在 metrics 内。`ingest_log` 是**已入库目录台账**。
+
+`schema.BENCH_KINDS` 注册表：
+
+- `text` → 表 `test_runs`，行键 `input_length` / `concurrency` / `prefix_rate`
+- `vlm` → 表 `vlm_test_runs`，行键 `input_length` / `concurrency` / `image_count` / `video_count` / `image_resolution`
+
+`compare_on` / run 级 `filters` 只能取 run 级维度（`ALL_DIMENSIONS`，**不含**行键）；行键只能进 `metric_filters`。
 
 数据库为单文件（`database.path`，默认 `/data/autores.db`），建库建表建索引全部由代码启动时自动完成（幂等），零人工初始化。**文件须放本地磁盘，不要放 NAS**——网络文件系统上 SQLite 锁不可靠。
 
-### 6.1 `test_runs` 表
+### 6.1 `test_runs` / `vlm_test_runs` 表
+
+两表 DDL 相同（`vlm_test_runs` 仅换表名），示意：
 
 ```sql
 CREATE TABLE test_runs (
@@ -318,16 +356,20 @@ CREATE TABLE test_runs (
     -- ── 框架专属细节 + 未识别参数 ──
     extra             TEXT NOT NULL DEFAULT '{}',   -- JSON
 
-    -- ── 指标内嵌（方案 A）：JSON 数组，每个 (输入长度,并发) 组合一个元素 ──
-    -- 形如 [{"input_length":1024,"concurrency":32,"Output_Throughput":3200.0,...}, ...]
-    -- 查询只按上面的维度列筛选，metrics 整列取出后在 Python 侧透视（§7.4），无需拆表
+    -- ── 指标内嵌：JSON 数组；每个元素含行键 + 指标 ──
+    -- text 行键: input_length, concurrency, prefix_rate
+    -- vlm  行键: input_length, concurrency, image_count, video_count, image_resolution
+    -- 形如 [{"input_length":1024,"concurrency":32,"prefix_rate":0.0,"Output_Throughput":3200.0,...}, ...]
     metrics           TEXT NOT NULL,      -- JSON
 
     created_at        TEXT NOT NULL
 );
 CREATE INDEX idx_test_runs_dims     ON test_runs (model, framework, framework_version, gpu_type);
 CREATE INDEX idx_test_runs_parallel ON test_runs (tp, dp, pp, ep, cp);
+-- vlm_test_runs 同结构、同索引命名模式
 ```
+
+> **注意**：`prefix_rate` **不是**表列。同 run 级维度下多条压测按行键**并集合并** metrics（`merge_duplicates`），冲突取 `run_timestamp` 更新的；不同场景永不混算。
 
 代码层保留"文档 dict"形态作为内部契约：`db/schema.py` 提供表行 ↔ dict 互转（params 子对象在读出时由参数列重组），下游对齐/工具/Agent 逻辑与存储引擎解耦——这正是本次从 MongoDB 平滑切换到 SQLite 只动 db 层的原因。
 
@@ -431,13 +473,14 @@ CREATE TABLE ingest_log (
 
 ### 7.4 阶段二：确定性报告流水线
 
-1. **查询**：QuerySpec → SQL `SELECT ... WHERE`，取出匹配的 `test_runs` 行（含 metrics JSON 列）。filters/compare_values 转为 `=`/`IN` 条件、exclude 转为 `NOT IN`（NULL 值不被误杀）；metric_filters（输入长度/并发）在取出后于 Python 侧过滤内嵌指标数组。
-2. **取最新（D20）**：结果按"除时间戳外所有维度组合"分组，每组取 `run_timestamp` 最大者。**不同框架版本、不同框架各自成组，全部保留**——不会因版本不同被误合并。
-3. **对齐**：把各文档的内嵌指标透视为矩阵宽表 —— **行 = (Input_Length, Concurrency) 测试条件组合，列 = 每个指标一个"列组"，组内再按对比轴的各个取值展开**；某组合缺某指标时该单元格填 `N/A`（不留空，明确表达"无数据"）。
+1. **查询**：QuerySpec（含 `benchmark_kind`）→ SQL `SELECT ... WHERE`，取出匹配表（`test_runs` / `vlm_test_runs`）的行。filters/compare_values 转为 `=`/`IN` 条件、exclude 转为 `NOT IN`（NULL 值不被误杀）；metric_filters（行键）在取出后于 Python 侧过滤内嵌指标数组。`compare_on` 必须是 run 级维度，不能是行键。
+2. **合并去重**：结果按"run 级维度组合"分组，同组多条 run 的 metrics **按行键取并集**合并（`merge_duplicates`）；同一行键冲突时取 `run_timestamp` 更大的。**不同框架版本、不同框架各自成组，全部保留**——不会因版本不同被误合并。不同场景各占各的行，绝不混算。
+3. **对齐**：把各文档的内嵌指标透视为矩阵宽表 —— **行 = 当前 kind 的全部行键组合，列 = 每个指标一个"列组"，组内再按对比轴的各个取值展开**；某组合缺某指标时该单元格填 `N/A`。报告附带 `coverage`（全列非 N/A 的对齐行数）。
 4. **渲染**（纯数据对比表，D12）：单个 sheet；首行标题区注明约束项（如"模型: GLM-4.5 | 框架: sglang | TP: 8"），随后是对比表。表体版式：
-   - **双层表头**：第 1 行为指标名（跨该指标列组合并），第 2 行为对比轴各取值；左侧 `Input_Length` / `Concurrency` 两列纵向合并两行。
+   - **双层表头**：第 1 行为指标名（跨该指标列组合并），第 2 行为对比轴各取值；左侧按 kind 动态渲染行键列（text 3 列 / vlm 5 列），纵向合并两行。
    - **差异列**：当对比轴恰好为两个取值时，每个指标组末尾追加一列 `A vs B`，值为相对差异 `(A - B) / B`，按百分比格式显示；任一侧为 `N/A` 或分母为 0 时该单元格填 `N/A`。对比轴取值数 ≠ 2 时不生成差异列，并在标题区说明。
    - **块汇总**：每个 `Input_Length` 块结束后插入一行，填该块内各差异列的均值（红色加粗）；`N/A` 不参与均值计算。
+   - 说明行标注对齐率与合并来源（`_merged_from`）。
    - 仅做基础可读性格式（表头加粗、冻结表头与维度列、列宽自适应），不加图表、不加结论。
 5. **产出**：文件写入 `report.output_dir`，文件名 `对比报告_{compare_on}_{时间戳}.xlsx`；生成随机下载 token（UUID），token→文件路径映射存内存；聊天回复中附下载链接及本次取数摘要（几条记录、哪些组合、是否有跨框架/多版本、是否有 N/A）。
 

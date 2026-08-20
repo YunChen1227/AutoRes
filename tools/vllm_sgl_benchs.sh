@@ -74,14 +74,15 @@ FLUSH_CACHE=0                 # 1=每轮压测前清 server 缓存（会把 KV h
 WARMUP_REQUESTS=0
 WARMUP_OUTPUT_LEN=32          # 预热请求输出长度（对齐 sglang 原生 warmup 的 32 token 上限）
 
-# ── 共享前缀比例（0~1，可比对维度，入库 test_runs.prefix_rate）──
+# ── 共享前缀比例数组（0~1，行键维度 Prefix_Rate，写入 metrics / _autores_dims）──
+#   作为第 3 层循环：concurrency → input_len → prefix_rate。
 #   每轮真实前缀长度 = round(INPUT_LEN * PREFIX_RATE)，正文长度 = INPUT_LEN - 前缀，
 #   保证两框架的「总输入 = INPUT_LEN」一致，可横向比较。
 #   PREFIX_RATE=0 → 无前缀（vllm: --random-prefix-len 0；sglang: 沿用 random-ids）。
 #   PREFIX_RATE>0 → vllm 用 random 数据集的 --random-prefix-len；
 #                   sglang random 数据集无前缀参数，改用 generated-shared-prefix
 #                   （--gsp-num-groups 1 单一全局前缀，逆向映射逼近 vllm，强行可比）。
-PREFIX_RATE=0.0
+declare -a PREFIX_RATES=(0.0)
 
 LOG_SUBDIR="logs_910b_cjb_dsv4flashint8_8_260723"
 FILE_PREFIX="dsv4_jk_ori"     # 输出文件名前缀
@@ -174,17 +175,17 @@ if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
     fi
 fi
 
-# ── 共享前缀比例校验（0~1，不含 1）+ 是否启用前缀 ──
-if ! awk -v r="$PREFIX_RATE" 'BEGIN{exit !(r+0==r && r>=0 && r<1)}' </dev/null 2>/dev/null; then
-    echo "[ERR] PREFIX_RATE 必须是 [0,1) 之间的数字，当前=$PREFIX_RATE" >&2
+# ── 共享前缀比例数组校验（每个 rate ∈ [0,1)）──
+if (( ${#PREFIX_RATES[@]} == 0 )); then
+    echo "[ERR] PREFIX_RATES 不能为空" >&2
     exit 1
 fi
-# HAS_PREFIX=1 表示本轮启用共享前缀（rate>0）
-if awk -v r="$PREFIX_RATE" 'BEGIN{exit !(r>0)}' </dev/null 2>/dev/null; then
-    HAS_PREFIX=1
-else
-    HAS_PREFIX=0
-fi
+for _pr in "${PREFIX_RATES[@]}"; do
+    if ! awk -v r="$_pr" 'BEGIN{exit !(r+0==r && r>=0 && r<1)}' </dev/null 2>/dev/null; then
+        echo "[ERR] PREFIX_RATES 每项必须是 [0,1) 之间的数字，当前=$_pr" >&2
+        exit 1
+    fi
+done
 
 # ── 预热参数校验 ──
 if ! [[ "$WARMUP_REQUESTS" =~ ^[0-9]+$ ]]; then
@@ -256,16 +257,8 @@ if (( WARMUP_REQUESTS > 0 )); then
 else
     echo "  WARMUP_REQUESTS  = 0  (不预热)"
 fi
-if [[ "$HAS_PREFIX" == "1" ]]; then
-    if [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
-        echo "  PREFIX_RATE      = $PREFIX_RATE  (sglang: generated-shared-prefix, num-groups=1)"
-    else
-        echo "  PREFIX_RATE      = $PREFIX_RATE  (vllm: --random-prefix-len)"
-    fi
-else
-    echo "  PREFIX_RATE      = $PREFIX_RATE  (无前缀)"
-fi
-echo "  ⚠ 落盘请执行: to_csv.py --framework $BENCH_FRAMEWORK ..."
+echo "  PREFIX_RATES     = ${PREFIX_RATES[*]}  (第 3 层循环；>0 时 sglang→GSP / vllm→random-prefix-len)"
+echo "  ⚠ 落盘请执行: to_csv.py --benchmark-kind text --framework $BENCH_FRAMEWORK ..."
 if [[ "$BENCH_WARMUP_FLAG_OK" == "0" ]]; then
     if [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
         echo "  ⚠ 当前 sglang bench 不认 $BENCH_WARMUP_FLAG，原生那 1 条预热关不掉 → 实际预热=${WARMUP_REQUESTS}+1，与 vllm 不对齐"
@@ -424,23 +417,31 @@ capture_kv_from_vllm_server() {
     fi
 }
 
-# ---- 主循环 ----
+# ---- 主循环：concurrency → input_len → prefix_rate ----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INJECT_DIMS="${SCRIPT_DIR}/inject_dims.py"
+
 for CONCURRENCY in "${max_concurrency[@]}"; do
     INPUT_LENGTHS=(${input_length_map[$CONCURRENCY]})
     for INPUT_LEN in "${INPUT_LENGTHS[@]}"; do
+      for PREFIX_RATE in "${PREFIX_RATES[@]}"; do
         PROMPTS=$((CONCURRENCY * 5))
-        OUTPUT_FILE="${BASE_LOG_DIR}/${FILE_PREFIX}_${CONCURRENCY}_${INPUT_LEN}_${OUTPUT_LEN}_${PROMPTS}.json"
+        # 文件名带 rate，避免不同 prefix 互相覆盖
+        RATE_TAG=$(awk -v r="$PREFIX_RATE" 'BEGIN{printf "%.4g", r+0}')
+        OUTPUT_FILE="${BASE_LOG_DIR}/${FILE_PREFIX}_${CONCURRENCY}_${INPUT_LEN}_${OUTPUT_LEN}_${PROMPTS}_pr${RATE_TAG}.json"
         if [[ -f "$OUTPUT_FILE" ]]; then
             echo "Skipping: $OUTPUT_FILE already exists."
             continue
         fi
         # 共享前缀：真实前缀长度 = round(INPUT_LEN * PREFIX_RATE)，正文 = INPUT_LEN - 前缀，
         # 保证两框架「总输入 = INPUT_LEN」一致可比。REMAIN 至少留 1，避免正文为 0。
-        if [[ "$HAS_PREFIX" == "1" ]]; then
+        if awk -v r="$PREFIX_RATE" 'BEGIN{exit !(r>0)}' </dev/null 2>/dev/null; then
+            HAS_PREFIX=1
             PREFIX_LEN=$(awk -v i="$INPUT_LEN" -v r="$PREFIX_RATE" 'BEGIN{printf "%d", (i*r)+0.5}')
             REMAIN=$((INPUT_LEN - PREFIX_LEN))
             if (( REMAIN < 1 )); then REMAIN=1; PREFIX_LEN=$((INPUT_LEN - 1)); fi
         else
+            HAS_PREFIX=0
             PREFIX_LEN=0
             REMAIN=$INPUT_LEN
         fi
@@ -537,8 +538,16 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
             capture_kv_from_vllm_server "$OUTPUT_FILE"
         fi
 
+        # 注入行键维度（供 to_csv 优先读 _autores_dims）
+        if [[ -f "$OUTPUT_FILE" ]]; then
+            python3 "$INJECT_DIMS" "$OUTPUT_FILE" --kind text \
+                --random-input-len "$INPUT_LEN" --prefix-rate "$PREFIX_RATE" \
+                || echo "[WARN] inject_dims 失败（不阻断）"
+        fi
+
         echo "********************end********************"
         sleep 10
+      done
     done
 done
 echo -e "\n\n>>>>>>>>>>>>>>>>end-end-end>>>>>>>>>>>>>>>>"
@@ -552,14 +561,14 @@ if [[ "$RUN_TO_CSV" == "1" ]]; then
     else
         BENCH_FLUSH_CACHE="false"
     fi
-    TO_CSV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/to_csv.py"
-    echo -e "\n[to_csv] 落盘：server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK flush_cache=$BENCH_FLUSH_CACHE prefix_rate=$PREFIX_RATE deployment=$DEPLOYMENT_MODE"
+    TO_CSV="${SCRIPT_DIR}/to_csv.py"
+    echo -e "\n[to_csv] 落盘：kind=text server=$SERVER_FRAMEWORK bench=$BENCH_FRAMEWORK flush_cache=$BENCH_FLUSH_CACHE prefix_rates=${PREFIX_RATES[*]} deployment=$DEPLOYMENT_MODE"
     # 通用参数；启动命令按部署模式追加（colocated=--launch-cmd；pd_disagg=--prefill/decode/router-cmd）
     TO_CSV_ARGS=(
+        --benchmark-kind text
         --framework "$SERVER_FRAMEWORK"
         --bench-framework "$BENCH_FRAMEWORK"
         --bench-flush-cache "$BENCH_FLUSH_CACHE"
-        --prefix-rate "$PREFIX_RATE"
         --framework-version "$FRAMEWORK_VERSION"
         --input-dir "$BASE_LOG_DIR"
         --nas-dir "$NAS_DIR"

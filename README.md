@@ -23,20 +23,25 @@
 ```
 压测                         落盘                         服务
 ────                         ────                         ────
-tools/vllm_sgl_benchs.sh ──► bench JSON 目录
+tools/vllm_sgl_benchs.sh ──► bench JSON 目录（text）
+tools/vlm_benchs.sh ───────► bench JSON 目录（vlm）
                                     │
 tools/to_csv.py ──────────► NAS 时间戳目录 ──► Scanner ──┐
-frontend/upload.html ─────────────────────────► API 上传 ──┤──► SQLite
-                                                           │
+frontend/upload.html / upload_vlm.html ──────► API 上传 ──┤──► SQLite
+                                                           │   test_runs / vlm_test_runs
 浏览器 chatbot / 下载 ◄── API + Agent + 报告流水线 ◄───────┘
 ```
 
-- **压测脚本** `tools/vllm_sgl_benchs.sh`：按并发×输入长度矩阵批量跑 bench，并尽量抓取 KV hit rate / spec decoding 指标。
-- **落盘脚本** `tools/to_csv.py`：把 bench JSON 整理为固定 schema 的 `result.csv` + `metadata.json`，写入 NAS 时间戳目录。
-- **Scanner**（`autores/scanner/`）：定时扫描 NAS，解析入库。
+- **压测脚本**
+  - `tools/vllm_sgl_benchs.sh`：纯文本，循环 concurrency → input_len → **prefix_rate**，抓取 KV / spec 指标。
+  - `tools/vlm_benchs.sh`：多模态，循环 concurrency → input_len → **image_count** → **image_resolution**（`VIDEO_COUNT` 保留且必须为 0）。
+- **维度注入** `tools/inject_dims.py`：把本轮行键写入结果 JSON 的 `_autores_dims`，供 `to_csv` 优先读取。
+- **落盘脚本** `tools/to_csv.py`：`--benchmark-kind text|vlm`，整理为固定 schema 的 `result.csv` + `metadata.json`。
+- **Scanner**（`autores/scanner/`）：读 `metadata.benchmark_kind`，路由到 `test_runs` 或 `vlm_test_runs`。
 - **API + 前端**（`autores/server/` + `frontend/`）：
   - `/` — chatbot（SSE）
-  - `/upload` — 手工上传入库（含 PD 分离选项卡）
+  - `/upload` — 文本压测手工上传
+  - `/upload/vlm` — VLM 压测手工上传
   - `/api/chat`、`/api/upload`、`/api/download/{token}`、`/api/health`
 - **参数工具**（`tools/`）：
   - `param_map.py` — vLLM/SGLang 启动参数配对表
@@ -126,14 +131,15 @@ bash vllm_sgl_benchs.sh
 | `FLUSH_CACHE` | `0` | `1` = 每轮压测前清 server KV/prefix cache |
 | `WARMUP_REQUESTS` | `0` | 每轮正式压测前的预热请求数。`0` = 不预热；`>0` 由脚本自己发，两个 bench 的原生 warmup 一律关掉，保证 sglang / vllm 行为一致 |
 | `WARMUP_OUTPUT_LEN` | `32` | 预热请求的输出长度（对齐 sglang 原生 warmup 的 32 token 上限） |
-| `PREFIX_RATE` | `0.0` | 共享前缀占输入长度的比例（`0~1`，如 `0.2/0.5/0.8`）。每轮真实前缀长度 = `round(INPUT_LEN × PREFIX_RATE)`，正文 = `INPUT_LEN − 前缀`（总输入仍 = `INPUT_LEN`）。作为对比维度入库 `test_runs.prefix_rate` |
+| `PREFIX_RATES` | `(0.0)` | 共享前缀比例**数组**（每项 `0~1`），作为第 3 层循环。每轮真实前缀长度 = `round(INPUT_LEN × rate)`，正文 = `INPUT_LEN − 前缀`。写入 metrics 行键 `Prefix_Rate`（不再是表列） |
 
-> **关于 `PREFIX_RATE`**（共享前缀，测前缀缓存命中）：
+> **关于 `PREFIX_RATES`**（共享前缀，测前缀缓存命中）：
 > - `vllm` bench：用 `random` 数据集的 `--random-prefix-len`（单一全局前缀，全体请求共享）。
-> - `sglang` bench：`random` 数据集**无前缀参数**，脚本在 `PREFIX_RATE>0` 时自动改用
+> - `sglang` bench：`random` 数据集**无前缀参数**，脚本在 rate>0 时自动改用
 >   `generated-shared-prefix` 数据集（`--gsp-num-groups 1` 单一全局前缀 + `--gsp-system-prompt-len=前缀` +
 >   `--gsp-question-len=正文`）逆向映射逼近 vllm，落盘 `Input_Length` 仍为总输入。
-> - `PREFIX_RATE=0` → 无前缀（vllm `--random-prefix-len 0`；sglang 沿用 `random-ids`），行为与旧版一致。
+> - rate=`0` → 无前缀（vllm `--random-prefix-len 0`；sglang 沿用 `random-ids`）。
+> - 输出文件名带 `_pr{rate}`，不同 rate 互不覆盖；每轮结束后 `inject_dims.py` 写入 `_autores_dims`。
 
 > **关于 `WARMUP_REQUESTS`**（预热，两框架强制对齐）：
 > 两个 bench 的原生 warmup 差异很大 —— sglang `--warmup-requests` **默认就是 1**，输出截到 32 token，一次性全发；
@@ -157,6 +163,40 @@ bash vllm_sgl_benchs.sh
 | KV hit rate | `--cache-report` → JSON 内 `cache_report.cache_hit_rate_pct` | 脚本前后抓 `/metrics`，注入 `kv_cache_hit_rate` |
 | Spec | JSON 内 `accept_length` | JSON 内 `spec_decode_acceptance_rate` / `spec_decode_acceptance_length` |
 
+### 1b. VLM 压测：`tools/vlm_benchs.sh`
+
+多模态压测，循环 **concurrency → input_len → image_count → image_resolution**，入库表 `vlm_test_runs`。
+
+```bash
+cd AutoRes/tools
+# 编辑脚本顶部：MODEL / TOKENIZER / IMAGE_COUNTS / IMAGE_RESOLUTIONS 等
+bash vlm_benchs.sh
+```
+
+**关键配置：**
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `IMAGE_COUNTS` | `(1)` | 每请求图片数数组（第 3 层循环） |
+| `IMAGE_RESOLUTIONS` | `("720x1280")` | `HxW` 字符串数组（第 4 层循环） |
+| `VIDEO_COUNT` | `0` | 保留标量；**>0 直接报错退出**（sglang image 数据集无视频合成） |
+| `WARMUP_REQUESTS` | `0` | 带图预热（chat message 挂 N 张 HxW data-URL）；有 PIL 用随机图，无则退化小图并告警 |
+
+**两框架参数映射（脚本内完成）：**
+
+- sglang：`--dataset-name image --image-count N --image-resolution HxW --image-format jpeg --image-content random`
+- vllm：`--dataset-name random-mm --random-mm-base-items-per-request N --random-mm-num-mm-items-range-ratio 0 --random-mm-limit-mm-per-prompt '{"image":N,"video":0}' --random-mm-bucket-config '{"(H, W, 1)":1.0}'`（backend=`openai-chat`）
+
+启动时对上述 flag 做 `--help` 探测，**缺失则硬失败**（不静默降级）。落盘自动带 `--benchmark-kind vlm`。
+
+#### 不可对齐 / 待验证清单
+
+- sglang `--image-format` / `--image-content` 在 vllm **无等价开关** → 不可跨框架对齐这两项。
+- vllm 支持每请求图片数抖动（`--random-mm-num-mm-items-range-ratio`），sglang 无 → 脚本固定为 `0`。
+- 视频：sglang `image` 数据集无视频合成 → `VIDEO_COUNT` 仅保留字段，`>0` 报错。
+- `Total_Input_Tokens` 在 VLM 下是否含图像 token，两框架口径**待实测**；落地前标注为**不可跨框架比较**。
+- vllm `--random-mm-bucket-config` 与 sglang image 数据集的具体 flag 名需按目标版本核对（脚本启动探测硬失败）。
+
 ### 2. 落盘：`tools/to_csv.py`
 
 把上一步 JSON 目录转为 Scanner 可识别的 NAS 目录。
@@ -165,9 +205,9 @@ bash vllm_sgl_benchs.sh
 
 ```bash
 python tools/to_csv.py \
+  --benchmark-kind text \
   --framework sglang --bench-framework sglang \
   --bench-flush-cache false \
-  --prefix-rate 0.0 \
   --framework-version 0.4.6 \
   --input-dir ./tools/logs_910b_cjb_dsv4flashint8_8_260723 \
   --nas-dir /mnt/nas/benchmark_root \
@@ -178,15 +218,16 @@ python tools/to_csv.py \
 
 > `--framework`（server 框架）与 `--bench-framework`（压测工具框架）**相互独立、均必填**，禁止默认一致——
 > sglang bench 可打 vllm server，反之亦然，共 4 种组合。`--bench-flush-cache true/false` 记录压测前是否清缓存，
-> 作为结果对比的区分维度入库（**必填**）。
+> 作为结果对比的区分维度入库（**必填**）。`--benchmark-kind` 决定路由到 `test_runs` 还是 `vlm_test_runs`。
+> 行键（如 `Prefix_Rate` / `Image_Count`）来自 JSON 的 `_autores_dims` 或 CSV 列，**不再**通过 CLI 整份回退。
 
 **vllm 示例：**
 
 ```bash
 python tools/to_csv.py \
+  --benchmark-kind text \
   --framework vllm --bench-framework vllm \
   --bench-flush-cache false \
-  --prefix-rate 0.5 \
   --framework-version 0.5.12 \
   --input-dir ./tools/logs_vllm \
   --nas-dir /mnt/nas/benchmark_root \
@@ -196,20 +237,20 @@ python tools/to_csv.py \
   --bench-cmd "vllm bench serve --random-input-len 1024 --percentile-metrics ttft,tpot,itl,e2el"
 ```
 
-> 压测脚本 `vllm_sgl_benchs.sh` 顶部把 `RUN_TO_CSV=1` 时，**压测跑完会自动调用一次 `to_csv.py`**
-> （`--bench-flush-cache` 由脚本的 `FLUSH_CACHE` 派生，`--prefix-rate` 直接用脚本的 `PREFIX_RATE`，
-> server/bench 框架用脚本内的两个变量），无需手动执行本步。
+> 压测脚本 `vllm_sgl_benchs.sh` / `vlm_benchs.sh` 顶部把 `RUN_TO_CSV=1` 时，**压测跑完会自动调用一次 `to_csv.py`**
+> （带对应 `--benchmark-kind`；`--bench-flush-cache` 由脚本的 `FLUSH_CACHE` 派生），无需手动执行本步。
 
 **vllm-ascend：** 与 vllm 相同，仅 `--framework vllm-ascend`；参数解析走 vllm 分支，入库 `framework` 仍存 `vllm-ascend`。
 
 **要点：**
 
+- `--benchmark-kind`：`text`（默认）或 `vlm`，写入 `metadata.benchmark_kind` 并决定 Scanner 入库表。
 - `--input-dir`：压测 JSON 所在目录（sglang / vllm 均为 `*.json` 整文件解析）。
 - `--framework` / `--bench-framework`：分别是 server 框架与压测工具框架，**均必填且相互独立**。
   `--bench-framework` 决定 bench JSON 字段解析（须与压测所用工具一致），`--framework` 决定 `--launch-cmd` 的参数提取。
 - `--bench-flush-cache`：`true/false`，**必填**，记录压测前是否清缓存（flush=冷启动、不 flush=复用缓存，结果差异大，作为入库对比维度）。
-- `--prefix-rate`：`0~1` 的小数，**必填**，本次压测共享前缀占输入长度的比例（与输入长度、并发一样是对比维度）→ `test_runs.prefix_rate`；旧数据无此字段时入库默认 `0`。
-- vllm / vllm-ascend 建议传 `--bench-cmd`，用于补 JSON 里没有的 `Input_Length`（从 `--random-input-len` 解析）。
+- 行键维度（`Prefix_Rate` / `Image_*`）由 `inject_dims.py` 写入 `_autores_dims`，或直接出现在 CSV；缺列记 N/A，**不提供** CLI / 表单整份回退值。
+- vllm / vllm-ascend 建议仍传 `--bench-cmd` 作兜底；优先读 `_autores_dims.random_input_len`。
 - vllm bench 须含 `--percentile-metrics ttft,tpot,itl,e2el` 才有完整 E2E/ITL 列（压测脚本已包含）。
 - `--launch-cmd`：完整服务启动命令；脚本提取 tp/dp/pp、投机解码、prefix caching 等入库维度，并计算 `gpu_count`。
 - 成功后在 `--nas-dir` 下创建 `YYYYMMDD_HHMMSS/`，含 `result.csv` 与 `metadata.json`。
@@ -235,9 +276,11 @@ python tools/to_csv.py \
 
 ### 手工上传（可选）
 
-服务启动后打开 `http://<服务器>:8080/upload`：
+服务启动后打开 `http://<服务器>:8080/upload`（文本）或 `/upload/vlm`（多模态）：
 
-1. 上传符合固定 schema 的结果 CSV（须含 `Input_Length`、`Concurrency`）——**选好文件后会自动按 spec 列识别 bench 框架**
+1. 上传符合固定 schema 的结果 CSV——**必需列**只有 `Input_Length`、`Concurrency`；
+   可选行键列（text：`Prefix_Rate`；vlm：`Image_Count` / `Video_Count` / `Image_Resolution`）缺则整列 N/A，且不与有值的行对齐。
+   **选好文件后会自动按 spec 列识别 bench 框架**
 2. 上传启动命令 txt（支持 `#` 注释、空行、反斜杠续行）
 3. 选择 **单机/分布式** 或 **PD 分离**（检测到 disaggregation / kv-transfer 参数会自动切换）
 4. 填写 `framework`（server 框架：`sglang` / `vllm` / `vllm-ascend`）、`framework_version`、`model`，选择 `gpu_type`
@@ -245,6 +288,7 @@ python tools/to_csv.py \
    - **bench 框架**：与 server 框架相互独立。上传 CSV 后按 spec decoding 列是否有值自动预填
      （仅 vLLM 列有值→`vllm`，仅 SGLang 列有值→`sglang`；两者都有/都无则需手选），可手动改。
    - **是否 flush cache**：无法从 CSV 推断，**必须手动勾选**（flush=冷启动、不 flush=复用缓存）。
+   - 表单**不再**提供 `prefix_rate` 整份回退值（已下沉为行键）。
 
 启动参数提取与 `to_csv.py` 同一套规则；PD 模式下分别填写 prefill / decode / router 启动命令。
 
