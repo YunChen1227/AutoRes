@@ -170,19 +170,24 @@ AutoRes/
 | Input_Length | `random_input_len` | *(无，取自 `--bench-cmd` 的 `--random-input-len`)* | vllm bench JSON 不含输入长度 |
 | Concurrency | `max_concurrency` | `max_concurrency` | 一致 |
 | Request_Throughput | `request_throughput` | `request_throughput` | 一致 |
-| Input_Throughput | `input_throughput` | *(vllm 无此字段)* | vllm 无 input 侧吞吐，填 N/A |
+| Input_Throughput | `input_throughput` | *(派生：`total_token_throughput - output_throughput`)* | vllm 无原生字段，落盘时计算 |
 | Output_Throughput | `output_throughput` | `output_throughput` | 一致 |
 | Total_Throughput | `total_throughput` | `total_token_throughput` | **名称不同** |
-| TTFT_{Mean,Median,P99}(ms) | `{mean,median,p99}_ttft_ms` | 同 | 一致 |
-| TPOT_{Mean,Median,P99}(ms) | `{mean,median,p99}_tpot_ms` | 同 | 一致 |
-| ITL_{Mean,Median,P99}(ms) | `{mean,median,p99}_itl_ms` | 同 | 一致 |
-| E2E_{Mean,Median,P99}(ms) | `{mean,median,p99}_e2e_latency_ms` | `{mean,median,p99}_e2el_ms` | **名称不同**（vllm 是 `e2el`） |
+| TTFT_{Mean,Median,Std,P90,P95,P99}(ms) | `{mean,median,std,p90,p95,p99}_ttft_ms` | 同 | 一致；vllm P90/P95 需 `--metric-percentiles` |
+| TPOT_{Mean,Median,Std,P90,P95,P99}(ms) | `{mean,median,std,p90,p95,p99}_tpot_ms` | 同 | 同上 |
+| ITL_{Mean,Median,Std,P90,P95,P99}(ms) | `{mean,median,std,p90,p95,p99}_itl_ms` | 同 | 同上 |
+| E2E_{Mean,Median,Std,P90,P95,P99}(ms) | `{mean,median,std,p90,p95,p99}_e2e_latency_ms` | `{mean,median,std,p90,p95,p99}_e2el_ms` | **名称不同**（vllm 是 `e2el`） |
+| Completed | `completed` | `completed` | 成功请求数 |
+| Failed | *(派生，见下)* | `failed_requests` | sglang：`errors` 非空计数 → `num_prompts-completed` → `len(output_lens)-completed` |
+| Total_Input_Tokens / Total_Output_Tokens | `total_input_tokens` / `total_output_tokens` | 同 | 一致 |
+| KV_Cache_Hit_Rate(%) | `cache_report.cache_hit_rate_pct` | `kv_cache_hit_rate`（脚本注入） | 跨框架对齐 |
+| SGLang_Spec_Accept_Length / vLLM_Spec_* | `accept_length` / — | — / `spec_decode_*` | 框架专属，不对齐 |
 
-新增建议指标（§5.2 之外、两框架都有、对性能分析有价值，纳入 CSV）：`Completed`（成功请求数）、`Total_Input_Tokens`、`Total_Output_Tokens`、`Duration_s`、`P95` 分位（sglang 原生有；vllm 需 bench 时配 `--metric-percentiles`）。
+> 新指标写入 `test_runs.metrics` JSON 列（schema-less），**无需改表结构**；老数据需重新 to_csv/上传才有新 key。
 
-> **vllm 落盘注意（写入文档供测试人员遵循）**：vllm bench 默认**不生成 e2el 统计**，且输入长度不进 JSON。测试人员跑 vllm bench 时需：① 加 `--percentile-metrics ttft,tpot,itl,e2el` 才有 E2E 指标；② 通过 `--bench-cmd` 把完整 bench 命令传给脚本，脚本从中解析 `--random-input-len`。缺失字段一律填 `N/A`，不阻塞落盘。
+> **vllm 落盘注意**：① 加 `--percentile-metrics ttft,tpot,itl,e2el` 才有 E2E；② 加 `--metric-percentiles 90,95,99` 才有 P90/P95 扁平字段；③ 输入长度不进 JSON，通过 `--bench-cmd` 解析 `--random-input-len`；④ `Input_Throughput` 由 total−output 派生。缺失字段一律填 `N/A`，不阻塞落盘。`vllm_sgl_benchs.sh` 已带上述参数。
 >
-> **sglang 落盘注意**：sglang bench 输出为 **JSONL**（每行一次 run），脚本按行解析；vllm 为每次 run 一个独立 JSON 文件。
+> **sglang 落盘注意**：输出为 **JSONL**（每行一次 run）；需 `--output-details` 才写入 `errors`/`output_lens`，供派生 `Failed`（明细数组不入库）。`vllm_sgl_benchs.sh` 已加该参数。
 
 ### 5.3 metadata.json：结构
 

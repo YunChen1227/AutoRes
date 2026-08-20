@@ -3,6 +3,7 @@
 # 压测脚本：sglang / vllm 通用，额外尝试抓取
 #   1) KV cache hit rate（两框架强制对齐，跨框架可比，统一 0-100 百分比）
 #   2) spec decoding 接受率/接受长度（两框架颗粒度不同，不对齐，跨框架不可比）
+#   3) warmup 预热（两框架强制对齐：bench 原生 warmup 一律关掉，改由脚本自己发）
 #
 # ★ 两个 framework 是分开的，一共 4 种组合：
 #     SERVER_FRAMEWORK  推理服务本身的框架  → 决定 flush 端点、/metrics、/server_info
@@ -59,6 +60,19 @@ TOKENIZER="/mnt/pvc/pvc-sfe-platform-id10001749-vol633083-prd/llm_model/DeepSeek
 
 OUTPUT_LEN=1024
 FLUSH_CACHE=0                 # 1=每轮压测前清 server 缓存（会把 KV hit rate 压到冷启动）
+
+# ── 预热请求数（两框架强制对齐，跨框架可比）──
+#   0 = 不预热。两个 bench 的原生 warmup 都显式关掉：vllm --num-warmups 原生默认就是 0，
+#       sglang --warmup-requests 原生默认是 1，不显式传 0 会偷偷多打一条。
+#   >0 = 由脚本自己发 N 条预热请求，bench 侧仍然传 0，以绕开两框架的实现差异：
+#       · 原生 warmup 输出长度不同：sglang 截到 32 token，vllm 用完整 OUTPUT_LEN（差 ~32 倍）
+#       · 原生 warmup 并发不同：sglang 一次性全发，vllm 受 --max-concurrency 限流
+#       · 「预热后清缓存」只有 sglang 有（--flush-cache），vllm bench 没有对应开关
+#       · server=vllm 时 KV hit rate 靠 /metrics 计数器 delta，原生 warmup 会混进 delta；
+#         而 sglang --cache-report 只统计正式请求，两者口径天然不一致
+#   脚本自管预热后，4 种组合的预热强度、清缓存时机、KV 采样基线完全一致。
+WARMUP_REQUESTS=0
+WARMUP_OUTPUT_LEN=32          # 预热请求输出长度（对齐 sglang 原生 warmup 的 32 token 上限）
 
 # ── 共享前缀比例（0~1，可比对维度，入库 test_runs.prefix_rate）──
 #   每轮真实前缀长度 = round(INPUT_LEN * PREFIX_RATE)，正文长度 = INPUT_LEN - 前缀，
@@ -172,6 +186,16 @@ else
     HAS_PREFIX=0
 fi
 
+# ── 预热参数校验 ──
+if ! [[ "$WARMUP_REQUESTS" =~ ^[0-9]+$ ]]; then
+    echo "[ERR] WARMUP_REQUESTS 必须是非负整数，当前=$WARMUP_REQUESTS" >&2
+    exit 1
+fi
+if ! [[ "$WARMUP_OUTPUT_LEN" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERR] WARMUP_OUTPUT_LEN 必须是正整数，当前=$WARMUP_OUTPUT_LEN" >&2
+    exit 1
+fi
+
 # ── 依据组合预解析各指标的采集策略（只算一次）──
 #   CAPTURE_KV  : none | sglang_native | scrape_vllm
 #   CAPTURE_SPEC: none | native
@@ -195,6 +219,24 @@ else
     SGLANG_BENCH_BACKEND="vllm"
 fi
 
+# ── 探测 bench 是否支持关闭原生 warmup ──
+#   预热统一由脚本负责，bench 侧一律传 0。老版本 bench 不认这个参数，硬传会直接报错退出，
+#   故先探一次；探不到就只告警（sglang 会退回原生默认的 1 条预热，两框架不再严格对齐）。
+if [[ "$BENCH_FRAMEWORK" == "vllm" ]]; then
+    BENCH_WARMUP_FLAG="--num-warmups"
+    BENCH_WARMUP_HELP="$(vllm bench serve --help 2>/dev/null)"
+else
+    BENCH_WARMUP_FLAG="--warmup-requests"
+    BENCH_WARMUP_HELP="$(python3 -m sglang.bench_serving --help 2>/dev/null)"
+fi
+WARMUP_OFF=()
+if grep -q -- "$BENCH_WARMUP_FLAG" <<<"$BENCH_WARMUP_HELP"; then
+    BENCH_WARMUP_FLAG_OK=1
+    WARMUP_OFF=("$BENCH_WARMUP_FLAG" 0)
+else
+    BENCH_WARMUP_FLAG_OK=0
+fi
+
 echo "================= 压测配置 ================="
 echo "  SERVER_FRAMEWORK = $SERVER_FRAMEWORK"
 echo "  BENCH_FRAMEWORK  = $BENCH_FRAMEWORK"
@@ -209,6 +251,11 @@ fi
 echo "  KV 采集策略      = $CAPTURE_KV"
 echo "  spec 采集策略    = $CAPTURE_SPEC"
 echo "  FLUSH_CACHE      = $FLUSH_CACHE"
+if (( WARMUP_REQUESTS > 0 )); then
+    echo "  WARMUP_REQUESTS  = $WARMUP_REQUESTS  (脚本自管，输出 ${WARMUP_OUTPUT_LEN} token；bench 原生 warmup 关闭)"
+else
+    echo "  WARMUP_REQUESTS  = 0  (不预热)"
+fi
 if [[ "$HAS_PREFIX" == "1" ]]; then
     if [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
         echo "  PREFIX_RATE      = $PREFIX_RATE  (sglang: generated-shared-prefix, num-groups=1)"
@@ -219,6 +266,13 @@ else
     echo "  PREFIX_RATE      = $PREFIX_RATE  (无前缀)"
 fi
 echo "  ⚠ 落盘请执行: to_csv.py --framework $BENCH_FRAMEWORK ..."
+if [[ "$BENCH_WARMUP_FLAG_OK" == "0" ]]; then
+    if [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
+        echo "  ⚠ 当前 sglang bench 不认 $BENCH_WARMUP_FLAG，原生那 1 条预热关不掉 → 实际预热=${WARMUP_REQUESTS}+1，与 vllm 不对齐"
+    else
+        echo "  ⚠ 当前 vllm bench 不认 $BENCH_WARMUP_FLAG（老版本无此参数，原生默认即 0 预热，不影响对齐）"
+    fi
+fi
 [[ "$CAPTURE_KV" == "none" ]] && echo "  ⚠ 该组合无法可靠获取 KV hit rate（sglang server 请改用 sglang bench + --cache-report）"
 [[ "$CAPTURE_SPEC" == "none" && ( "$SERVER_FRAMEWORK" != "$BENCH_FRAMEWORK" ) ]] && echo "  ⚠ server≠bench：spec 指标颗粒度错位，本轮不采集（避免误贴标签）"
 echo "============================================"
@@ -235,6 +289,60 @@ flush_server_cache() {
         curl -s "${CURL_AUTH[@]}" -X POST "${BASE_URL}/flush_cache?timeout=60" >/dev/null 2>&1 \
             || echo "[WARN] flush_cache 失败"
     fi
+}
+
+# 预热：脚本自己发 WARMUP_REQUESTS 条请求，两框架走同一条 OpenAI 兼容路径
+# (/v1/chat/completions)，保证 4 种组合的预热强度一致。预热完再清一次缓存（受
+# FLUSH_CACHE 控制），之后调用方才去采 KV 基线，故预热流量不会混进 KV hit rate。
+#   $1=本轮输入长度  $2=本轮并发
+run_warmup() {
+    local input_len="$1" conc="$2"
+    (( WARMUP_REQUESTS > 0 )) || return 0
+    echo "[warmup] ${WARMUP_REQUESTS} 条（input≈${input_len} token，max_tokens=${WARMUP_OUTPUT_LEN}，并发≤${conc}）"
+    python3 - "$BASE_URL" "$MODEL" "$input_len" "$WARMUP_OUTPUT_LEN" \
+             "$WARMUP_REQUESTS" "$conc" "${API_KEY}" <<'PYEOF'
+import json
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+base_url, model, input_len, out_len, n, conc, api_key = sys.argv[1:8]
+input_len, out_len, n, conc = int(input_len), int(out_len), int(n), int(conc)
+
+# 近似 input_len 个 token 的填充文本：预热只为打热 kernel / CUDA graph / 权重，
+# 不追求与数据集逐 token 一致（真正计量的请求由 bench 负责）。
+prompt = " ".join(["hi"] * max(input_len, 1))
+body = json.dumps({
+    "model": model,
+    "messages": [{"role": "user", "content": prompt}],
+    "max_tokens": out_len,
+    "temperature": 0.0,
+    "stream": False,
+}).encode()
+headers = {"Content-Type": "application/json"}
+if api_key:
+    headers["Authorization"] = "Bearer " + api_key
+url = base_url.rstrip("/") + "/v1/chat/completions"
+
+
+def fire(_):
+    req = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as resp:
+            resp.read()
+        return True
+    except Exception as exc:
+        print(f"[WARN] warmup 请求失败: {exc}")
+        return False
+
+
+with ThreadPoolExecutor(max_workers=max(min(conc, n), 1)) as pool:
+    ok = sum(pool.map(fire, range(n)))
+print(f"[warmup] 成功 {ok}/{n}")
+PYEOF
+    # 预热后再清一次：FLUSH_CACHE=1 时保证正式压测仍是冷启动。sglang bench 的
+    # --flush-cache 就是这个语义，vllm bench 没有对应开关，故统一由脚本兜底。
+    flush_server_cache
 }
 
 # 抓 BASE_URL 的 vllm prefix cache 累计计数：输出 "queries hits"（抓不到输出空串）
@@ -344,6 +452,9 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
         # 压测前清缓存（可选，端点按 server 选）
         flush_server_cache
 
+        # 预热（可选）：脚本自管，跑在 KV 基线采样之前，预热流量不进 KV delta
+        run_warmup "$INPUT_LEN" "$CONCURRENCY"
+
         # KV：server=vllm 时压测前先抓一次基线计数
         PC_BEFORE=""
         if [[ "$CAPTURE_KV" == "scrape_vllm" ]]; then
@@ -368,11 +479,15 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
                 --save-result \
                 --result-dir "$BASE_LOG_DIR" \
                 --result-filename "$(basename "$OUTPUT_FILE")" \
-                --percentile-metrics ttft,tpot,e2el,itl
+                --percentile-metrics ttft,tpot,e2el,itl \
+                --metric-percentiles 90,95,99 \
+                "${WARMUP_OFF[@]}"
         else
             # sglang bench：backend=sglang-oai-chat 打 sglang server / backend=vllm 打 vllm server
             #   --cache-report 仅在 server=sglang 时加（原生 KV，且只支持 sglang 后端）
             #   accept_length 仅在 backend 含 sglang（即 server=sglang）时由 bench 自动查 /server_info
+            #   --output-details：写入 errors/output_lens，供 to_csv 派生 Failed 计数（不入库明细）
+            #   --warmup-requests 0（WARMUP_OFF）：关掉原生默认的 1 条预热，预热改由 run_warmup 统管
             SGL_EXTRA=()
             [[ "$CAPTURE_KV" == "sglang_native" ]] && SGL_EXTRA+=(--cache-report)
             mapfile -t _SGL_EP < <(_sglang_endpoint_args)
@@ -412,6 +527,7 @@ for CONCURRENCY in "${max_concurrency[@]}"; do
                 --tokenizer "$TOKENIZER" \
                 --output-file "$OUTPUT_FILE" \
                 --output-details \
+                "${WARMUP_OFF[@]}" \
                 "${SGL_EXTRA[@]}" \
                 --model "$MODEL"
         fi

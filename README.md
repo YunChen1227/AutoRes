@@ -124,6 +124,8 @@ bash vllm_sgl_benchs.sh
 | `SERVER_HOST` / `SERVER_PORT` | 见脚本 | 推理服务地址 |
 | `MODEL` / `TOKENIZER` | 见脚本 | 模型名与 tokenizer 路径 |
 | `FLUSH_CACHE` | `0` | `1` = 每轮压测前清 server KV/prefix cache |
+| `WARMUP_REQUESTS` | `0` | 每轮正式压测前的预热请求数。`0` = 不预热；`>0` 由脚本自己发，两个 bench 的原生 warmup 一律关掉，保证 sglang / vllm 行为一致 |
+| `WARMUP_OUTPUT_LEN` | `32` | 预热请求的输出长度（对齐 sglang 原生 warmup 的 32 token 上限） |
 | `PREFIX_RATE` | `0.0` | 共享前缀占输入长度的比例（`0~1`，如 `0.2/0.5/0.8`）。每轮真实前缀长度 = `round(INPUT_LEN × PREFIX_RATE)`，正文 = `INPUT_LEN − 前缀`（总输入仍 = `INPUT_LEN`）。作为对比维度入库 `test_runs.prefix_rate` |
 
 > **关于 `PREFIX_RATE`**（共享前缀，测前缀缓存命中）：
@@ -132,6 +134,16 @@ bash vllm_sgl_benchs.sh
 >   `generated-shared-prefix` 数据集（`--gsp-num-groups 1` 单一全局前缀 + `--gsp-system-prompt-len=前缀` +
 >   `--gsp-question-len=正文`）逆向映射逼近 vllm，落盘 `Input_Length` 仍为总输入。
 > - `PREFIX_RATE=0` → 无前缀（vllm `--random-prefix-len 0`；sglang 沿用 `random-ids`），行为与旧版一致。
+
+> **关于 `WARMUP_REQUESTS`**（预热，两框架强制对齐）：
+> 两个 bench 的原生 warmup 差异很大 —— sglang `--warmup-requests` **默认就是 1**，输出截到 32 token，一次性全发；
+> vllm `--num-warmups` 默认 0，输出用完整 `OUTPUT_LEN`，且受 `--max-concurrency` 限流；「预热后清缓存」也只有 sglang 有
+> （`--flush-cache`）。另外 server=vllm 时 KV hit rate 靠 `/metrics` 计数器 delta，原生 warmup 会混进 delta，
+> 而 sglang `--cache-report` 只统计正式请求，两者口径天然不一致。
+> 所以脚本把两边的原生 warmup 都显式传 `0`，预热改由脚本统一发（同一条 `/v1/chat/completions`，条数 / 输出长度 / 并发一致），
+> 并把预热放在 **KV 基线采样之前**；`FLUSH_CACHE=1` 时预热后再清一次缓存，保证正式压测仍是冷启动。
+> 这样 4 种 server×bench 组合的预热强度、清缓存时机、KV hit rate 口径完全一致。
+> 若 bench 版本太老不认这两个参数，脚本会在启动横幅告警（sglang 会多出原生的 1 条预热）。
 
 **输出：** 脚本内 `LOG_SUBDIR` 目录（默认 `tools/logs_910b_cjb_dsv4flashint8_8_260723/`）下多个 JSON。已存在的文件会跳过，可断点续跑。
 
@@ -241,12 +253,13 @@ python tools/to_csv.py \
 完整表头以 `tools/to_csv.py` 的 `METRIC_FIELD_MAP` 为准；**必填列**只有 `Input_Length`、`Concurrency`，缺测填 `N/A`。
 
 ```csv
-Input_Length,Concurrency,...,Completed,Total_Input_Tokens,Total_Output_Tokens,KV_Cache_Hit_Rate(%),SGLang_Spec_Accept_Length,vLLM_Spec_Accept_Rate(%),vLLM_Spec_Accept_Length
-1024,32,...,400,409600,81920,63.5,2.87,N/A,N/A
+Input_Length,Concurrency,...,Completed,Failed,Total_Input_Tokens,Total_Output_Tokens,KV_Cache_Hit_Rate(%),SGLang_Spec_Accept_Length,vLLM_Spec_Accept_Rate(%),vLLM_Spec_Accept_Length
+1024,32,...,400,0,409600,81920,63.5,2.87,N/A,N/A
 ```
 
+另含延迟 Std/P90 列（如 `TTFT_Std(ms)`、`TTFT_P90(ms)` 等），完整表头见 `METRIC_FIELD_MAP`。  
 sglang 行：`KV_Cache_Hit_Rate` + `SGLang_Spec_Accept_Length` 有值，vllm spec 列为 `N/A`。  
-vllm 行反之；`KV_Cache_Hit_Rate(%)` 两边语义对齐（均为 0–100 的百分比）。
+vllm 行反之；`KV_Cache_Hit_Rate(%)` 两边语义对齐（均为 0–100 的百分比）；`Input_Throughput` 由 total−output 派生。
 
 #### 样例：`launch.txt`（sglang）
 

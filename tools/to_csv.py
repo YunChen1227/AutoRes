@@ -75,31 +75,42 @@ METRIC_FIELD_MAP = {
     "Concurrency":         {"sglang": "max_concurrency",   "vllm": "max_concurrency"},
     # 吞吐
     "Request_Throughput":  {"sglang": "request_throughput", "vllm": "request_throughput"},
-    "Input_Throughput":    {"sglang": "input_throughput",   "vllm": None},  # vllm 无 input 侧吞吐
+    # vllm 无原生 input 侧吞吐；record_to_row 用 total_token_throughput - output_throughput 派生
+    "Input_Throughput":    {"sglang": "input_throughput",   "vllm": None},
     "Output_Throughput":   {"sglang": "output_throughput",  "vllm": "output_throughput"},
     "Total_Throughput":    {"sglang": "total_throughput",   "vllm": "total_token_throughput"},
     # TTFT
     "TTFT_Mean(ms)":       {"sglang": "mean_ttft_ms",   "vllm": "mean_ttft_ms"},
     "TTFT_Median(ms)":     {"sglang": "median_ttft_ms", "vllm": "median_ttft_ms"},
+    "TTFT_Std(ms)":        {"sglang": "std_ttft_ms",    "vllm": "std_ttft_ms"},
+    "TTFT_P90(ms)":        {"sglang": "p90_ttft_ms",    "vllm": "p90_ttft_ms"},
     "TTFT_P95(ms)":        {"sglang": "p95_ttft_ms",    "vllm": "p95_ttft_ms"},
     "TTFT_P99(ms)":        {"sglang": "p99_ttft_ms",    "vllm": "p99_ttft_ms"},
     # TPOT
     "TPOT_Mean(ms)":       {"sglang": "mean_tpot_ms",   "vllm": "mean_tpot_ms"},
     "TPOT_Median(ms)":     {"sglang": "median_tpot_ms", "vllm": "median_tpot_ms"},
+    "TPOT_Std(ms)":        {"sglang": "std_tpot_ms",    "vllm": "std_tpot_ms"},
+    "TPOT_P90(ms)":        {"sglang": "p90_tpot_ms",    "vllm": "p90_tpot_ms"},
     "TPOT_P95(ms)":        {"sglang": "p95_tpot_ms",    "vllm": "p95_tpot_ms"},
     "TPOT_P99(ms)":        {"sglang": "p99_tpot_ms",    "vllm": "p99_tpot_ms"},
     # ITL
     "ITL_Mean(ms)":        {"sglang": "mean_itl_ms",    "vllm": "mean_itl_ms"},
     "ITL_Median(ms)":      {"sglang": "median_itl_ms",  "vllm": "median_itl_ms"},
+    "ITL_Std(ms)":         {"sglang": "std_itl_ms",     "vllm": "std_itl_ms"},
+    "ITL_P90(ms)":         {"sglang": "p90_itl_ms",     "vllm": "p90_itl_ms"},
     "ITL_P95(ms)":         {"sglang": "p95_itl_ms",     "vllm": "p95_itl_ms"},
     "ITL_P99(ms)":         {"sglang": "p99_itl_ms",     "vllm": "p99_itl_ms"},
     # E2E（vllm 叫 e2el）
     "E2E_Mean(ms)":        {"sglang": "mean_e2e_latency_ms",   "vllm": "mean_e2el_ms"},
     "E2E_Median(ms)":      {"sglang": "median_e2e_latency_ms", "vllm": "median_e2el_ms"},
+    "E2E_Std(ms)":         {"sglang": "std_e2e_latency_ms",    "vllm": "std_e2el_ms"},
+    "E2E_P90(ms)":         {"sglang": "p90_e2e_latency_ms",    "vllm": "p90_e2el_ms"},
     "E2E_P95(ms)":         {"sglang": "p95_e2e_latency_ms",    "vllm": "p95_e2el_ms"},
     "E2E_P99(ms)":         {"sglang": "p99_e2e_latency_ms",    "vllm": "p99_e2el_ms"},
     # 新增建议指标（P3 已定；不含 Duration_s）
     "Completed":           {"sglang": "completed",            "vllm": "completed"},
+    # Failed：vllm 原生 failed_requests；sglang 无聚合字段，由 record_to_row 派生
+    "Failed":              {"sglang": None,                   "vllm": "failed_requests"},
     "Total_Input_Tokens":  {"sglang": "total_input_tokens",   "vllm": "total_input_tokens"},
     "Total_Output_Tokens": {"sglang": "total_output_tokens",  "vllm": "total_output_tokens"},
     # ── KV cache 命中率（强制对齐：跨框架可比，统一 0-100 百分比）──
@@ -493,7 +504,78 @@ def record_to_row(framework, record, fallback_input_len):
             continue
         val = _dig(record, key)
         row[col] = format_num(val) if val is not _MISSING else NA
+
+    # vllm 无 input 侧吞吐：total_token_throughput - output_throughput
+    if pm_fw == "vllm" and row.get("Input_Throughput") in (NA, None):
+        tot = _dig(record, "total_token_throughput")
+        out = _dig(record, "output_throughput")
+        if tot is not _MISSING and out is not _MISSING:
+            try:
+                row["Input_Throughput"] = format_num(float(tot) - float(out))
+            except (TypeError, ValueError):
+                pass
+
+    # vllm 分位常存 percentiles_*_ms 列表（非扁平 p90_*）；扁平缺失时回填
+    if pm_fw == "vllm":
+        _fill_vllm_percentiles_from_lists(row, record)
+
+    # sglang 失败数：errors → num_prompts-completed → len(output_lens)-completed → N/A
+    # （需 bench --output-details 才有 errors/output_lens；明细数组不入库）
+    if pm_fw == "sglang" and row.get("Failed") in (NA, None):
+        comp = _dig(record, "completed")
+        errs = _dig(record, "errors")
+        olens = _dig(record, "output_lens")
+        nprompts = _dig(record, "num_prompts")
+        failed = None
+        if isinstance(errs, list):
+            failed = sum(1 for e in errs if e)  # 成功项通常为 ""
+        elif nprompts is not _MISSING and comp is not _MISSING:
+            try:
+                failed = int(nprompts) - int(comp)
+            except (TypeError, ValueError):
+                failed = None
+        elif isinstance(olens, list) and comp is not _MISSING:
+            try:
+                failed = len(olens) - int(comp)
+            except (TypeError, ValueError):
+                failed = None
+        if failed is not None:
+            row["Failed"] = format_num(failed)
+
     return row
+
+
+def _fill_vllm_percentiles_from_lists(row: dict, record: dict) -> None:
+    """从 percentiles_{ttft,tpot,itl,e2el}_ms 列表回填 P90/P95/P99 列。"""
+    metric_to_prefix = {
+        "ttft": "TTFT",
+        "tpot": "TPOT",
+        "itl": "ITL",
+        "e2el": "E2E",
+    }
+    for metric, prefix in metric_to_prefix.items():
+        plist = _dig(record, f"percentiles_{metric}_ms")
+        if not isinstance(plist, list):
+            continue
+        for item in plist:
+            p_val = None
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                p_val = (item[0], item[1])
+            elif isinstance(item, dict):
+                p = item.get("percentile", item.get("p"))
+                v = item.get("value", item.get("val"))
+                if p is not None and v is not None:
+                    p_val = (p, v)
+            if p_val is None:
+                continue
+            try:
+                p_int = int(float(p_val[0]))
+            except (TypeError, ValueError):
+                continue
+            col = f"{prefix}_P{p_int}(ms)"
+            if col in row and row[col] in (NA, None):
+                row[col] = format_num(p_val[1])
+
 
 
 def build_rows(framework, records, fallback_input_len):
