@@ -37,13 +37,66 @@ log = get_logger("upload")
 
 # 表单必填的元信息字段（metadata.json 在上传流里的替代品）
 # 模型无版本时只填 model；model_version 入库写空串，不要求用户填写。
-REQUIRED_META = ["framework", "framework_version", "model", "gpu_type"]
+REQUIRED_META = [
+    "framework", "framework_version", "model", "gpu_type",
+    "model_size", "model_dtype",
+]
 
 # 压测工具框架（bench framework）可选值。与 server framework 相互独立、禁止默认一致。
 SUPPORTED_BENCH_FRAMEWORKS = ["sglang", "vllm"]
 
 # CSV 单元格里视为"无值"的取值（判断 spec 列是否有值时用）；注意 "0" 算有值。
 _NA_CELLS = frozenset({"", "n/a", "na", "none", "null"})
+
+
+def _parse_positive_int(val, label: str) -> int:
+    """解析正整数（模型大小 GB、图片数量等）。"""
+    if val is None or (isinstance(val, str) and not val.strip()):
+        raise UploadError(f"缺少必填字段: {label}")
+    try:
+        n = int(str(val).strip())
+    except (TypeError, ValueError) as e:
+        raise UploadError(f"{label} 必须是正整数，收到: {val}") from e
+    if n < 1:
+        raise UploadError(f"{label} 必须是 ≥1 的整数，收到: {n}")
+    return n
+
+
+def _parse_image_resolution(val, label: str = "bench_image_resolution") -> str:
+    """HxW 分辨率字符串（与 vlm_benchs.sh 一致）。"""
+    import re
+    if val is None or (isinstance(val, str) and not val.strip()):
+        raise UploadError(f"缺少必填字段: {label}")
+    s = str(val).strip()
+    if not re.match(r"^\d+[xX]\d+$", s):
+        raise UploadError(f"{label} 格式非法（需 HxW，如 720x1280），收到: {s}")
+    return s.lower()
+
+
+def _apply_vlm_row_key_fallbacks(
+    metrics: list[dict],
+    mapped_canons: set[str],
+    *,
+    image_count: int | None,
+    image_resolution: str | None,
+) -> None:
+    """VLM：CSV 缺 Image_Count / Image_Resolution 列时，用表单 bench 参数整列回填。"""
+    if "Image_Count" not in mapped_canons and image_count is not None:
+        for m in metrics:
+            if m.get("image_count") is None:
+                m["image_count"] = image_count
+    if "Image_Resolution" not in mapped_canons and image_resolution is not None:
+        for m in metrics:
+            if m.get("image_resolution") is None:
+                m["image_resolution"] = image_resolution
+    if "Video_Count" not in mapped_canons:
+        for m in metrics:
+            if m.get("video_count") is None:
+                m["video_count"] = 0
+
+
+def supported_model_dtypes() -> list[str]:
+    return list(schema.MODEL_DTYPE_CHOICES)
 
 
 def supported_bench_frameworks() -> list[str]:
@@ -222,7 +275,8 @@ def read_upload_table(raw: bytes) -> tuple[list[str], list[dict]]:
 
 
 def _build_metrics(fieldnames: list[str], rows: list[dict],
-                   kind: str | None = None) -> list[dict]:
+                   kind: str | None = None,
+                   header_map: dict | None = None) -> list[dict]:
     """
     表头 + 行数据 → metric 记录列表（CSV / Excel 共用）。
     表头会 remap 到 to_csv.py 规范列名；列名归一与数值转换与 scanner 一致。
@@ -236,7 +290,8 @@ def _build_metrics(fieldnames: list[str], rows: list[dict],
     if not fieldnames:
         raise UploadError("表格无表头")
 
-    header_map = build_header_map(list(fieldnames))
+    if header_map is None:
+        header_map = build_header_map(list(fieldnames))
     missing = check_required_dimensions(header_map, bk)
     if missing:
         raw_headers = [str(h).strip() for h in fieldnames
@@ -290,10 +345,13 @@ def _build_metrics(fieldnames: list[str], rows: list[dict],
     return metrics
 
 
-def parse_table(raw: bytes, kind: str | None = None) -> list[dict]:
-    """上传文件字节 → metric 记录列表（自动识别 CSV / xlsx）。"""
+def parse_table(raw: bytes, kind: str | None = None) -> tuple[list[dict], set[str]]:
+    """上传文件字节 → (metric 记录列表, 已映射到的规范列名集合)。"""
     fieldnames, rows = read_upload_table(raw)
-    return _build_metrics(fieldnames, rows, kind)
+    header_map = build_header_map(list(fieldnames))
+    metrics = _build_metrics(fieldnames, rows, kind, header_map=header_map)
+    mapped = {v for v in header_map.values() if v}
+    return metrics, mapped
 
 
 def detect_bench_framework(csv_bytes: bytes) -> dict:
@@ -370,6 +428,16 @@ def validate_meta(form: dict) -> dict:
     # 模型版本可选：无版本时存空串，库表仍保留该列以便与落盘流对齐
     meta["model_version"] = (form.get("model_version") or "").strip()
 
+    meta["model_size"] = _parse_positive_int(form.get("model_size"), "model_size")
+
+    dtype = (form.get("model_dtype") or "").strip().lower()
+    if not dtype:
+        raise UploadError("缺少必填字段: model_dtype")
+    if dtype not in schema.MODEL_DTYPE_CHOICES:
+        raise UploadError(
+            f"model_dtype 必须是 {list(schema.MODEL_DTYPE_CHOICES)} 之一，收到: {dtype}")
+    meta["model_dtype"] = dtype
+
     allowed = launch_params.supported_frameworks()
     if meta["framework"] not in allowed:
         raise UploadError(f"framework 必须是 {allowed} 之一，收到: {meta['framework']}")
@@ -400,6 +468,13 @@ def validate_meta(form: dict) -> dict:
         meta["benchmark_kind"] = schema.resolve_kind(raw_kind).name
     except ValueError as e:
         raise UploadError(str(e)) from e
+
+    # VLM bench 参数：与 vlm_benchs.sh 类型一致（整型图片数 + HxW 分辨率）
+    if meta["benchmark_kind"] == "vlm":
+        meta["_bench_image_count"] = _parse_positive_int(
+            form.get("bench_image_count"), "bench_image_count")
+        meta["_bench_image_resolution"] = _parse_image_resolution(
+            form.get("bench_image_resolution"))
     return meta
 
 
@@ -504,7 +579,13 @@ def ingest(
 
     meta = validate_meta(meta_form)
     kind = meta["benchmark_kind"]
-    metrics = parse_table(csv_bytes, kind)
+    metrics, mapped_canons = parse_table(csv_bytes, kind)
+    if kind == "vlm":
+        _apply_vlm_row_key_fallbacks(
+            metrics, mapped_canons,
+            image_count=meta.pop("_bench_image_count", None),
+            image_resolution=meta.pop("_bench_image_resolution", None),
+        )
 
     extra: dict = {"ingest_source": "manual_upload"}
 

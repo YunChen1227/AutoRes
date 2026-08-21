@@ -42,7 +42,7 @@
   label { font-size: 13px; font-weight: 500; }
   label .req { color: var(--err); }
   label .muted { color: var(--muted); font-weight: 400; }
-  input[type="text"], select, textarea {
+  input[type="text"], input[type="number"], select, textarea {
     border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
     font: inherit; background: #fff; width: 100%;
   }
@@ -50,7 +50,7 @@
     min-height: 92px; resize: vertical; line-height: 1.5;
     font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px;
   }
-  input[type="text"]:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f2; border-color: var(--accent); }
+  input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f2; border-color: var(--accent); }
   .filebox {
     border: 1px dashed #c8ccd4; border-radius: 10px; padding: 14px;
     display: flex; align-items: center; gap: 12px; background: #fafbfc;
@@ -185,9 +185,10 @@
       </div>
 
       <div class="card">
-        <h3>3. 填写元信息</h3>
+        <h3>3. 填写模型服务信息</h3>
         <div class="desc">
-          这些字段无法从 CSV / 启动命令推断，需手工填写。其中<b>框架</b>决定用哪套启动参数提取规则与默认值回填。
+          描述本次推理服务部署的模型与运行环境；这些字段无法从 CSV / 启动命令推断，需手工填写。
+          <b>框架</b>决定用哪套启动参数提取规则与默认值回填。
         </div>
         <div class="grid">
           <div class="field">
@@ -201,6 +202,17 @@
           <div class="field">
             <label>模型 <span class="req">*</span></label>
             <input type="text" name="model" placeholder="如 GLM-4.5" required>
+          </div>
+          <div class="field">
+            <label>模型大小 (GB) <span class="req">*</span></label>
+            <input type="number" name="model_size" id="model_size" min="1" step="1"
+                   placeholder="如 72" required>
+          </div>
+          <div class="field">
+            <label>模型 dtype <span class="req">*</span></label>
+            <select name="model_dtype" id="model_dtype" required>
+              <option value="">请选择</option>
+            </select>
           </div>
           <div class="field">
             <label>显卡 <span class="req">*</span></label>
@@ -228,6 +240,7 @@
   const result = document.getElementById("result");
   const frameworkSel = document.getElementById("framework");
   const gpuSel = document.getElementById("gpu_type");
+  const dtypeSel = document.getElementById("model_dtype");
   const benchSel = document.getElementById("bench_framework");
   const benchHint = document.getElementById("benchhint");
   const csvInput = form.querySelector('input[name="csv_file"]');
@@ -253,6 +266,7 @@
     .then(function (d) {
       fillSelect(frameworkSel, d.frameworks || []);
       fillSelect(gpuSel, d.gpu_types || []);
+      fillSelect(dtypeSel, d.model_dtypes || []);
       fillSelect(benchSel, d.bench_frameworks || ["sglang", "vllm"]);
     })
     .catch(function () {
@@ -261,6 +275,7 @@
         "H20-141G", "H20-96G", "910B3", "910B4-32G", "910B4-64G",
         "C550", "PPU810E", "PPU890",
       ]);
+      fillSelect(dtypeSel, ["bf16", "fp8", "int8", "int4", "fp4"]);
       fillSelect(benchSel, ["sglang", "vllm"]);
     });
 
@@ -409,6 +424,11 @@
     if (!form.querySelector('input[name="bench_flush_cache"]:checked')) {
       return "请选择压测前是否 flush cache";
     }
+    const ms = form.querySelector('input[name="model_size"]');
+    if (!ms || !ms.value || parseInt(ms.value, 10) < 1) {
+      return "请填写模型大小（≥1 的整数，单位 GB）";
+    }
+    if (!dtypeSel.value) return "请选择模型 dtype";
     return null;
   }
 

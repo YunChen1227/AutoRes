@@ -36,10 +36,15 @@ from datetime import datetime
 META_DIMENSIONS = [
     "model",
     "model_version",
+    "model_size",
+    "model_dtype",
     "framework",
     "framework_version",
     "gpu_type",
 ]
+
+# 上传表单 / 模型服务信息：权重 dtype 可选值
+MODEL_DTYPE_CHOICES: tuple[str, ...] = ("bf16", "fp8", "int8", "int4", "fp4")
 
 # ── 结构化启动参数维度（同样是直接列；文档/接口上仍归为 params）──
 #
@@ -220,6 +225,8 @@ def metric_dims(kind: str | None = None) -> tuple[str, ...]:
 METADATA_DIRECT_FIELDS: tuple[str, ...] = (
     "model",
     "model_version",       # DB NOT NULL，但允许空串；upload 不要求用户填写
+    "model_size",          # 模型参数量（GB，整数）；upload 必填
+    "model_dtype",         # 权重 dtype：bf16/fp8/int8/int4/fp4；upload 必填
     "framework",           # server（推理服务）框架
     "framework_version",
     "gpu_type",
@@ -261,6 +268,8 @@ def _test_runs_columns() -> list[tuple[str, str]]:
         ("run_timestamp", "TEXT NOT NULL"),
         ("model", "TEXT NOT NULL"),
         ("model_version", "TEXT NOT NULL"),
+        ("model_size", "INTEGER"),
+        ("model_dtype", "TEXT"),
         ("framework", "TEXT NOT NULL"),
         ("framework_version", "TEXT NOT NULL"),
         ("gpu_type", "TEXT NOT NULL"),
@@ -393,6 +402,8 @@ def doc_to_row(doc: dict, kind: str | None = None) -> dict:
         "run_timestamp": _iso(doc["run_timestamp"]),
         "model": doc["model"],
         "model_version": doc["model_version"],
+        "model_size": doc.get("model_size"),
+        "model_dtype": doc.get("model_dtype"),
         "framework": doc["framework"],
         "framework_version": doc["framework_version"],
         "gpu_type": doc["gpu_type"],
@@ -430,6 +441,8 @@ def row_to_doc(row, kind: str | None = None) -> dict:
         "run_timestamp": datetime.fromisoformat(row["run_timestamp"]),
         "model": row["model"],
         "model_version": row["model_version"],
+        "model_size": _rget(row, "model_size"),
+        "model_dtype": _rget(row, "model_dtype"),
         "framework": row["framework"],
         "framework_version": row["framework_version"],
         "gpu_type": row["gpu_type"],

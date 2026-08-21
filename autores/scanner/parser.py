@@ -112,6 +112,8 @@ def parse_run_dir(dir_path: str) -> dict:
         "run_timestamp": run_timestamp,
         "model": meta["model"],
         "model_version": meta["model_version"],
+        "model_size": meta["model_size"],
+        "model_dtype": meta["model_dtype"],
         "framework": meta["framework"],
         "framework_version": meta["framework_version"],
         "gpu_type": meta["gpu_type"],
