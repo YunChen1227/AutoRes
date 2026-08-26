@@ -124,6 +124,25 @@ async def upload_detect_bench(csv_file: UploadFile = File(...)):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+@router.post("/api/upload/inspect-config")
+async def upload_inspect_config(config_file: UploadFile = File(...)):
+    """
+    选好 config.json 后立刻回显识别到的模型结构与元信息预填值，
+    让用户当场确认传对了文件。这里只解析、不入库；非法文件返回 400 与具体原因。
+
+    model_meta 里的三项就是留空时的入库值，前端把它们回显成占位提示而不是预填
+    输入框——让用户核对而不是让用户抄一遍。
+    """
+    try:
+        raw = await config_file.read()
+        cfg = launch_params.load_model_config(raw)
+        arch = launch_params.normalize_model_config(cfg)
+        meta, notes = launch_params.model_meta(cfg, arch)
+        return JSONResponse({"model_arch": arch, "model_meta": meta, "notes": notes})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 @router.post("/api/upload/detect")
 async def upload_detect(
     framework: str = Form(""),
@@ -144,12 +163,14 @@ async def upload_detect(
 async def upload_run(
     request: Request,
     csv_file: UploadFile = File(...),
+    config_file: UploadFile | None = File(None),
     framework: str = Form(...),
     framework_version: str = Form(...),
     model: str = Form(...),
     gpu_type: str = Form(...),
-    model_size: str = Form(...),
-    model_dtype: str = Form(...),
+    model_params_b: str = Form(""),
+    model_weight_gb: str = Form(""),
+    model_dtype: str = Form(""),
     model_version: str = Form(""),
     bench_framework: str = Form(...),
     bench_flush_cache: str = Form(...),
@@ -166,6 +187,13 @@ async def upload_run(
 
     单机/分布式：deployment_mode=colocated，命令走 launch_cmd。
     PD 分离    ：deployment_mode=pd_disagg，命令走 prefill_cmd / decode_cmd（+ router_cmd）。
+
+    config_file 是模型目录下的 config.json（可选）。给了它才能推出 context_length /
+    dtype / quantization / 批量调度默认值等启动命令里通常不写的参数，以及
+    model_params_b / model_weight_gb / model_dtype 三个元信息列。
+
+    这三列留空即按 config.json 推导值入库，填了以填的为准（不一致时在回显里告警）。
+    没传 config 时 model_params_b 必填——它是分组对比的主轴，不能为空。
     """
     st = request.app.state
     meta = {
@@ -173,7 +201,8 @@ async def upload_run(
         "framework_version": framework_version,
         "model": model,
         "model_version": model_version,
-        "model_size": model_size,
+        "model_params_b": model_params_b,
+        "model_weight_gb": model_weight_gb,
         "model_dtype": model_dtype,
         "gpu_type": gpu_type,
         "bench_framework": bench_framework,
@@ -184,6 +213,7 @@ async def upload_run(
     }
     try:
         csv_bytes = await csv_file.read()
+        config_bytes = await config_file.read() if config_file is not None else None
         summary = upload_mod.ingest(
             st.db, meta, csv_bytes, launch_cmd,
             benchmark_root=st.config.scanner.benchmark_root,
@@ -193,6 +223,7 @@ async def upload_run(
             decode_text=decode_cmd,
             router_text=router_cmd,
             benchmark_kind=benchmark_kind,
+            config_bytes=config_bytes,
         )
     except UploadError as e:
         log.info("上传校验失败", extra={"fields": {"error": str(e)}})
@@ -207,7 +238,8 @@ async def upload_run(
 
     log.info("上传入库成功", extra={"fields": {
         "run_id": summary["run_id"], "metrics": summary["num_metrics"],
-        "kind": summary.get("benchmark_kind")}})
+        "kind": summary.get("benchmark_kind"),
+        "model_config_used": summary.get("model_config_used")}})
     return JSONResponse(summary)
 
 

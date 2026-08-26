@@ -3,7 +3,8 @@
 
   {benchmark_root}/YYYYMMDD_HHMMSS/
     ├── result.csv
-    └── metadata.json   # launch_cmd 写入 JSON，无单独 txt 文件
+    ├── metadata.json       # launch_cmd 写入 JSON，无单独 txt 文件
+    └── model_config.json   # 模型 config.json 原文（用户上传了才有）
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from autores.db import schema
+from autores.server.ingest import launch_params
 from autores.server.ingest.csv_columns import canonical_columns
 
 _DIR_PATTERN = re.compile(r"^\d{8}_\d{6}$")
@@ -103,8 +105,14 @@ def allocate_timestamp_dir(benchmark_root: str, db, when: datetime,
 
 
 def write_run_dir(dir_path: str, metrics: list[dict], metadata: dict,
-                  kind: str | None = None) -> None:
-    """写入 result.csv + metadata.json。"""
+                  kind: str | None = None, model_cfg: dict | None = None) -> None:
+    """
+    写入 result.csv + metadata.json（+ 有 config 时的 model_config.json）。
+
+    model_config.json 存的是原封不动的模型 config.json：推导规则会随 vllm/sglang
+    版本变，留下原文才能日后按新规则重算。Scanner 重扫本目录时会读它，
+    保证目录流与上传流得到同一份 params（与 tools/to_csv.py:write_outputs 一致）。
+    """
     os.makedirs(dir_path, exist_ok=True)
     bk = schema.resolve_kind(
         kind or metadata.get("benchmark_kind")
@@ -128,6 +136,14 @@ def write_run_dir(dir_path: str, metrics: list[dict], metadata: dict,
     except OSError as e:
         raise PersistError(f"写入 metadata.json 失败: {meta_path}: {e}") from e
 
+    if model_cfg is not None:
+        cfg_path = os.path.join(dir_path, launch_params.model_config_filename())
+        try:
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(model_cfg, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            raise PersistError(f"写入模型 config 失败: {cfg_path}: {e}") from e
+
 
 def persist_upload(
     benchmark_root: str,
@@ -142,6 +158,7 @@ def persist_upload(
     deployment_mode: str = "colocated",
     pd: dict | None = None,
     benchmark_kind: str | None = None,
+    model_cfg: dict | None = None,
 ) -> tuple[str, str]:
     """
     落盘一次上传。返回 (dir_name, dir_path)。
@@ -159,5 +176,5 @@ def persist_upload(
         meta, launch_cmd, params, extra,
         deployment_mode=deployment_mode, pd=pd, benchmark_kind=kind,
     )
-    write_run_dir(dir_path, metrics, metadata, kind)
+    write_run_dir(dir_path, metrics, metadata, kind, model_cfg)
     return dir_name, dir_path

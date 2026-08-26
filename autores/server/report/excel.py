@@ -38,6 +38,8 @@ def _constraints_text(constraints: dict) -> str:
     # 维度名 -> 中文展示
     label_map = {
         "model": "模型", "model_version": "模型版本",
+        "model_params_b": "参数量(B)", "model_weight_gb": "权重占用(GiB)",
+        "model_dtype": "权重精度",
         "framework": "框架", "framework_version": "框架版本",
         "gpu_type": "显卡", "tp": "TP", "dp": "DP", "pp": "PP",
         "ep": "EP", "cp": "CP", "kv_cache_dtype": "KV Cache Dtype",

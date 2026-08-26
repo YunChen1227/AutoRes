@@ -9,7 +9,8 @@
 | 能力 | 说明 |
 |------|------|
 | 自动入库 | Scanner 定时扫描 NAS 时间戳目录，解析 `result.csv` + `metadata.json` |
-| 手工上传 | 数据不在 NAS 时，在 `/upload` 提交 CSV + 启动命令 txt + 元信息；支持 **单机/分布式** 与 **PD 分离** 两种部署模式 |
+| 手工上传 | 数据不在 NAS 时，在 `/upload` 提交 CSV + 启动命令 + 模型 `config.json`（可选）+ 元信息；支持 **单机/分布式** 与 **PD 分离** 两种部署模式 |
+| 参数推导 | 启动命令 + 模型 `config.json` 一起推出**实际生效**的启动参数（`context_length` / `dtype` / `quantization` / 批量调度默认值…），算法照搬 vllm / sglang 上游，并逐项记录来源 |
 | 自然语言对比 | Chatbot 多轮澄清需求 → 确定性流水线查库对齐 → 下载 Excel |
 | 跨框架参数对齐 | `tools/param_map.py` 维护 vLLM ↔ SGLang 启动参数配对（含量纲/类型差异说明） |
 | PD 分离部署 | `tools/param_map_pd.py` 解析 prefill/decode/router 参数；入库 `prefill_*` / `decode_*` 前缀列 |
@@ -213,6 +214,8 @@ python tools/to_csv.py \
   --nas-dir /mnt/nas/benchmark_root \
   --gpu-type H20-141G \
   --model DeepSeek-V4 \
+  --model-size 350 --model-dtype fp8 \
+  --model-config /models/DeepSeek-V4/config.json \
   --launch-cmd "python -m sglang.launch_server --tp-size 8 --enable-cache-report --speculative-algorithm EAGLE"
 ```
 
@@ -253,7 +256,43 @@ python tools/to_csv.py \
 - vllm / vllm-ascend 建议仍传 `--bench-cmd` 作兜底；优先读 `_autores_dims.random_input_len`。
 - vllm bench 须含 `--percentile-metrics ttft,tpot,itl,e2el` 才有完整 E2E/ITL 列（压测脚本已包含）。
 - `--launch-cmd`：完整服务启动命令；脚本提取 tp/dp/pp、投机解码、prefix caching 等入库维度，并计算 `gpu_count`。
-- 成功后在 `--nas-dir` 下创建 `YYYYMMDD_HHMMSS/`，含 `result.csv` 与 `metadata.json`。
+- `--model-config`：模型目录下的 `config.json`，**强烈建议传**。`context_length`、`dtype`、`quantization`、
+  `max-num-batched-tokens` / `chunked-prefill-size` 这些参数**启动命令里通常不写**，是 vllm / sglang 读模型 config
+  在运行时推导的；不传则相应列留空。推导算法逐项照搬上游源码，见 `tools/model_config.py`。
+  三个模型元信息列也靠它推导（见下）。
+- `--model-params-b` / `--model-weight-gb` / `--model-dtype`：参数量（单位 B）、权重实际占用（单位 GiB）、
+  权重精度（`bf16|fp16|fp8|int8|int4|fp4`），对应同名表列。**传了 `--model-config` 就三项都不用给**，
+  全部按 config 推导；给了命令行值则以命令行为准、与推导值不符时告警。
+  没给 `--model-config`（或 config 缺 `num_hidden_layers` / `hidden_size` / `vocab_size`）时
+  `--model-params-b` 变必填——它是分组对比的主轴，不能为空。
+- 成功后在 `--nas-dir` 下创建 `YYYYMMDD_HHMMSS/`，含 `result.csv`、`metadata.json`
+  （传了 `--model-config` 还有一份 `model_config.json` 原文，供日后按新版规则重算）。
+
+**参数来源留痕**：入库的 `params` 是**实际生效值**（命令写了用写的，没写按上游逻辑推导）。
+为了不丢"是不是用户显式设的"，`extra` 里同时留 `params_explicit`（只含命令写了的）、
+`param_sources`（每项来源 `explicit`/`config`/`gpu`/`static`）、`param_notes`（推导说明与告警）、
+`model_arch`（层数 / KV 头数 / head_dim / 单 token KV 字节数 / MoE / MLA / vision 等）、
+`model_meta`（元信息三列的推导值原始留档，便于和用户手填值对账）。
+sglang 的 `mem_fraction_static`、`max_running_requests`、`attention_backend` 依赖运行时状态算不准，
+**不推导、列留空**——编个数字比不给更误导。
+
+**模型元信息三列的口径**（曾经的 `model_size` 口径不清，已拆开）：
+
+| 列 | 单位 | 来源 | 说明 |
+|----|------|------|------|
+| `model_params_b` | B（10⁹） | config 推导，可手工覆盖 | 7B 模型记 `7.62`。按形状字段逐块累加：稠密 / MoE / 两代 Qwen-VL 实测与官方参数量**完全吻合**，仅 DeepSeek-V3 差 0.3%（MTP 层近似）。核心形状字段缺任一项则留空，不给近似数 |
+| `model_weight_gb` | GiB | config 推导，可手工覆盖 | 与 `gpu_memory_presets.GPU_MEMORY_GIB` 同单位，可直接和显存比。量化 checkpoint 按「层内线性层走量化精度，embedding / lm_head / vision tower 走 `torch_dtype`」分段算 |
+| `model_dtype` | — | config 推导，可手工覆盖 | **权重**精度，不是框架的计算 dtype。量化 checkpoint 的 `torch_dtype` 多是 `bfloat16`（激活精度），真实权重精度读 `quantization_config`；DeepSeek-V3 因此是 `fp8` 而非 `bf16` |
+
+`quant_method` → 权重精度的映射表取 vllm `QUANTIZATION_METHODS` 与 sglang
+`BASE_QUANTIZATION_METHODS` 的并集；`torchao` / `gguf` / `MIXED_PRECISION` 等逐层位宽不同的，
+**不推导、列留空**并在 `param_notes` 里写明原因。
+
+多模态的参数量含 vision tower、patch embedding 与 Qwen-VL 系的 patch merger。注意两代
+Qwen-VL 的 `vision_config` 键名是反的（2.5 代 `hidden_size` 是内部宽度、`out_hidden_size` 是
+输出宽度；2 代 `embed_dim` 才是内部宽度、`hidden_size` 是输出宽度），且 2.5 代的 vision MLP
+是 gated 的、2 代不是——两处都按"哪个键存在 / 激活函数是什么"判断，见 `tools/model_config.py`。
+CLIP / SigLIP 那类 projector 形状不在 `vision_config` 里，会少算几十 M 并在 `param_notes` 里写明。
 
 ---
 
@@ -281,16 +320,26 @@ python tools/to_csv.py \
 1. 上传符合固定 schema 的结果 CSV——**必需列**只有 `Input_Length`、`Concurrency`；
    可选行键列（text：`Prefix_Rate`；vlm：`Image_Count` / `Video_Count` / `Image_Resolution`）缺则整列 N/A，且不与有值的行对齐。
    **选好文件后会自动按 spec 列识别 bench 框架**
-2. 上传启动命令 txt（支持 `#` 注释、空行、反斜杠续行）
-3. 选择 **单机/分布式** 或 **PD 分离**（检测到 disaggregation / kv-transfer 参数会自动切换）
-4. 填写 `framework`（server 框架：`sglang` / `vllm` / `vllm-ascend`）、`framework_version`、`model`，选择 `gpu_type`
-5. **bench 参数（必填）**：
+2. **上传模型 `config.json`（可选，强烈建议）**——`context_length` / `dtype` / `quantization` /
+   `max-num-batched-tokens` 这些参数启动命令里通常不写，靠它才能推出来。
+   选好文件后会立刻回显识别到的架构、层数、KV 头数、量化方式，以及推导出的参数量 / 权重占用 /
+   权重精度（写进对应输入框的 placeholder，不预填），当场发现传错文件。
+3. 粘贴启动命令（支持 `#` 注释、空行、反斜杠续行）
+4. 选择 **单机/分布式** 或 **PD 分离**（检测到 disaggregation / kv-transfer 参数会自动切换）
+5. 填写模型服务信息：`framework`（server 框架：`sglang` / `vllm` / `vllm-ascend`）、`framework_version`、
+   `model`，选择 `gpu_type`。
+   **参数量（B）**、**权重占用（GiB）**、**权重精度** 三项留空即按 `config.json` 推导，
+   核对上一步回显的推导值就行，不必手填；填了以填的为准，不一致时回显告警。
+   未上传 `config.json` 时**参数量必填**。
+6. **bench 参数（必填）**：
    - **bench 框架**：与 server 框架相互独立。上传 CSV 后按 spec decoding 列是否有值自动预填
      （仅 vLLM 列有值→`vllm`，仅 SGLang 列有值→`sglang`；两者都有/都无则需手选），可手动改。
    - **是否 flush cache**：无法从 CSV 推断，**必须手动勾选**（flush=冷启动、不 flush=复用缓存）。
    - 表单**不再**提供 `prefix_rate` 整份回退值（已下沉为行键）。
 
-启动参数提取与 `to_csv.py` 同一套规则；PD 模式下分别填写 prefill / decode / router 启动命令。
+启动参数提取与 `to_csv.py` 同一套规则；PD 模式下分别填写 prefill / decode / router 启动命令
+（两个角色跑同一个模型，共用同一份 `config.json`）。提交成功后的回显会给每个参数标出来源：
+无标记 = 命令显式写的，`←config` = 从模型 config 推的，`←显存` = 按显卡显存档位推的，`←默认` = 上游静态默认值。
 
 #### 样例：`result.csv`（节选表头 + 一行）
 

@@ -55,6 +55,17 @@ FRAMEWORK_VERSION="0.4.6"
 GPU_TYPE="910B4-64G"
 LAUNCH_CMD="python -m sglang.launch_server --tp-size 8"
 BENCH_CMD=""
+# 以下三项都可留空：填了 MODEL_CONFIG 就全部按 config 推导，不必手填。
+# 多模态的参数量含 vision tower / patch embedding / Qwen-VL 系的 merger；
+# CLIP、SigLIP 那类 projector 形状不在 vision_config 里，会少算几十 M。
+MODEL_PARAMS_B=""                           # 参数量，单位 B（Qwen2.5-VL-7B 填 8.29）→ test_runs.model_params_b
+MODEL_WEIGHT_GB=""                          # 权重实际占用，单位 GiB → test_runs.model_weight_gb
+MODEL_DTYPE=""                              # 权重精度：bf16|fp16|fp8|int8|int4|fp4 → test_runs.model_dtype
+# 模型目录下的 config.json 路径。强烈建议填：context_length / dtype / quantization /
+# max-num-batched-tokens 这些参数启动命令里通常不写，是 vllm/sglang 读它推导出来的；
+# 上面三项元信息也靠它推导，多模态模型还会一并识别出 vision_config
+# （详见 tools/model_config.py）。
+MODEL_CONFIG=""                             # 例：/models/Qwen2.5-VL-72B/config.json
 
 declare -a max_concurrency=(1 2 4 8 16)
 declare -A input_length_map=(
@@ -581,6 +592,16 @@ if [[ "$RUN_TO_CSV" == "1" ]]; then
         --bench-cmd "$BENCH_CMD"
         --deployment-mode "$DEPLOYMENT_MODE"
     )
+    [[ -n "$MODEL_PARAMS_B" ]]  && TO_CSV_ARGS+=(--model-params-b "$MODEL_PARAMS_B")
+    [[ -n "$MODEL_WEIGHT_GB" ]] && TO_CSV_ARGS+=(--model-weight-gb "$MODEL_WEIGHT_GB")
+    [[ -n "$MODEL_DTYPE" ]]     && TO_CSV_ARGS+=(--model-dtype "$MODEL_DTYPE")
+    if [[ -n "$MODEL_CONFIG" ]]; then
+        if [[ -f "$MODEL_CONFIG" ]]; then
+            TO_CSV_ARGS+=(--model-config "$MODEL_CONFIG")
+        else
+            echo "[WARN] MODEL_CONFIG 指向的文件不存在，跳过：$MODEL_CONFIG"
+        fi
+    fi
     if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
         TO_CSV_ARGS+=(--prefill-cmd "$PREFILL_CMD" --decode-cmd "$DECODE_CMD")
         [[ -n "$ROUTER_CMD" ]] && TO_CSV_ARGS+=(--router-cmd "$ROUTER_CMD")

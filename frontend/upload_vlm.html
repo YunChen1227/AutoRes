@@ -122,6 +122,21 @@
           </div>
         </div>
 
+        <div class="field">
+          <label>模型 config.json <span class="muted">(可选，强烈建议)</span></label>
+          <div class="filebox">
+            <input type="file" name="config_file" id="config_file" accept=".json,application/json">
+            <span class="tag">模型目录下的 config.json</span>
+          </div>
+          <div class="desc" style="margin:0">
+            <code>context_length</code>、<code>dtype</code>、<code>quantization</code>、
+            <code>max-num-batched-tokens</code> 这些参数<b>启动命令里通常不写</b>，
+            由 vllm / sglang 读模型 config 在运行时推导。上传它，这些列才有值；
+            多模态模型还会一并识别出 <code>vision_config</code>。不传则相应列留空，仍可正常入库。
+          </div>
+          <div class="autohint" id="confighint"></div>
+        </div>
+
         <input type="hidden" name="deployment_mode" id="deployment_mode" value="colocated">
         <div class="tabs" role="tablist">
           <button type="button" class="tab active" data-mode="colocated">单机 / 分布式</button>
@@ -199,8 +214,11 @@
       <div class="card">
         <h3>3. 填写模型服务信息</h3>
         <div class="desc">
-          描述本次推理服务部署的模型与运行环境；这些字段无法从 CSV / 启动命令推断，需手工填写。
-          <b>框架</b>决定用哪套启动参数提取规则与默认值回填。
+          描述本次推理服务部署的模型与运行环境。<b>框架</b>决定用哪套启动参数提取规则与默认值回填。
+          <b>参数量</b>、<b>权重占用</b>、<b>权重精度</b>三项由上传的 config.json 推导
+          （含 vision tower、patch embedding 与 Qwen-VL 系的 merger），
+          选好文件后会在上方显示推导结果，核对无误就不用填。填了以填的为准。
+          未上传 config.json 时参数量必填。
         </div>
         <div class="grid">
           <div class="field">
@@ -216,14 +234,19 @@
             <input type="text" name="model" placeholder="如 Qwen2-VL" required>
           </div>
           <div class="field">
-            <label>模型大小 (GB) <span class="req">*</span></label>
-            <input type="number" name="model_size" id="model_size" min="1" step="1"
-                   placeholder="如 7" required>
+            <label>参数量 (B)</label>
+            <input type="number" name="model_params_b" id="model_params_b" min="0.01" step="0.01"
+                   placeholder="留空＝按 config 推导">
           </div>
           <div class="field">
-            <label>模型 dtype <span class="req">*</span></label>
-            <select name="model_dtype" id="model_dtype" required>
-              <option value="">请选择</option>
+            <label>权重占用 (GiB)</label>
+            <input type="number" name="model_weight_gb" id="model_weight_gb" min="0.01" step="0.01"
+                   placeholder="留空＝按 config 推导">
+          </div>
+          <div class="field">
+            <label>权重精度</label>
+            <select name="model_dtype" id="model_dtype">
+              <option value="">按 config 推导</option>
             </select>
           </div>
           <div class="field">
@@ -253,11 +276,15 @@
   const frameworkSel = document.getElementById("framework");
   const gpuSel = document.getElementById("gpu_type");
   const dtypeSel = document.getElementById("model_dtype");
+  const paramsInput = document.getElementById("model_params_b");
+  const weightInput = document.getElementById("model_weight_gb");
   const benchSel = document.getElementById("bench_framework");
   const imgCountInput = document.getElementById("bench_image_count");
   const imgResInput = document.getElementById("bench_image_resolution");
   const benchHint = document.getElementById("benchhint");
   const csvInput = form.querySelector('input[name="csv_file"]');
+  const configInput = document.getElementById("config_file");
+  const configHint = document.getElementById("confighint");
   const modeInput = document.getElementById("deployment_mode");
   const tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
   const panelCo = document.getElementById("panel-colocated");
@@ -323,6 +350,63 @@
       });
   });
 
+  // config 推出的元信息只写进 placeholder，不预填输入框：预填等于让用户把推导值
+  // 抄一遍再"确认"，反而看不出哪些值是自己填的。空着提交就是采纳推导值。
+  // derivedParams 记住参数量推没推出来，validate() 据此决定是否强制手填。
+  let derivedParams = null;
+
+  function applyModelMeta(meta, bits) {
+    derivedParams = (meta && meta.model_params_b) || null;
+    if (!meta) return;
+    if (meta.model_params_b) {
+      bits.push("参数量约 " + meta.model_params_b + "B");
+      paramsInput.placeholder = "推导值 " + meta.model_params_b;
+    }
+    if (meta.model_weight_gb) {
+      bits.push("权重约 " + meta.model_weight_gb + "GiB");
+      weightInput.placeholder = "推导值 " + meta.model_weight_gb;
+    }
+    if (meta.model_dtype) {
+      bits.push("精度=" + meta.model_dtype);
+      const opt = dtypeSel.querySelector('option[value=""]');
+      if (opt) opt.textContent = "按 config 推导（" + meta.model_dtype + "）";
+    }
+  }
+
+  // 选好 config.json 后立刻回显识别到的模型结构，当场发现传错文件
+  configInput.addEventListener("change", function () {
+    const file = configInput.files && configInput.files[0];
+    derivedParams = null;
+    if (!file) { configHint.textContent = ""; return; }
+    configHint.style.color = "#6b7280";
+    configHint.textContent = "正在解析模型 config…";
+    const fd = new FormData();
+    fd.append("config_file", file);
+    fetch("/api/upload/inspect-config", { method: "POST", body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.error) { configHint.style.color = "#b42318"; configHint.textContent = d.error; return; }
+        const a = d.model_arch || {};
+        const bits = [a.arch || a.model_type || "未知架构"];
+        if (a.num_layers) bits.push(a.num_layers + " 层");
+        if (a.num_kv_heads) bits.push("kv_heads=" + a.num_kv_heads);
+        if (a.max_position_embeddings) bits.push("max_pos=" + a.max_position_embeddings);
+        if (a.quant_method) bits.push("量化=" + a.quant_method);
+        if (a.is_moe) bits.push("MoE×" + (a.num_experts || "?"));
+        if (a.is_mla) bits.push("MLA");
+        applyModelMeta(d.model_meta, bits);
+        configHint.style.color = a.is_multimodal ? "#0a7c42" : "#8a6d00";
+        configHint.textContent = "已识别：" + bits.join("　") +
+          (a.is_multimodal
+            ? "　vision=" + (a.vision_model_type || "有")
+            : "　⚠ 该 config 里没有 vision_config，确认是多模态模型的 config.json 吗？");
+      })
+      .catch(function () {
+        configHint.style.color = "#8a6d00";
+        configHint.textContent = "解析失败，可仍然提交（相关列将留空）。";
+      });
+  });
+
   // 与后端 param_map_pd.looks_like_pd 一致的关键字粗判：填好即自动跳转
   function looksLikePd(s) {
     if (!s) return false;
@@ -383,13 +467,40 @@
     result.innerHTML = "<h4>入库失败</h4>" + esc(msg);
   }
 
-  function kvLine(params) {
+  // 来源标记：命令显式写的不加后缀，其余标出是从哪儿推出来的
+  const SRC_LABEL = { config: "←config", gpu: "←显存", static: "←默认" };
+
+  function kvLine(params, sources) {
     params = params || {};
-    return Object.keys(params).filter(function (k) {
+    sources = sources || {};
+    return Object.keys(params).sort().filter(function (k) {
       return params[k] !== null && params[k] !== undefined && params[k] !== "";
     }).map(function (k) {
-      return esc(k) + "=" + esc(params[k]);
-    }).join("  ") || "（默认值，命令未显式设置）";
+      const tag = SRC_LABEL[sources[k]] || "";
+      return esc(k) + "=" + esc(params[k]) + tag;
+    }).join("  ") || "（命令未显式设置，且无可推导来源）";
+  }
+
+  function archLine(a) {
+    const bits = [];
+    if (a.arch || a.model_type) bits.push(a.arch || a.model_type);
+    if (a.num_layers) bits.push("layers=" + a.num_layers);
+    if (a.num_kv_heads) bits.push("kv_heads=" + a.num_kv_heads);
+    if (a.head_dim) bits.push("head_dim=" + a.head_dim);
+    if (a.kv_bytes_per_token) bits.push("kv/token=" + a.kv_bytes_per_token + "B");
+    if (a.vision_model_type) bits.push("vision=" + a.vision_model_type);
+    if (a.quant_method) bits.push("quant=" + a.quant_method);
+    return bits.join("  ");
+  }
+
+  // 入库生效的元信息列。表单留空时这里显示的就是 config 推导值。
+  function metaLine(m) {
+    m = m || {};
+    return [
+      "参数量=" + (m.model_params_b != null ? m.model_params_b + "B" : "—"),
+      "权重占用=" + (m.model_weight_gb != null ? m.model_weight_gb + "GiB" : "—（未能推导）"),
+      "权重精度=" + (m.model_dtype || "—（未能推导）"),
+    ].join("  ");
   }
 
   function showOk(d) {
@@ -403,8 +514,10 @@
     if (d.deployment_mode === "pd_disagg" && d.pd) {
       const pd = d.pd;
       html += '<div class="kv">传输后端：<b>' + esc(pd.transfer_backend || "—") + "</b></div>";
-      html += '<div class="kv">Prefill 参数：<code>' + esc(kvLine(pd.prefill && pd.prefill.params)) + "</code></div>";
-      html += '<div class="kv">Decode 参数：<code>' + esc(kvLine(pd.decode && pd.decode.params)) + "</code></div>";
+      html += '<div class="kv">Prefill 参数：<code>' +
+        esc(kvLine(pd.prefill && pd.prefill.params, pd.prefill && pd.prefill.param_sources)) + "</code></div>";
+      html += '<div class="kv">Decode 参数：<code>' +
+        esc(kvLine(pd.decode && pd.decode.params, pd.decode && pd.decode.param_sources)) + "</code></div>";
       if (pd.router && (pd.router.policy || pd.router.prefill_policy || pd.router.decode_policy)) {
         html += '<div class="kv">Router 策略：<code>' + esc(kvLine({
           policy: pd.router.policy, prefill_policy: pd.router.prefill_policy, decode_policy: pd.router.decode_policy,
@@ -417,12 +530,22 @@
         html += '<div class="warn">⚠ 未识别参数（已存入 extra，不影响入库）：' + esc(unrec.join(" ")) + "</div>";
       }
     } else {
-      html += '<div class="kv">解析出的启动参数：<code>' + esc(kvLine(d.params)) + "</code></div>";
+      html += '<div class="kv">生效启动参数：<code>' + esc(kvLine(d.params, d.param_sources)) + "</code></div>";
       if (d.unrecognized && d.unrecognized.length) {
         html += '<div class="warn">⚠ 未识别的参数（已原样存入 extra，不影响入库）：' +
                 esc(d.unrecognized.join(" ")) + "</div>";
       }
     }
+    if (d.model_arch) {
+      html += '<div class="kv">模型结构：<code>' + esc(archLine(d.model_arch)) + "</code></div>";
+    } else if (!d.model_config_used) {
+      html += '<div class="warn">⚠ 本次未上传模型 config.json：' +
+              "context_length / dtype / quantization / 权重精度 等列已留空。</div>";
+    }
+    html += '<div class="kv">模型元信息：<code>' + esc(metaLine(d.model_meta)) + "</code></div>";
+    (d.param_notes || []).forEach(function (n) {
+      html += '<div class="warn">' + esc(n) + "</div>";
+    });
     result.className = "result ok";
     result.innerHTML = html;
   }
@@ -445,11 +568,15 @@
     if (!/^\d+[xX]\d+$/.test(res)) {
       return "请填写图片分辨率（HxW 格式，如 720x1280）";
     }
-    const ms = form.querySelector('input[name="model_size"]');
-    if (!ms || !ms.value || parseInt(ms.value, 10) < 1) {
-      return "请填写模型大小（≥1 的整数，单位 GB）";
+    if (paramsInput.value) {
+      if (parseFloat(paramsInput.value) <= 0) return "参数量需大于 0";
+    } else if (!derivedParams) {
+      return "请填写参数量（单位 B，如 Qwen2.5-VL-7B 填 8.29）"
+             + "；上传 config.json 可自动推导";
     }
-    if (!dtypeSel.value) return "请选择模型 dtype";
+    if (weightInput.value && parseFloat(weightInput.value) <= 0) {
+      return "权重占用需大于 0（留空则按 config.json 推导）";
+    }
     return null;
   }
 

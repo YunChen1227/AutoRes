@@ -4,6 +4,13 @@
 
 面向 to_csv.py 生成的固定 schema，不做可配置字段映射。
 路由由 metadata.benchmark_kind 决定（缺省 text）。
+
+关于目录里的 model_config.json（模型 config 原文）：
+  启动参数的推导发生在**入库前**（to_csv.py 落盘 / upload 提交时），结果已经
+  写进 metadata.params 与 metadata.extra。本模块不重跑推导——同一个目录在不同
+  AutoRes 版本下必须解析出同一行数据，否则台账会随代码升级悄悄漂移。
+  只有一种例外：目录里有 config 原文、但 metadata 里没带 model_arch（老目录或
+  手工拼的目录），此时补一份模型结构字段，供分析层使用。这只加字段、不动 params。
 """
 from __future__ import annotations
 
@@ -89,6 +96,26 @@ def _parse_metadata(meta_path: str) -> dict:
     return meta
 
 
+def _load_model_arch(dir_path: str) -> dict | None:
+    """
+    目录里有模型 config 原文时，归一成 model_arch 字段（层数/KV 头数/head_dim 等）。
+
+    仅在 metadata.extra 没带 model_arch 时调用。解析不了就返回 None——
+    这是补充信息，不能因为它让整个目录入库失败。
+    """
+    from autores.server.ingest import launch_params
+
+    path = os.path.join(dir_path, launch_params.model_config_filename())
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            cfg = launch_params.load_model_config(f.read())
+        return launch_params.normalize_model_config(cfg)
+    except (OSError, ValueError):
+        return None
+
+
 def parse_run_dir(dir_path: str) -> dict:
     """
     解析单个 timestamp 目录，返回可直接 insert_run 的文档。
@@ -106,14 +133,21 @@ def parse_run_dir(dir_path: str) -> dict:
 
     deployment = meta.get("deployment_mode", "colocated")
     extra = dict(meta.get("extra", {}))
+    if not extra.get("model_arch"):
+        arch = _load_model_arch(dir_path)
+        if arch:
+            extra["model_arch"] = arch
 
     doc = {
         "_id": dir_name,
         "run_timestamp": run_timestamp,
         "model": meta["model"],
         "model_version": meta["model_version"],
-        "model_size": meta["model_size"],
-        "model_dtype": meta["model_dtype"],
+        # 老 NAS 目录的 metadata.json 里没有这几个键（字段是后加的），列可空。
+        # 已废弃的 model_size 口径不清（GB 还是 B 说不准），刻意不做换算回填。
+        "model_params_b": meta.get("model_params_b"),
+        "model_weight_gb": meta.get("model_weight_gb"),
+        "model_dtype": meta.get("model_dtype"),
         "framework": meta["framework"],
         "framework_version": meta["framework_version"],
         "gpu_type": meta["gpu_type"],
@@ -156,9 +190,11 @@ def _split_pd(pd_meta: dict) -> tuple[dict, dict]:
             "decode_policy": router.get("decode_policy"),
         },
     }
+    role_keys = ("launch_cmd", "disagg", "unrecognized",
+                 "params_explicit", "param_sources")
     extra_pd = {
-        "prefill": {k: prefill.get(k) for k in ("launch_cmd", "disagg", "unrecognized")},
-        "decode": {k: decode.get(k) for k in ("launch_cmd", "disagg", "unrecognized")},
+        "prefill": {k: prefill.get(k) for k in role_keys},
+        "decode": {k: decode.get(k) for k in role_keys},
         "router": {k: router.get(k) for k in ("launch_cmd", "_extra")},
     }
     return doc_pd, extra_pd

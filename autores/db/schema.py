@@ -10,6 +10,9 @@ SQLite 表结构定义与共享常量（design.md §6）。
   run_id            : TEXT PRIMARY KEY（= timestamp 目录名，天然唯一/幂等）
   run_timestamp     : TEXT（ISO 8601）
   model / model_version / framework / framework_version / gpu_type / launch_cmd : TEXT
+  model_params_b    : REAL（参数量，单位 B = 10^9；7B 模型记 7.62）
+  model_weight_gb   : REAL（权重实际占用，单位 GiB；7B bf16 约 14.2）
+  model_dtype       : TEXT（权重精度，见 MODEL_DTYPE_CHOICES）
   deployment_mode   : TEXT（'colocated' = 单机/分布式；'pd_disagg' = PD 分离，D22）
   <param>           : 单机/分布式的结构化启动参数（独立列，D18）
   prefill_<param>   : PD 分离时 prefill 实例的同名参数（非 PD 记录为 NULL）
@@ -36,15 +39,19 @@ from datetime import datetime
 META_DIMENSIONS = [
     "model",
     "model_version",
-    "model_size",
+    "model_params_b",
+    "model_weight_gb",
     "model_dtype",
     "framework",
     "framework_version",
     "gpu_type",
 ]
 
-# 上传表单 / 模型服务信息：权重 dtype 可选值
-MODEL_DTYPE_CHOICES: tuple[str, ...] = ("bf16", "fp8", "int8", "int4", "fp4")
+# 权重精度可选值。三处必须同步：
+#   tools/model_config.py:MODEL_DTYPE_BYTES  各取值的位宽（推导 model_weight_gb 用）
+#   tools/model_config.py:derive_model_dtype 从 config.json 推出该取值
+# tools/ 不 import 本模块（那边要能脱离 autores 包单独跑），故是约定而非引用。
+MODEL_DTYPE_CHOICES: tuple[str, ...] = ("bf16", "fp16", "fp8", "int8", "int4", "fp4")
 
 # ── 结构化启动参数维度（同样是直接列；文档/接口上仍归为 params）──
 #
@@ -225,8 +232,10 @@ def metric_dims(kind: str | None = None) -> tuple[str, ...]:
 METADATA_DIRECT_FIELDS: tuple[str, ...] = (
     "model",
     "model_version",       # DB NOT NULL，但允许空串；upload 不要求用户填写
-    "model_size",          # 模型参数量（GB，整数）；upload 必填
-    "model_dtype",         # 权重 dtype：bf16/fp8/int8/int4/fp4；upload 必填
+    "model_params_b",      # 参数量，单位 B（10^9）；由 config.json 推导，可手工覆盖
+                           # （推不出来时才要求手填，见 model_config.merge_model_meta）
+    "model_weight_gb",     # 权重实际占用，单位 GiB；由 config.json 推导，可手工覆盖
+    "model_dtype",         # 权重精度（MODEL_DTYPE_CHOICES）；由 config.json 推导，可手工覆盖
     "framework",           # server（推理服务）框架
     "framework_version",
     "gpu_type",
@@ -268,7 +277,8 @@ def _test_runs_columns() -> list[tuple[str, str]]:
         ("run_timestamp", "TEXT NOT NULL"),
         ("model", "TEXT NOT NULL"),
         ("model_version", "TEXT NOT NULL"),
-        ("model_size", "INTEGER"),
+        ("model_params_b", "REAL"),
+        ("model_weight_gb", "REAL"),
         ("model_dtype", "TEXT"),
         ("framework", "TEXT NOT NULL"),
         ("framework_version", "TEXT NOT NULL"),
@@ -340,6 +350,10 @@ def migrate(conn) -> None:
     对已存在的 test_runs / vlm_test_runs 表补齐缺失列。
     仅做 ADD COLUMN（可空或带默认值），不改动/删除既有列，安全幂等。
     不做数据回填（prefix_rate 等已下沉到 metrics，库无旧数据）。
+
+    已废弃的列（如口径不清的 model_size，现拆为 model_params_b + model_weight_gb）
+    在老库里会作为死列留着：SQLite 删列要重建表，而这些列既不读也不写，
+    留着比冒重建风险划算。新建的库里没有它们。
     """
     for table in ("test_runs", "vlm_test_runs"):
         existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -402,7 +416,8 @@ def doc_to_row(doc: dict, kind: str | None = None) -> dict:
         "run_timestamp": _iso(doc["run_timestamp"]),
         "model": doc["model"],
         "model_version": doc["model_version"],
-        "model_size": doc.get("model_size"),
+        "model_params_b": doc.get("model_params_b"),
+        "model_weight_gb": doc.get("model_weight_gb"),
         "model_dtype": doc.get("model_dtype"),
         "framework": doc["framework"],
         "framework_version": doc["framework_version"],
@@ -441,7 +456,8 @@ def row_to_doc(row, kind: str | None = None) -> dict:
         "run_timestamp": datetime.fromisoformat(row["run_timestamp"]),
         "model": row["model"],
         "model_version": row["model_version"],
-        "model_size": _rget(row, "model_size"),
+        "model_params_b": _rget(row, "model_params_b"),
+        "model_weight_gb": _rget(row, "model_weight_gb"),
         "model_dtype": _rget(row, "model_dtype"),
         "framework": row["framework"],
         "framework_version": row["framework_version"],

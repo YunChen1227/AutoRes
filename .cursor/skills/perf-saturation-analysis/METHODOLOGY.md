@@ -16,12 +16,12 @@
 
 饱和点是**运行时属性**（随序列长度分布、KV 精度、调度参数变化），不是模型常数。
 
-参考：
+参考（离线快照见 [`docs/methodology-references/`](../../../docs/methodology-references/README.md)）：
 
-- [Saturation point identification (The Neural Base)](https://theneuralbase.com/inference-optimization/learn/advanced/saturation-point-identification/)
-- [Load testing methodology](https://theneuralbase.com/inference-optimization/learn/advanced/load-testing-methodology/)
-- SLIM / attention decode 带宽饱和：[arXiv:2607.29575](https://arxiv.org/html/2607.29575v1)
-- Vultr concurrency saturation sweeps：[docs](https://docs.vultr.com/inference-cookbook/rocm/benchmarks/saturation-analysis)
+- [Saturation point identification (The Neural Base)](https://theneuralbase.com/inference-optimization/learn/advanced/saturation-point-identification/) → [本地 HTML](../../../docs/methodology-references/neural-base-saturation-point.html)
+- [Load testing methodology](https://theneuralbase.com/inference-optimization/learn/advanced/load-testing-methodology/) → [本地 HTML](../../../docs/methodology-references/neural-base-load-testing.html)
+- SLIM / attention decode 带宽饱和：[arXiv:2607.29575](https://arxiv.org/html/2607.29575v1) → [本地 HTML](../../../docs/methodology-references/arxiv-slim-2607.29575.html)
+- Vultr concurrency saturation sweeps：[docs](https://docs.vultr.com/inference-cookbook/rocm/benchmarks/saturation-analysis) → [本地 HTML](../../../docs/methodology-references/vultr-saturation-analysis.html)
 
 ## 2. 指标角色
 
@@ -68,7 +68,7 @@ y = \frac{1}{\gamma}\left[1 + \alpha(N-1) + \beta N(N-1)\right]
 
 要求 ≥4 个有效并发点；\(\beta\le 0\) 时不报 \(N^*\)（无 retrograde）。
 
-参考：[USL manifesto (PerfDynamics)](https://www.perfdynamics.com/Manifesto/USLscalability.pdf)、[usl R vignette](https://cran.r-project.org/web/packages/usl/vignettes/usl.pdf)
+参考：[USL manifesto (PerfDynamics)](https://www.perfdynamics.com/Manifesto/USLscalability.pdf) → [本地 PDF](../../../docs/methodology-references/usl-scalability.pdf)、[usl R vignette](https://cran.r-project.org/web/packages/usl/vignettes/usl.pdf)
 
 ## 4. 简化 Kneedle
 
@@ -93,7 +93,7 @@ L = \lambda W
 
 生产经验：常在 ~70% 利用率以下留 headroom，避免尾延迟非线性爆炸。
 
-参考：Anyscale [LLM metrics / goodput](https://docs.anyscale.com/llm/serving/benchmarking/metrics.md)；队列与 LLM：[tianpan LLM queuing](https://tianpan.co/blog/2026-04-10-llm-queuing-theory-littles-law-token-scheduling)
+参考：Anyscale [LLM metrics / goodput](https://docs.anyscale.com/llm/serving/benchmarking/metrics) → [本地 HTML](../../../docs/methodology-references/anyscale-llm-serving-metrics.html)；队列与 LLM：[tianpan LLM queuing](https://tianpan.co/blog/2026-04-10-llm-queuing-theory-littles-law-token-scheduling)
 
 **Goodput**：满足 SLO 的成功请求比例。本 skill 的 SLO 约束最大并发即 goodput≈100% 的上界代理。
 

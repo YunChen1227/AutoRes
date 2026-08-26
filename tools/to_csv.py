@@ -195,6 +195,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import param_map as pm  # noqa: E402
 import param_map_pd as pm_pd  # noqa: E402  (PD 分离解析表，与网页上传同源)
 import gpu_count as gc  # noqa: E402
+import model_config as mc  # noqa: E402  (config.json → 我们的字段 + DERIVED 参数推导)
 from autores.db import schema as db_schema  # noqa: E402
 
 
@@ -277,14 +278,22 @@ def _coerce(kind, raw):
 NOISE_FLAGS = {"-m", "-c", "-u"}
 
 
-def extract_launch_params(framework, launch_cmd):
+def extract_launch_params(framework, launch_cmd, model_cfg=None, gpu_type=None):
     """
-    从启动命令字符串提取结构化参数（由 param_map.py 配对表驱动）。
+    从启动命令字符串提取结构化参数（由 param_map.py 配对表驱动），
+    再用模型 config.json + 显卡型号把 DERIVED 参数补成实际生效值。
 
     返回 (params: dict, extra: dict)：
-      params  入库顶层字段，key 与 autores/db/schema.py:PARAM_DIMENSIONS 对齐
-      extra   命令里出现、但未提升为一等列的参数 + 未识别 flag
+      params  入库顶层字段，key 与 autores/db/schema.py:PARAM_DIMENSIONS 对齐。
+              语义是**实际生效值**：命令里写了就用写的，没写就按 vllm/sglang
+              上游逻辑推导（见 tools/model_config.py）。
+      extra   命令里出现、但未提升为一等列的参数 + 未识别 flag，另加：
+                params_explicit  只含命令里真正写了的参数（追溯"用户意图"用）
+                param_sources    每个参数的来源 explicit|config|gpu|static
+                param_notes      推导说明与精度提示
+                model_arch       config.json 归一后的模型结构字段（有传才有）
 
+    model_cfg 为 None（未上传 config.json）时，依赖模型的参数留空，其余照常回填。
     framework 可为 vllm-ascend；参数解析走 vllm 分支，入库 framework 仍存原名。
     """
     pm_fw = "vllm" if framework == "vllm-ascend" else framework
@@ -350,8 +359,27 @@ def extract_launch_params(framework, launch_cmd):
     if unrecognized:
         extra["unrecognized"] = unrecognized
 
+    # 命令里真正写了哪些参数——必须在任何默认值回填之前留档，
+    # 否则 tp=1 这类回填值会和"命令写了 tp 1"混为一谈。
+    explicit_keys = set(params)
+    extra["params_explicit"] = dict(params)
+
     # 回填 tp/pp/dp 静态默认值并计算实际卡数（design.md D-默认值 + 卡数对齐）
     gc.annotate_gpu_count(pm_fw, params, extra)
+
+    # DERIVED 参数补全：模型 config.json + 显卡显存 → 实际生效值
+    resolved = mc.resolve(pm_fw, params, explicit_keys=explicit_keys,
+                          cfg=model_cfg, gpu_type=gpu_type)
+    extra["param_sources"] = resolved["sources"]
+    if resolved["notes"]:
+        extra["param_notes"] = resolved["notes"]
+    if resolved.get("model_arch"):
+        extra["model_arch"] = resolved["model_arch"]
+    # 元信息列（model_dtype / model_params_b / model_weight_gb）的推导值。
+    # 留在 extra 里是推导留档：用户手填值与推导值不一致时，事后能查到两边各是多少。
+    # 真正写进 metadata 顶层的生效值由 ingest 层（本文件 main / upload.py）合并。
+    if resolved.get("model_meta"):
+        extra["model_meta"] = resolved["model_meta"]
 
     return params, extra
 
@@ -367,14 +395,16 @@ def _pd_flag_names():
     return set(pm_pd.SGL_PD_FLAGS) | {pm_pd.VLLM_KV_FLAG}
 
 
-def extract_role(framework, cmd):
+def extract_role(framework, cmd, model_cfg=None, gpu_type=None):
     """
     解析一条 PD 角色（prefill 或 decode）server 命令，返回：
       {role, params, disagg, unrecognized, extra}
     role 为 'prefill'/'decode'/'both'；非 PD 角色命令 role=None（调用方据此报错）。
+
+    prefill 与 decode 跑的是同一个模型，共用同一份 model_cfg。
     """
     role = pm_pd.detect_role(framework, cmd)
-    params, extra = extract_launch_params(framework, cmd)
+    params, extra = extract_launch_params(framework, cmd, model_cfg, gpu_type)
     disagg = pm_pd.extract_disagg(framework, cmd)
 
     pd_flags = _pd_flag_names()
@@ -394,13 +424,14 @@ def extract_role(framework, cmd):
     }
 
 
-def build_pd(framework, prefill_cmd, decode_cmd, router_cmd=""):
+def build_pd(framework, prefill_cmd, decode_cmd, router_cmd="",
+             model_cfg=None, gpu_type=None):
     """
     解析 PD 分离三条命令 → (combined_launch_cmd, pd_meta)。
     pd_meta 结构与 upload._build_pd 完全一致，供 scanner._split_pd 正确入库。
     """
-    pf = extract_role(framework, prefill_cmd)
-    dc = extract_role(framework, decode_cmd)
+    pf = extract_role(framework, prefill_cmd, model_cfg, gpu_type)
+    dc = extract_role(framework, decode_cmd, model_cfg, gpu_type)
 
     if pf["role"] not in ("prefill", "both"):
         raise SystemExit(
@@ -423,20 +454,30 @@ def build_pd(framework, prefill_cmd, decode_cmd, router_cmd=""):
     if router_cmd:
         combined += f"\n\n# ROUTER\n{router_cmd}"
 
+    # prefill 与 decode 跑同一个模型，model_arch / model_meta / 推导说明提到 pd_meta
+    # 顶层只存一份；param_sources 是逐角色的（两条命令显式写的 flag 不同），留在各角色块里。
+    pf_extra, dc_extra = pf.get("extra") or {}, dc.get("extra") or {}
     pd_meta = {
         "transfer_backend": transfer_backend,
         "gpu_count": total_gpus,
         "prefill_gpu_count": pf_gpus,
         "decode_gpu_count": dc_gpus,
+        "model_arch": pf_extra.get("model_arch"),
+        "model_meta": pf_extra.get("model_meta"),
+        "param_notes": pf_extra.get("param_notes"),
         "prefill": {
             "params": pf["params"], "launch_cmd": prefill_cmd,
             "disagg": pf["disagg"], "unrecognized": pf["unrecognized"],
             "gpu_count": pf_gpus,
+            "params_explicit": pf_extra.get("params_explicit"),
+            "param_sources": pf_extra.get("param_sources"),
         },
         "decode": {
             "params": dc["params"], "launch_cmd": decode_cmd,
             "disagg": dc["disagg"], "unrecognized": dc["unrecognized"],
             "gpu_count": dc_gpus,
+            "params_explicit": dc_extra.get("params_explicit"),
+            "param_sources": dc_extra.get("param_sources"),
         },
         "router": {**router, "launch_cmd": router_cmd},
     }
@@ -632,7 +673,14 @@ def build_rows(framework, records, fallback_input_len, kind="text"):
 # 4. 落盘（§5.1、§5.3）
 # ============================================================================
 
-def write_outputs(out_dir, rows, metadata, kind="text"):
+def write_outputs(out_dir, rows, metadata, kind="text", model_cfg=None):
+    """
+    落盘 result.csv + metadata.json（+ 有 config 时的 model_config.json）。
+
+    model_config.json 存的是**原封不动的模型 config.json**：推导规则会随
+    vllm/sglang 版本变，留下原文才能日后按新规则重算，只存推导结果就废了。
+    Scanner 重扫同一目录时会读它，保证目录流与上传流得到同一份 params。
+    """
     os.makedirs(out_dir, exist_ok=True)
     headers = list(metric_field_map_for(kind).keys())
 
@@ -645,6 +693,10 @@ def write_outputs(out_dir, rows, metadata, kind="text"):
     meta_path = os.path.join(out_dir, "metadata.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    if model_cfg is not None:
+        with open(os.path.join(out_dir, mc.RUN_DIR_FILENAME), "w", encoding="utf-8") as f:
+            json.dump(model_cfg, f, ensure_ascii=False, indent=2)
 
     return csv_path, meta_path
 
@@ -716,11 +768,29 @@ def parse_args():
                         "（sglang --disaggregation-mode decode / vllm kv_role=kv_consumer）")
     p.add_argument("--router-cmd", default="",
                    help="（PD 分离可选）router/proxy 启动命令，解析 --policy/--prefill-policy/--decode-policy")
+    p.add_argument("--model-config", default="",
+                   help="（非 DB 列，强烈建议）模型目录下的 config.json 路径。"
+                        "vllm/sglang 的 context_length / dtype / quantization / "
+                        "max-num-batched-tokens 等默认值都是从它推导的，"
+                        "不给则这些列留空。落盘时会拷一份到 model_config.json")
 
     # ── metadata 直接列（与 test_runs / METADATA_DIRECT_FIELDS 一一对应）──
     for field in db_schema.METADATA_DIRECT_FIELDS:
         flag = _cli_flag(field)
-        if field == "framework":
+        if field == "model_params_b":
+            p.add_argument(flag, type=float, default=None,
+                           help="参数量，单位 B（7B 模型填 7.62 或 7）→ test_runs.model_params_b；"
+                                "不填则由 --model-config 推导，仅在没有 config 时必填")
+        elif field == "model_weight_gb":
+            p.add_argument(flag, type=float, default=None,
+                           help="权重实际占用，单位 GiB → test_runs.model_weight_gb；"
+                                "不填则由 --model-config 推导")
+        elif field == "model_dtype":
+            p.add_argument(flag, default=None,
+                           choices=list(db_schema.MODEL_DTYPE_CHOICES),
+                           help="权重精度 → test_runs.model_dtype；"
+                                "不填则由 --model-config 推导（量化块优先）")
+        elif field == "framework":
             p.add_argument(flag, required=True, choices=list(db_schema.FRAMEWORK_CHOICES),
                            help="server（推理服务）框架 → test_runs.framework")
         elif field == "bench_framework":
@@ -805,11 +875,26 @@ def main():
 
     rows = build_rows(bench_framework, records, fallback_input_len, kind)
 
+    # 模型 config.json：DERIVED 参数（context_length / dtype / 批量默认值…）的推导输入
+    model_cfg = None
+    if args.model_config:
+        try:
+            with open(args.model_config, "rb") as f:
+                model_cfg = mc.load_config(f.read())
+        except OSError as e:
+            raise SystemExit(f"[ERR] 读取 --model-config 失败: {args.model_config}: {e}") from e
+        except mc.ModelConfigError as e:
+            raise SystemExit(f"[ERR] {e}") from e
+    else:
+        print("⚠️  未传 --model-config：context_length / dtype / quantization 以及 "
+              "model_dtype / model_weight_gb 等由模型 config 推导的列将留空")
+
     # 提取启动参数（按 server 框架，因为 launch_cmd 是服务端启动命令）
     pd_meta = None
     if deployment == "pd_disagg":
         combined, pd_meta = build_pd(
-            meta["framework"], args.prefill_cmd, args.decode_cmd, args.router_cmd)
+            meta["framework"], args.prefill_cmd, args.decode_cmd, args.router_cmd,
+            model_cfg, meta["gpu_type"])
         meta["launch_cmd"] = combined
         params = {}
         extra = {
@@ -817,11 +902,28 @@ def main():
             "prefill_gpu_count": pd_meta["prefill_gpu_count"],
             "decode_gpu_count": pd_meta["decode_gpu_count"],
         }
+        for key in ("model_arch", "param_notes"):
+            if pd_meta.get(key):
+                extra[key] = pd_meta[key]
     else:
-        params, extra = extract_launch_params(meta["framework"], meta["launch_cmd"])
+        params, extra = extract_launch_params(
+            meta["framework"], meta["launch_cmd"], model_cfg, meta["gpu_type"])
+
+    # 模型元信息列：命令行填了就用填的，没填用 config 推的；两者不符时告警
+    meta_notes = mc.merge_model_meta(
+        meta, (pd_meta or {}).get("model_meta") or extra.get("model_meta"))
+    if meta_notes:
+        extra = dict(extra)
+        extra["param_notes"] = list(extra.get("param_notes") or []) + meta_notes
+
+    # 参数量是唯一"必须有值"的元信息列（分组对比的主轴）。推不出来只有两种原因：
+    # 没给 --model-config，或 config 缺核心形状字段——两者都得回退到手填。
+    if meta.get("model_params_b") is None:
+        sys.exit("[ERR] 无法确定模型参数量：未给 --model-config 或 config 缺核心形状字段"
+                 "（num_hidden_layers / hidden_size / vocab_size），请显式指定 --model-params-b")
 
     metadata = build_metadata(meta, params, extra, bench_cmd=args.bench_cmd, pd=pd_meta)
-    csv_path, meta_path = write_outputs(out_dir, rows, metadata, kind)
+    csv_path, meta_path = write_outputs(out_dir, rows, metadata, kind, model_cfg)
 
     print(f"[OK] 落盘完成：{len(rows)} 条指标记录")
     print(f"[目录] {out_dir}")
@@ -838,9 +940,20 @@ def main():
         print("[decode]  " + "  ".join(f"{k}={dc_p[k]}" for k in sorted(dc_p)))
     else:
         if params:
-            print("[参数] " + "  ".join(f"{k}={params[k]}" for k in sorted(params)))
+            src = extra.get("param_sources", {})
+            print("[参数] " + "  ".join(
+                f"{k}={params[k]}({src.get(k, '?')})" for k in sorted(params)))
         if extra.get("unrecognized"):
             print(f"[未识别] {' '.join(extra['unrecognized'])}")
+    arch = extra.get("model_arch") or {}
+    if arch:
+        print(f"[模型] {arch.get('arch')} layers={arch.get('num_layers')} "
+              f"kv_heads={arch.get('num_kv_heads')} head_dim={arch.get('head_dim')} "
+              f"kv/token={arch.get('kv_bytes_per_token')}B")
+    print(f"[元信息] params={meta.get('model_params_b')}B "
+          f"weight={meta.get('model_weight_gb')}GiB dtype={meta.get('model_dtype')}")
+    for note in extra.get("param_notes", []):
+        print(f"[推导] {note}")
 
 
 if __name__ == "__main__":

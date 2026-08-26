@@ -70,6 +70,8 @@
 | D19 | 半成品防护 | **取消完成标记机制**：csv/json 均由脚本硬编码原子生成，不存在半成品。入库解析失败即**不记录该 timestamp 目录**（下轮自动重试），成功才记入台账 | 简化 §5.5（原 §5.2 完成标记方案作废） |
 | D20 | 取数策略 | **所有维度全同才取最新一次**；框架版本不同（如 vllm 0.5.11 vs 0.5.12）视为不同记录**全部取出**；不同框架（vllm vs sglang）的版本号**不可跨框架比较**，各自独立取 | 修订原 §7.2 的"latest"策略，见 §7.4 |
 | D21 | 排除逻辑 | 取出数据可能过多，Agent 除"取哪些"外还支持"排除哪些"：QuerySpec 增加 `exclude` 字段，用户可要求剔除某维度值（如"去掉 A800 的"） | 见 §7.3、§7.4 |
+| D23 | config.json 参与推导 | 落盘脚本与上传页面都接收模型 `config.json`（可选），与启动命令**一起**推导参数：`params` 列存实际生效值，`extra` 里留 `params_explicit` / `param_sources` / `param_notes` / `model_arch`。推导算法逐项照搬 vllm/sglang 上游，算不准的（sglang `mem_fraction_static` / `max_running_requests` / `attention_backend`）宁缺勿编 | `context_length`、`dtype`、`quantization`、`max-num-batched-tokens` 这类参数命令里通常不写，只解析命令则列全是 NULL，见 §5.4.2 |
+| D24 | 模型元信息列拆分 | 口径不清的 `model_size` 列**彻底移除**，拆成 `model_params_b`（参数量，B）+ `model_weight_gb`（权重占用，GiB）。这两列与 `model_dtype` 三者**全部由 `config.json` 推导**，表单/CLI 只作可选覆盖：传了 config 就一个都不用填。仅 `model_params_b` 在推不出来时（没传 config 或 config 缺形状字段）要求手填——它是分组对比的主轴，不能为空。老库里的 `model_size` 留作死列，**不做换算回填** | 原列的三处文档口径互相矛盾（注释写参数量 GB、README 写权重占用 GB、前端占位符给 `72`），旧值到底是 GB 还是 B 判断不了；手填还容易把量化模型的 dtype 记成 `bf16`（那是激活精度）、把 MoE 的激活参数量当总参数量。既然 config 能算准，就别让人再填一遍，见 §5.4.3 |
 
 ---
 
@@ -152,7 +154,11 @@ AutoRes/
 | `--nas-dir` | 是 | NAS 挂载根路径（各测试人员挂载位置不同，由入参指定），脚本在其下创建时间戳目录 |
 | `--gpu-type` | 是 | 显卡类型（如 `H20-141G`），写入 metadata.json |
 | `--model` / `--model-version` | 是 | 模型名与版本 |
+| `--model-params-b` | 否* | 参数量，单位 B（10⁹）；不传则由 `--model-config` 推导 → `model_params_b`。*没给 `--model-config`（或 config 缺形状字段）时必填 |
+| `--model-weight-gb` | 否 | 权重实际占用，单位 GiB；不传则由 `--model-config` 推导 → `model_weight_gb` |
+| `--model-dtype` | 否 | 权重精度（`bf16/fp16/fp8/int8/int4/fp4`）；不传则由 `--model-config` 推导 → `model_dtype` |
 | `--launch-cmd` | 是* | **完整服务启动命令字符串**（colocated 必填；PD 分离改用 `--prefill-cmd`/`--decode-cmd`）；脚本据此提取结构化启动参数（见 §5.4） |
+| `--model-config` | 否（强烈建议） | 模型目录下的 `config.json` 路径。**启动命令里通常不写**的参数（`context_length` / `dtype` / `quantization` / `max-num-batched-tokens` …）都是框架读它在运行时推导的；上面三个元信息列也靠它推导。不传则相应列留空（见 §5.4.1 / §5.4.3） |
 | `--bench-cmd` | 否 | 完整 benchmark 命令字符串；作 `_autores_dims` 缺失时的兜底 |
 
 > `prefix_rate` **不再**是 to_csv CLI 入参（已下沉为 text metrics 行键，由 `inject_dims.py` / CSV 列提供）。
@@ -163,8 +169,11 @@ AutoRes/
 {nas_dir}/
 └── 20260708_143000/          # 脚本按落盘时刻生成的时间戳目录（唯一标识）
     ├── result.csv            # 固定列头的量化指标表
-    └── metadata.json         # 结构化元信息 + 启动参数
+    ├── metadata.json         # 结构化元信息 + 启动参数
+    └── model_config.json     # 模型 config.json 原文（传了 --model-config 才有）
 ```
+
+> `model_config.json` 存**原文**而非推导结果：推导规则会随 vllm/sglang 版本变，留下原文才能日后按新规则重算。网页上传流落盘同一套结构（`persist.write_run_dir`）。
 
 ### 5.2 result.csv：两框架字段映射
 
@@ -280,7 +289,75 @@ AutoRes/
 >
 > **注意 torch_compile 的框架差异**：sglang 默认关（需显式 `--enable-torch-compile`），vllm 默认开（除非 `--enforce-eager`）。对比时这是真实差异，脚本按各自默认如实回填。
 >
-> **注意 chunked_prefill / mem_fraction 等**：sglang 中 `chunked_prefill_size`、`mem_fraction_static`、`attention_backend` 默认均为 None（运行时按 GPU 显存自动计算），无法回填确定值，命令未写时在 extra 里记 `"auto"`。
+> **本表已被 `tools/param_map.py` 取代**：那里按 flag 逐条记录别名、默认值种类（`STATIC` / `DERIVED` / `NA`）与语义类型，并标注哪些"看起来能比、实际不能比"。本表保留作背景说明，出现分歧时**以 param_map.py 为准**（它带上游 commit 基线，且有 `verify_param_map.py` 自动校验 flag 是否还存在）。
+
+#### 5.4.2 config.json 驱动的参数推导（D23）
+
+一批参数**启动命令里通常不写**，由框架在运行时读「模型 `config.json` + 硬件」推导。只解析命令拿不到它们，入库后相应列全是 NULL，既看不到实际生效值，也无法判断两次测试是否真的同配置。
+
+实现在 `tools/model_config.py`（上游基线 commit 与 `param_map.py` 同步），逐项照搬上游算法而非另发明一套：
+
+| 我们的字段 | sglang 推导来源 | vllm 推导来源 |
+|-----------|----------------|--------------|
+| `context_length` | `get_context_length`：候选键取**第一个命中** × rope factor | `derive_max_model_len_and_key`：候选键取**最小值**，`model_max_length` 无条件覆盖；yarn/longrope 另有分支 |
+| `dtype` | `_get_and_verify_dtype`：`auto`+float32 → gemma\* 用 bfloat16，其余 float16 | `_resolve_auto_dtype`：`auto`+float32 → 平台首选（现代 CUDA = bfloat16） |
+| `quantization` | `config.quantization_config.quant_method` | 同左 |
+| `chunked_prefill_size` | `_handle_gpu_memory_settings` 显存分档 | `get_batch_defaults`：单卡 ≥70GiB 且卡名不含 a100 → 8192，否则 2048；再 `min(max_num_seqs × max_model_len, …)` |
+| `max_running_requests` | *不推导*（见下） | `get_batch_defaults`：≥70GiB → 1024，否则 256；再 `min(…, chunked_prefill_size)` |
+| `page_size` | 回填 1（`_page_size_default`） | 回填 16（`DEFAULT_BLOCK_SIZE`） |
+| `prefix_caching` | 默认 True | `is_prefix_caching_supported`（encoder-decoder 系为 False） |
+| `mem_fraction` | *不推导*（见下） | 0.92（静态字面量） |
+
+> ⚠ **`context_length` 与 `dtype` 两边算法真的不同**，不能共用一套实现。例：Mistral 那种同时有 `max_position_embeddings=32768` 和 `model_max_length=16384` 的 config，sglang 先命中 `model_max_length`、vllm 取最小值后又被 `model_max_length` 覆盖，恰好同为 16384；但换成只有 `seq_length` 与 `max_position_embeddings` 两个键且数值不同的 config，两边结果就会分岔。
+
+**刻意不推导的（宁缺勿编，列留 NULL）**：sglang 的 `mem_fraction_static`（公式依赖 attention backend 是否 MLA、DP attention 开关、moe_a2a_backend、cuda graph buffer 等运行时状态）、`max_running_requests`（由 KV pool 容量反推，而容量又取决于前者）、`attention_backend`（按 GPU 架构 × 模型架构 × kv dtype 分派）。
+
+**params 的语义与来源留痕**：`params`（表列）存的是**实际生效值**——命令写了就用写的，没写就按上游逻辑推导。为了不丢"是不是用户显式设的"这一信息，`extra` 里同时留：
+
+| `extra` 键 | 内容 |
+|-----------|------|
+| `params_explicit` | 只含命令里真正写了的参数（"用户意图"对比用） |
+| `param_sources` | 每个参数的来源：`explicit` / `config` / `gpu` / `static` |
+| `param_notes` | 推导说明与精度提示（如"命令里的 context_length 超过 config 支持值"） |
+| `model_arch` | `config.json` 归一到我们字段后的模型结构：`num_layers` / `num_kv_heads` / `head_dim` / `sliding_window` / `is_moe` / `is_mla` / `kv_bytes_per_token` / vision 侧字段等 |
+| `model_meta` | 元信息三列（§5.4.3）的**推导值**原始留档，便于日后与用户手填值对账 |
+
+> `tp/pp/dp` 在算卡数时会先回填成 1，因此 `params_explicit` 必须在任何回填**之前**留档——光看"有没有值"分不出"命令写了 tp 1"和"命令没写 tp"。
+
+**已知精度边界**：只吃 `config.json`。上游还会读 `tokenizer_config.json`（`model_max_length`）、`generation_config.json`、`hf_quant_config.json`，以及 config 里没写 dtype 时从 safetensors 头反查权重 dtype。这些不在上传范围内时相关推导会退化，`param_notes` 会显式写明。平台相关分支按 **NVIDIA CUDA + `vllm serve`（`UsageContext.OPENAI_API_SERVER`）** 取值——这是实际压测形态；昇腾/沐曦/平头哥的显存分档只是"容量凑巧落在哪个区间"的参考（同 `gpu_memory_presets.py`）。
+
+#### 5.4.3 模型元信息三列（D24）
+
+`model_params_b` / `model_weight_gb` / `model_dtype` 不是启动参数，而是 `test_runs` 的元信息列，原先靠上传表单手填。`config.json` 成为常规输入后改为推导，实现在 `tools/model_config.py` §2b / §4b。
+
+> **口径变更**：原 `model_size` 列（注释说"参数量（GB）"、README 说"权重占用（GB）"、前端占位符给 `72`）三处口径不一致，用户实际填的大概率是参数量的 B 数。该列已**彻底移除**，拆成语义明确的两列。`migrate()` 只做 `ADD COLUMN`，老库里的 `model_size` 作为死列留着（既不读也不写），新建的库没有它。**不做换算回填**——旧值到底是 GB 还是 B 判断不了，编一个换算比留空更糟。
+
+| 列 | 单位 | 谁说了算 | 推导方式 |
+|----|------|---------|---------|
+| `model_params_b` | B（10⁹） | config 推导，用户可覆盖；推不出来时才要求手填 | 按 config 形状字段逐块累加：embedding + 逐层（attn + MLP）+ MTP 层 + vision tower（含 patch embedding 与 merger） |
+| `model_weight_gb` | GiB | config 推导，用户可覆盖 | 按段乘精度：层内线性层用量化精度，embedding / lm_head / vision tower 用 `torch_dtype` |
+| `model_dtype` | — | config 推导，用户可覆盖 | **量化块优先**、计算 dtype 兜底 |
+
+传了 config 的正常路径下这三个框全部留空，前端把推导值显示成 placeholder 而**不预填输入框**——预填等于让用户把推导值抄一遍再"确认"，之后就分不出哪些值是人填的。手填只是覆盖通道，留给"我知道这个 checkpoint 的真实布局和 config 声明的不一样"的情况。
+
+**为什么 `model_dtype` 不能只读 `torch_dtype`**：量化 checkpoint 的 `torch_dtype` 是激活/计算精度（多为 `bfloat16`），不是权重精度。DeepSeek-V3 就是 `torch_dtype=bfloat16` + `quant_method=fp8`，只看前者会把它记成 `bf16`。`quant_method` → 精度的映射表取 vllm `QUANTIZATION_METHODS` 与 sglang `BASE_QUANTIZATION_METHODS` 的**并集**（只收会出现在 checkpoint 里的名字，不收 `--quantization` 才用的在线量化简写）；位宽写在别处的按方式分头读：`modelopt`/`quark` 看 `quant_algo`，`compressed-tensors` 看 `config_groups[].weights.{num_bits,type}`，`bitsandbytes` 看 `load_in_4bit/8bit`，`awq`/`gptq`/`moe_wna16` 看 `bits`。
+
+**`model_params_b` 的估算精度**（实测见 `test/check_model_meta.py`）：稠密模型（Qwen2.5 / Llama / Mistral）、Mixtral 式 MoE（gpt-oss）、Qwen3-30B-A3B、以及两代 Qwen-VL（2 代 / 2.5 代）都**完全吻合官方参数量**；只有 DeepSeek-V3 差 0.3%（MTP 层的 `eh_proj` 按近似算）。norm / bias 等小张量一律不计（<0.1%）。核心形状字段（`num_hidden_layers` / `hidden_size` / `vocab_size`）缺任一项就返回 NULL 而不是给近似数。
+
+MoE 层布局按 `first_k_dense_replace` + `decoder_sparse_step` 还原，`moe_layer_freq` 是逐层列表时还原不了，按"全是 MoE 层"处理并在 `param_notes` 里告警。
+
+**vision tower 的两个坑**（都已处理，见 `_vision_dims` / `_vision_params`）：
+
+1. **两代 Qwen-VL 的键名是反的**。2.5 代 `vision_config.hidden_size`=1280 是内部宽度、`out_hidden_size`=3584 是输出宽度；2 代反过来，`embed_dim`=1280 才是内部宽度、`hidden_size`=3584 是输出宽度。所以判据是"谁存在"而不是"谁优先"，按 `hidden_size` 优先读会让 2 代整个 vision tower 算大 8 倍。
+2. **vision MLP 可能是 gated 的**。2.5 代是 `gate_proj`/`up_proj`/`down_proj` 三个矩阵（`hidden_act=silu`），2 代与 CLIP / SigLIP 是 `fc1`/`fc2` 两个。按激活函数名判断，否则 32 层累计差 140M。
+
+patch embedding（Conv3d）与 Qwen-VL 系的 patch merger 都计入。CLIP / SigLIP 那类 projector 形状不在 `vision_config` 里，算不了就在 `param_notes` 里写明未计入（几十 M 量级）。
+
+**合并规则**（`model_config.merge_model_meta`）：三列同一条规则——没填就用推导值，填了以填的为准并在不一致时告警。不静默覆盖手填值，是因为 config 只描述形状、不描述磁盘上真实存了什么（被裁剪的 checkpoint、混合量化、外挂 draft 权重都会让两者对不上）。比对方式按列分：`model_dtype` / `model_weight_gb` 直接比值，`model_params_b` 比相对偏差、超 **20%** 才报——阈值定得松是因为手填时习惯写标称值（"7B" 实际 7.62B，差 8%），要拦的是数量级错误：config 传错了模型，或把 MoE 的激活参数量（`Qwen3-30B-A3B` 的 `A3B`）当成总参数量填进来。
+
+**刻意不推导**：`torchao` / `gguf` / `inc` / `modelslim` / `MIXED_PRECISION` 等逐层位宽不同的量化方式，config 里没有足够信息还原，`model_dtype` 与 `model_weight_gb` 均留 NULL 并在 `param_notes` 里写明原因。这三列都不参与任何计算、只做分组对比，编一个值会让"同模型两次上传对不上"，比留空更糟。
+
+**参数量推不出来时的回退**：`model_params_b` 是唯一"必须有值"的一列。推不出来只有两种原因——没传 `config.json`，或 config 缺核心形状字段。两种情况都会在合并后校验时报错，要求显式指定（表单 `model_params_b` / CLI `--model-params-b`）。前端据 `inspect-config` 的返回决定是否强制该框必填：没选 config 或 config 没推出参数量时才拦。
 
 ### 5.5 Scanner：扫描、入库与半成品处理（D19）
 
@@ -294,18 +371,24 @@ AutoRes/
 
 **场景**：数据分散在不同子系统与地区，未落在 Scanner 扫描的 NAS 目录下。测试人员在前端页面直接提交一份整理好的 CSV 与一个写有启动命令的 txt。
 
-**输入**（三部分，缺一不可）：
+**输入**：
 
-| 输入 | 说明 |
-|------|------|
-| `csv_file` | 结果 CSV，须含 `Input_Length` 与 `Concurrency` 两列（to_csv.py 的固定 schema）；其余列原样作为指标 |
-| `launch_file` | 启动命令 txt，原文保留；允许 `#` 注释行、空行与反斜杠续行，非空行拼接为一条命令 |
-| 表单字段 | `framework` / `framework_version` / `model` / `model_version` / `gpu_type`——这 5 项无法从前两个文件推断，是 `metadata.json` 在上传流里的替代品 |
+| 输入 | 必填 | 说明 |
+|------|------|------|
+| `csv_file` | 是 | 结果 CSV / xlsx，须含 `Input_Length` 与 `Concurrency` 两列（to_csv.py 的固定 schema）；其余列原样作为指标 |
+| 启动命令文本 | 是 | 直接粘贴，原文保留；允许 `#` 注释行、空行与反斜杠续行，非空行拼接为一条命令。PD 分离改填 prefill / decode（+ 可选 router）三个框 |
+| `config_file` | 否（强烈建议） | 模型目录下的 `config.json`。给了它才能推出 `context_length` / `dtype` / `quantization` / 批量调度默认值等命令里通常不写的参数（§5.4.2），以及元信息三列（§5.4.3）；不传照样能入库，相应列留空 |
+| 表单字段 | 是 | `framework` / `framework_version` / `model` / `gpu_type` / `bench_framework` / `bench_flush_cache`——无法从上述文件推断，是 `metadata.json` 在上传流里的替代品 |
+| 表单字段（可选覆盖） | 否 | `model_version` / `model_params_b` / `model_weight_gb` / `model_dtype`——留空即按 `config.json` 推导值入库；填了以填的为准，不一致时回显告警（§5.4.3）。未传 config 时 `model_params_b` 变必填 |
+
+> 选好 `config.json` 后前端立刻调 `POST /api/upload/inspect-config` 回显识别到的架构 / 层数 / KV 头数 / 量化方式，以及推导出的参数量 / 权重占用 / 权重精度（写进对应输入框的 placeholder，不预填），当场发现传错文件（例如误传 `tokenizer_config.json`，或给多模态模型传了纯文本 config）。提交成功后的回显会给每个参数标出来源（`←config` / `←显存` / `←默认`，无标记即命令显式写的），并单列一行"模型元信息"显示三列的生效值。
 
 **与目录流的一致性**（关键约束）：
 
 - CSV 行→metric 记录复用 `scanner.parser` 的列名归一与数值转换（`N/A`→`None`、整数去小数点），两条路径解析同一份 CSV 结果逐字段相同；
-- 启动参数提取**按文件路径加载 `tools/to_csv.py` 的 `extract_launch_params`**，而非复制规则——否则同一条命令走两条路径会得到不同 params，库里出现虚假差异；`framework` 决定用哪套规则与默认值回填（§5.4.1）；
+- 启动参数提取**按文件路径加载 `tools/to_csv.py` 的 `extract_launch_params`**，而非复制规则——否则同一条命令走两条路径会得到不同 params，库里出现虚假差异；`framework` 决定用哪套规则与默认值回填（§5.4.1、§5.4.2）；
+- 上传的 `config.json` 原文落盘为 `model_config.json`，目录结构与 to_csv.py 一致，崩溃后重扫可复原；
+- **推导只发生在入库前**。Scanner 不重跑推导——同一个目录在不同 AutoRes 版本下必须解析出同一行数据，否则台账会随代码升级悄悄漂移。唯一例外是目录里有 config 原文、但 `metadata.extra` 没带 `model_arch`（老目录或手工拼的目录），此时补一份模型结构字段，只加字段、不动 params；
 - 产出文档结构与 `parse_run_dir` 完全一致，走同一个 `db.insert_run`，因此上传的记录与扫描的记录在查询/对齐/报告环节无差别。
 
 **run_id 与幂等**：上传无源目录，`run_id` 由服务器时间生成为 `upload_YYYYMMDD_HHMMSS`；同秒冲突时追加 `_1`、`_2`…（人工上传低频，冲突极少）。前缀 `upload_` 便于日后区分手工与自动记录，`extra.ingest_source = "manual_upload"` 同样标注来源。台账以 `run_id` 自身作为 `source_dir`，避免与扫描目录名冲突。
@@ -339,6 +422,9 @@ CREATE TABLE test_runs (
     -- ── 元信息维度 ──
     model             TEXT NOT NULL,
     model_version     TEXT NOT NULL,
+    model_params_b    REAL,               -- 参数量，单位 B（10^9）；7B 模型记 7.62
+    model_weight_gb   REAL,               -- 权重实际占用，单位 GiB；7B bf16 约 14.2（§5.4.3）
+    model_dtype       TEXT,               -- 权重精度 bf16|fp16|fp8|int8|int4|fp4
     framework         TEXT NOT NULL,      -- sglang | vllm
     framework_version TEXT NOT NULL,      -- 落盘入参手动传（P4 已定）
     gpu_type          TEXT NOT NULL,      -- 来自 --gpu-type
@@ -370,6 +456,8 @@ CREATE INDEX idx_test_runs_parallel ON test_runs (tp, dp, pp, ep, cp);
 ```
 
 > **注意**：`prefix_rate` **不是**表列。同 run 级维度下多条压测按行键**并集合并** metrics（`merge_duplicates`），冲突取 `run_timestamp` 更新的；不同场景永不混算。
+>
+> **已废弃的 `model_size` 列**（D24）：口径不清，已拆成 `model_params_b` + `model_weight_gb`。`migrate()` 只做 `ADD COLUMN`（SQLite 删列要重建表，风险不值当），故老库里 `model_size` 作为死列留着、既不读也不写；新建的库没有它。
 
 代码层保留"文档 dict"形态作为内部契约：`db/schema.py` 提供表行 ↔ dict 互转（params 子对象在读出时由参数列重组），下游对齐/工具/Agent 逻辑与存储引擎解耦——这正是本次从 MongoDB 平滑切换到 SQLite 只动 db 层的原因。
 

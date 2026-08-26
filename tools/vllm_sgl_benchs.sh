@@ -95,6 +95,15 @@ NAS_DIR="/mnt/nas/benchmark_root"          # to_csv 落盘根目录（其下建�
 FRAMEWORK_VERSION="0.4.6"                   # server 框架版本 → test_runs.framework_version
 GPU_TYPE="910B4-64G"                        # 显卡型号 → test_runs.gpu_type（需在 gpu_memory_presets 内）
 LAUNCH_CMD="python -m sglang.launch_server --tp-size 8"   # server 启动命令 → test_runs.launch_cmd
+# 以下三项都可留空：填了 MODEL_CONFIG 时，参数量按 config 的形状字段估算，
+# 权重占用与权重精度直接推导（量化 checkpoint 会正确识别成 fp8/int4 等）。
+MODEL_PARAMS_B=""                           # 参数量，单位 B（7B 模型填 7.62）→ test_runs.model_params_b
+MODEL_WEIGHT_GB=""                          # 权重实际占用，单位 GiB → test_runs.model_weight_gb
+MODEL_DTYPE=""                              # 权重精度：bf16|fp16|fp8|int8|int4|fp4 → test_runs.model_dtype
+# 模型目录下的 config.json 路径。强烈建议填：context_length / dtype / quantization /
+# max-num-batched-tokens 这些参数启动命令里通常不写，是 vllm/sglang 读它推导出来的；
+# 上面三项元信息也靠它推导。不给则相应列留空（详见 tools/model_config.py）。
+MODEL_CONFIG=""                             # 例：/models/GLM-4.5/config.json
 # vllm bench 场景 to_csv 需从 bench 命令补 Input_Length（sglang bench 无需）。
 # 注意：本脚本每轮 input-len 都不同，单一 --bench-cmd 无法覆盖全部，vllm bench 下
 # Input_Length 可能落 N/A —— 这是 to_csv 对 vllm bench 的既有限制，与本次改动无关。
@@ -577,6 +586,16 @@ if [[ "$RUN_TO_CSV" == "1" ]]; then
         --bench-cmd "$BENCH_CMD"
         --deployment-mode "$DEPLOYMENT_MODE"
     )
+    [[ -n "$MODEL_PARAMS_B" ]]  && TO_CSV_ARGS+=(--model-params-b "$MODEL_PARAMS_B")
+    [[ -n "$MODEL_WEIGHT_GB" ]] && TO_CSV_ARGS+=(--model-weight-gb "$MODEL_WEIGHT_GB")
+    [[ -n "$MODEL_DTYPE" ]]     && TO_CSV_ARGS+=(--model-dtype "$MODEL_DTYPE")
+    if [[ -n "$MODEL_CONFIG" ]]; then
+        if [[ -f "$MODEL_CONFIG" ]]; then
+            TO_CSV_ARGS+=(--model-config "$MODEL_CONFIG")
+        else
+            echo "[WARN] MODEL_CONFIG 指向的文件不存在，跳过：$MODEL_CONFIG"
+        fi
+    fi
     if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
         TO_CSV_ARGS+=(--prefill-cmd "$PREFILL_CMD" --decode-cmd "$DECODE_CMD")
         [[ -n "$ROUTER_CMD" ]] && TO_CSV_ARGS+=(--router-cmd "$ROUTER_CMD")

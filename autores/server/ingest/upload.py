@@ -37,9 +37,10 @@ log = get_logger("upload")
 
 # 表单必填的元信息字段（metadata.json 在上传流里的替代品）
 # 模型无版本时只填 model；model_version 入库写空串，不要求用户填写。
+# model_params_b / model_weight_gb / model_dtype 三列不在此列：由 config.json 推导，
+# 表单只作为可选覆盖。参数量推不出来时在 ingest() 里再报错（那时才知道推没推出来）。
 REQUIRED_META = [
     "framework", "framework_version", "model", "gpu_type",
-    "model_size", "model_dtype",
 ]
 
 # 压测工具框架（bench framework）可选值。与 server framework 相互独立、禁止默认一致。
@@ -50,7 +51,7 @@ _NA_CELLS = frozenset({"", "n/a", "na", "none", "null"})
 
 
 def _parse_positive_int(val, label: str) -> int:
-    """解析正整数（模型大小 GB、图片数量等）。"""
+    """解析正整数（图片数量等）。"""
     if val is None or (isinstance(val, str) and not val.strip()):
         raise UploadError(f"缺少必填字段: {label}")
     try:
@@ -60,6 +61,19 @@ def _parse_positive_int(val, label: str) -> int:
     if n < 1:
         raise UploadError(f"{label} 必须是 ≥1 的整数，收到: {n}")
     return n
+
+
+def _parse_positive_float(val, label: str) -> float | None:
+    """解析正浮点数（参数量 B、权重占用 GiB）。留空返回 None（交由 config 推导）。"""
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return None
+    try:
+        f = float(str(val).strip())
+    except (TypeError, ValueError) as e:
+        raise UploadError(f"{label} 必须是正数，收到: {val}") from e
+    if f <= 0:
+        raise UploadError(f"{label} 必须大于 0，收到: {f}")
+    return f
 
 
 def _parse_image_resolution(val, label: str = "bench_image_resolution") -> str:
@@ -157,6 +171,22 @@ def supported_gpu_types() -> list[str]:
 MAX_CSV_BYTES = 5 * 1024 * 1024
 MAX_XLSX_BYTES = 10 * 1024 * 1024   # xlsx 为压缩包，放宽到 10MB
 MAX_TXT_BYTES = 64 * 1024
+
+
+def parse_model_config(raw: bytes | None) -> dict | None:
+    """
+    上传的模型 config.json 字节 → dict；未上传（None / 空）返回 None。
+
+    config.json 是可选的：不传照样能入库，只是 context_length / dtype /
+    quantization / max-num-batched-tokens 这些由模型配置推导的列会留空
+    （详见 tools/model_config.py 顶部说明）。
+    """
+    if not raw or not raw.strip():
+        return None
+    try:
+        return launch_params.load_model_config(raw)
+    except ValueError as e:
+        raise UploadError(f"模型 config.json 非法：{e}") from e
 
 
 class UploadError(Exception):
@@ -428,15 +458,19 @@ def validate_meta(form: dict) -> dict:
     # 模型版本可选：无版本时存空串，库表仍保留该列以便与落盘流对齐
     meta["model_version"] = (form.get("model_version") or "").strip()
 
-    meta["model_size"] = _parse_positive_int(form.get("model_size"), "model_size")
+    # 三列都由 config.json 推导，表单只作可选覆盖（留空即用推导值）。
+    # 这里一律不设 required：能不能落值取决于 config 推得出不出来，
+    # 而 config 此刻还没解析。真正的"缺参数量"在 ingest() 里合并完再判。
+    meta["model_params_b"] = _parse_positive_float(
+        form.get("model_params_b"), "model_params_b")
+    meta["model_weight_gb"] = _parse_positive_float(
+        form.get("model_weight_gb"), "model_weight_gb")
 
     dtype = (form.get("model_dtype") or "").strip().lower()
-    if not dtype:
-        raise UploadError("缺少必填字段: model_dtype")
-    if dtype not in schema.MODEL_DTYPE_CHOICES:
+    if dtype and dtype not in schema.MODEL_DTYPE_CHOICES:
         raise UploadError(
             f"model_dtype 必须是 {list(schema.MODEL_DTYPE_CHOICES)} 之一，收到: {dtype}")
-    meta["model_dtype"] = dtype
+    meta["model_dtype"] = dtype or None
 
     allowed = launch_params.supported_frameworks()
     if meta["framework"] not in allowed:
@@ -489,10 +523,13 @@ def resolve_launch_text(launch_text: str | None) -> str:
 
 
 def _build_pd(framework: str, prefill_text: str, decode_text: str,
-              router_text: str | None) -> tuple[str, dict]:
+              router_text: str | None,
+              model_cfg: dict | None = None,
+              gpu_type: str | None = None) -> tuple[str, dict]:
     """
     解析 PD 分离的 prefill / decode / router 三条命令，返回 (combined_launch_cmd, pd_meta)。
     prefill / decode 必填且角色需匹配；router 可选。
+    两个角色跑同一个模型，共用同一份 model_cfg。
     """
     prefill_cmd = resolve_launch_text(prefill_text)
     decode_cmd = resolve_launch_text(decode_text)
@@ -502,8 +539,8 @@ def _build_pd(framework: str, prefill_text: str, decode_text: str,
             raise UploadError(f"router 命令超过大小上限（{MAX_TXT_BYTES // 1024} KB）")
         router_cmd = parse_launch_txt(router_text)
 
-    pf = launch_params.extract_role(framework, prefill_cmd)
-    dc = launch_params.extract_role(framework, decode_cmd)
+    pf = launch_params.extract_role(framework, prefill_cmd, model_cfg, gpu_type)
+    dc = launch_params.extract_role(framework, decode_cmd, model_cfg, gpu_type)
 
     if pf["role"] not in ("prefill", "both"):
         raise UploadError(
@@ -527,20 +564,28 @@ def _build_pd(framework: str, prefill_text: str, decode_text: str,
     if router_cmd:
         combined += f"\n\n# ROUTER\n{router_cmd}"
 
+    # 结构必须与 tools/to_csv.py:build_pd 一致——两条路都要经 scanner._split_pd 入库
+    pf_extra, dc_extra = pf.get("extra") or {}, dc.get("extra") or {}
     pd_meta = {
         "transfer_backend": transfer_backend,
         "gpu_count": total_gpus,
         "prefill_gpu_count": pf_gpus,
         "decode_gpu_count": dc_gpus,
+        "model_arch": pf_extra.get("model_arch"),
+        "param_notes": pf_extra.get("param_notes"),
         "prefill": {
             "params": pf["params"], "launch_cmd": prefill_cmd,
             "disagg": pf["disagg"], "unrecognized": pf["unrecognized"],
             "gpu_count": pf_gpus,
+            "params_explicit": pf_extra.get("params_explicit"),
+            "param_sources": pf_extra.get("param_sources"),
         },
         "decode": {
             "params": dc["params"], "launch_cmd": decode_cmd,
             "disagg": dc["disagg"], "unrecognized": dc["unrecognized"],
             "gpu_count": dc_gpus,
+            "params_explicit": dc_extra.get("params_explicit"),
+            "param_sources": dc_extra.get("param_sources"),
         },
         "router": {**router, "launch_cmd": router_cmd},
     }
@@ -560,6 +605,7 @@ def ingest(
     decode_text: str | None = None,
     router_text: str | None = None,
     benchmark_kind: str | None = None,
+    config_bytes: bytes | None = None,
 ) -> dict:
     """
     完整上传流程：校验 → 解析 → 落盘 → 扫描入库。
@@ -568,6 +614,9 @@ def ingest(
     deployment_mode:
       'colocated' —— 单机/分布式：读 launch_text 一条命令（原有行为）；
       'pd_disagg' —— PD 分离：读 prefill_text / decode_text（必填）+ router_text（可选）。
+
+    config_bytes 是模型目录下 config.json 的原文（可选）。给了它才能推出
+    context_length / dtype / quantization / 批量调度默认值等命令里通常不写的参数。
     """
     if deployment_mode not in ("colocated", "pd_disagg"):
         raise UploadError(f"deployment_mode 非法: {deployment_mode}")
@@ -587,16 +636,23 @@ def ingest(
             image_resolution=meta.pop("_bench_image_resolution", None),
         )
 
+    model_cfg = parse_model_config(config_bytes)
+    gpu_type = meta["gpu_type"]
+
     extra: dict = {"ingest_source": "manual_upload"}
 
     if deployment_mode == "pd_disagg":
         launch_cmd, pd_meta = _build_pd(
-            meta["framework"], prefill_text, decode_text, router_text)
+            meta["framework"], prefill_text, decode_text, router_text,
+            model_cfg, gpu_type)
         params: dict = {}
         pd_block: dict | None = pd_meta
         extra["gpu_count"] = pd_meta["gpu_count"]
         extra["prefill_gpu_count"] = pd_meta["prefill_gpu_count"]
         extra["decode_gpu_count"] = pd_meta["decode_gpu_count"]
+        for key in ("model_arch", "param_notes"):
+            if pd_meta.get(key):
+                extra[key] = pd_meta[key]
     else:
         launch_cmd = resolve_launch_text(launch_text)
         # 安全网：单机模式却贴了 PD 命令 → 提示改用 PD 分离（前端应已自动跳转）
@@ -605,15 +661,31 @@ def ingest(
                 "检测到 disaggregation / kv-transfer-config 相关参数，"
                 "请切换到「PD 分离」分别填写 prefill 与 decode 命令。"
             )
-        params, base_extra = launch_params.extract(meta["framework"], launch_cmd)
+        params, base_extra = launch_params.extract(
+            meta["framework"], launch_cmd, model_cfg, gpu_type)
         extra.update(base_extra)
         pd_block = None
+
+    # 模型元信息列：表单填了以表单为准，没填用 config 推的；不一致时把告警并入 param_notes，
+    # 提交后的回显会一并展示（"config 传错模型"最常在这里现形）。
+    meta_notes = launch_params.merge_model_meta(
+        meta, (pd_block or {}).get("model_meta") or extra.get("model_meta"))
+    if meta_notes:
+        extra["param_notes"] = list(extra.get("param_notes") or []) + meta_notes
+
+    # 参数量是唯一"必须有值"的一列（分组对比的主轴，缺了这行数据没法横向比）。
+    # 推不出来的只有两种情况：没传 config，或 config 缺核心形状字段——两者都得回退手填。
+    if meta.get("model_params_b") is None:
+        raise UploadError(
+            "无法确定模型参数量：config.json 未上传或缺核心形状字段"
+            "（num_hidden_layers / hidden_size / vocab_size），请手动填写 model_params_b")
 
     now = datetime.now(timezone.utc)
     try:
         dir_name, dir_path = persist.persist_upload(
             benchmark_root, db, now, meta, metrics, launch_cmd, params, extra,
             deployment_mode=deployment_mode, pd=pd_block, benchmark_kind=kind,
+            model_cfg=model_cfg,
         )
     except persist.PersistError as e:
         raise UploadError(str(e)) from e
@@ -631,6 +703,7 @@ def ingest(
         "dir": dir_path, "run_id": doc["_id"], "deployment_mode": deployment_mode,
         "kind": kind}})
 
+    doc_extra = doc.get("extra") or {}
     summary = {
         "run_id": doc["_id"],
         "source_dir": dir_name,
@@ -640,6 +713,13 @@ def ingest(
         "benchmark_kind": kind,
         "gpu_count": doc.get("gpu_count"),
         "launch_cmd": doc["launch_cmd"],
+        # 让用户提交后立刻看到"哪些值是命令写的、哪些是推出来的"
+        "model_config_used": model_cfg is not None,
+        "model_arch": doc_extra.get("model_arch"),
+        "model_meta": {k: doc.get(k) for k in
+                       ("model_params_b", "model_weight_gb", "model_dtype")},
+        "param_sources": doc_extra.get("param_sources"),
+        "param_notes": doc_extra.get("param_notes", []),
     }
     if deployment_mode == "pd_disagg":
         summary["pd"] = {
@@ -648,8 +728,10 @@ def ingest(
             "prefill_gpu_count": pd_block["prefill_gpu_count"],
             "decode_gpu_count": pd_block["decode_gpu_count"],
             "prefill": {"params": pd_block["prefill"]["params"],
+                        "param_sources": pd_block["prefill"].get("param_sources"),
                         "unrecognized": pd_block["prefill"]["unrecognized"]},
             "decode": {"params": pd_block["decode"]["params"],
+                       "param_sources": pd_block["decode"].get("param_sources"),
                        "unrecognized": pd_block["decode"]["unrecognized"]},
             "router": {k: v for k, v in pd_block["router"].items() if k != "launch_cmd"},
         }

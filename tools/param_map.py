@@ -156,15 +156,15 @@ PARAM_PAIRS = [
     _p("page_size", kind=K_INT,
        sgl_flags=["--page-size"],
        vllm_flags=["--block-size"],
-       sgl_default=None, sgl_kind=DERIVED,
-       sgl_derived_from=["attention_backend", "model_arch"],
-       vllm_default=16, vllm_kind=DERIVED,
-       vllm_derived_from=["platform"],
-       note="同义（KV 分页粒度，token 数）但默认值都不是字面量："
-            "vLLM 声明 Field(default=None)，__post_init__ 回填 DEFAULT_BLOCK_SIZE=16，"
-            "且部分平台会覆盖（platforms/interface.py）；"
-            "SGLang 默认 None，经 arg_groups/overrides.py:_page_size_default 解析。"
-            "此处 vllm_default 记的是回填后的生效值 16，非源码字面量 None。"),
+       sgl_default=1, sgl_kind=STATIC,
+       vllm_default=16, vllm_kind=STATIC,
+       note="同义（KV 分页粒度，token 数）但**默认值差 16 倍**，且两边源码里都不是"
+            "字面量默认，要跟一层才看得到："
+            "vLLM 声明 Field(default=None)，__post_init__ 回填 DEFAULT_BLOCK_SIZE=16"
+            "（config/cache.py:48）；"
+            "SGLang 也声明 None，由 arg_groups/overrides.py:_page_size_default 回填 1"
+            "（ROCm+vectorized_5d 布局与 musa 平台例外，回填 64——我们不跑这两个平台）。"
+            "此处记的是 CUDA 下回填后的生效值，非源码字面量 None。"),
 
     _p("prefix_caching", kind=K_INVERTED,
        sgl_flags=["--disable-radix-cache"],
@@ -186,22 +186,35 @@ PARAM_PAIRS = [
        vllm_flags=["--max-num-seqs"],
        sgl_default=None, sgl_kind=DERIVED,
        sgl_derived_from=["kv_pool_capacity", "mem_fraction_static"],
-       vllm_default=128, vllm_kind=STATIC,
+       vllm_default=None, vllm_kind=DERIVED,
+       vllm_derived_from=["gpu_memory_capacity", "device_name", "usage_context",
+                          "max_num_batched_tokens"],
        comparable=False,
-       note="⚠ 未显式设置时不可比：SGLang 默认 None，按 KV pool 容量推导，"
-            "在大显存机器（如 8×H200）上常远高于 128；vLLM 固定默认 128"
-            "（DEFAULT_MAX_NUM_SEQS，config/scheduler.py:44）。"),
+       note="⚠ 两边都是运行时推导，未显式设置时不可比。"
+            "SGLang 默认 None，按 KV pool 容量推导，在大显存机器上常达数千。"
+            "vLLM 的 DEFAULT_MAX_NUM_SEQS=128（config/scheduler.py）只是取不到"
+            "usage_context 时的兜底；`vllm serve` 实际走 arg_utils.py:get_batch_defaults —— "
+            "单卡显存 ≥70GiB 且卡名不含 a100 → 1024，否则 256，"
+            "之后再 min(该值, max_num_batched_tokens)。"
+            "推导实现见 tools/model_config.py:derive_vllm_batch_params。"),
 
     _p("chunked_prefill_size", kind=K_INT,
        sgl_flags=["--chunked-prefill-size"],
        vllm_flags=["--max-num-batched-tokens"],
        sgl_default=None, sgl_kind=DERIVED,
        sgl_derived_from=["gpu_memory_capacity"],
-       vllm_default=2048, vllm_kind=STATIC,
+       vllm_default=None, vllm_kind=DERIVED,
+       vllm_derived_from=["gpu_memory_capacity", "device_name", "usage_context",
+                          "model_config.max_model_len", "max_num_seqs"],
        comparable=False,
-       note="⚠ 未显式设置时不可比：SGLang 默认 None，按显存档位取值"
-            "（<20G→2048, <35G→2048, …，_handle_gpu_memory_settings）；"
-            "vLLM 固定 DEFAULT_MAX_NUM_BATCHED_TOKENS=2048。"
+       note="⚠ 两边都是运行时推导，未显式设置时不可比。"
+            "SGLang 默认 None，按显存档位取值"
+            "（<20G→2048, <35G→2048, …，_handle_gpu_memory_settings）。"
+            "vLLM 的 DEFAULT_MAX_NUM_BATCHED_TOKENS=2048 同样只是兜底常量；"
+            "`vllm serve` 走 get_batch_defaults —— 单卡显存 ≥70GiB 且卡名不含 a100 → 8192，"
+            "否则 2048，之后 min(max_num_seqs × max_model_len, 该值)，"
+            "因此**依赖模型 config.json 的上下文长度**。"
+            "推导实现见 tools/model_config.py:derive_vllm_batch_params。"
             "另注意 SGLang 的 max_prefill_tokens(默认 16384) 是另一个独立旋钮，"
             "不要与本项混为一谈。"),
 

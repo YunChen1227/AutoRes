@@ -92,12 +92,59 @@ def transfer_backends() -> dict[str, list[str]]:
     return {"sglang": list(pd.SGL_TRANSFER_BACKENDS)}
 
 
-def extract(framework: str, launch_cmd: str) -> tuple[dict, dict]:
-    """从启动命令提取 (params, extra)。framework 非法时抛 ValueError。"""
+def _model_config_mod():
+    """
+    模型 config 推导模块。
+
+    取 to_csv 自己 import 的那一份（to_csv.py 顶部 `import model_config as mc`），
+    而不是再按路径加载一次——同一份规则在进程里只能有一个实例，
+    否则将来给它加缓存或状态时两边会不一致。
+    """
+    return _load().mc
+
+
+def load_model_config(raw) -> dict:
+    """模型 config.json（bytes/str/dict）→ dict。非法时抛 ValueError 子类。"""
+    return _model_config_mod().load_config(raw)
+
+
+def model_config_filename() -> str:
+    """时间戳目录里存 config 原文的文件名（落盘与 Scanner 读回共用）。"""
+    return _model_config_mod().RUN_DIR_FILENAME
+
+
+def normalize_model_config(cfg: dict) -> dict:
+    """模型 config dict → AutoRes model_arch 字段（层数/KV 头数/head_dim 等）。"""
+    return _model_config_mod().normalize(cfg)
+
+
+def model_meta(cfg: dict, arch: dict | None = None) -> tuple[dict, list[str]]:
+    """
+    模型 config dict → ({model_dtype, model_params_b, model_weight_gb}, 告警)。
+
+    供 /api/upload/inspect-config 在用户选好文件时立刻回显预填值，
+    不经过启动命令解析（那时前端还没提交命令）。
+    """
+    return _model_config_mod().resolve_model_meta(cfg, arch)
+
+
+def merge_model_meta(meta: dict, derived: dict | None) -> list[str]:
+    """把推导出的模型元信息合并进 metadata 顶层（就地修改），返回告警列表。"""
+    return _model_config_mod().merge_model_meta(meta, derived)
+
+
+def extract(framework: str, launch_cmd: str,
+            model_cfg: dict | None = None,
+            gpu_type: str | None = None) -> tuple[dict, dict]:
+    """
+    从启动命令 + 模型 config 提取 (params, extra)。framework 非法时抛 ValueError。
+
+    model_cfg 为 None 时行为与只解析命令一致（依赖模型的参数留空）。
+    """
     mod = _load()
     if framework not in supported_frameworks():
         raise ValueError(f"不支持的框架: {framework}")
-    return mod.extract_launch_params(framework, launch_cmd)
+    return mod.extract_launch_params(framework, launch_cmd, model_cfg, gpu_type)
 
 
 def detect_role(framework: str, launch_cmd: str) -> str | None:
@@ -115,7 +162,9 @@ def _pd_flag_names() -> set[str]:
     return set(pd.SGL_PD_FLAGS) | {pd.VLLM_KV_FLAG}
 
 
-def extract_role(framework: str, launch_cmd: str) -> dict:
+def extract_role(framework: str, launch_cmd: str,
+                 model_cfg: dict | None = None,
+                 gpu_type: str | None = None) -> dict:
     """
     解析一条 PD 角色（prefill 或 decode）server 启动命令，返回：
       {
@@ -127,10 +176,11 @@ def extract_role(framework: str, launch_cmd: str) -> dict:
         extra: {...},         # 通用参数解析的其它 extra（hicache_detail 等）
       }
     若该命令不是 PD 角色命令，role 为 None（调用方据此报错）。
+    prefill 与 decode 跑同一个模型，调用方对两条命令传同一份 model_cfg。
     """
     pd = _load_pd()
     role = pd.detect_role(framework, launch_cmd)
-    params, extra = extract(framework, launch_cmd)
+    params, extra = extract(framework, launch_cmd, model_cfg, gpu_type)
     disagg = pd.extract_disagg(framework, launch_cmd)
 
     # 从 unrecognized 中剔除 PD 专属 flag（它们已被 disagg 解析，不算"未识别"）
