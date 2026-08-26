@@ -158,7 +158,7 @@ AutoRes/
 | `--model-weight-gb` | 否 | 权重实际占用，单位 GiB；不传则由 `--model-config` 推导 → `model_weight_gb` |
 | `--model-dtype` | 否 | 权重精度（`bf16/fp16/fp8/int8/int4/fp4`）；不传则由 `--model-config` 推导 → `model_dtype` |
 | `--launch-cmd` | 是* | **完整服务启动命令字符串**（colocated 必填；PD 分离改用 `--prefill-cmd`/`--decode-cmd`）；脚本据此提取结构化启动参数（见 §5.4） |
-| `--model-config` | 否（强烈建议） | 模型目录下的 `config.json` 路径。**启动命令里通常不写**的参数（`context_length` / `dtype` / `quantization` / `max-num-batched-tokens` …）都是框架读它在运行时推导的；上面三个元信息列也靠它推导。不传则相应列留空（见 §5.4.1 / §5.4.3） |
+| `--model-config` | 否（强烈建议） | 模型目录下的 `config.json` 路径。**启动命令里通常不写**的参数（`context_length` / `dtype` / `quantization` / `max-num-batched-tokens` …）都是框架读它在运行时推导的；上面三个元信息列也靠它推导。不传则相应列留空（见 §5.4.1 / §5.4.3）。压测脚本自动落盘时无需单独配置——随机数据集压测必须给 bench 传 `--tokenizer`，而该路径就是模型目录，脚本里 `MODEL_CONFIG` 留空即取 `$TOKENIZER/config.json` |
 | `--bench-cmd` | 否 | 完整 benchmark 命令字符串；作 `_autores_dims` 缺失时的兜底 |
 
 > `prefix_rate` **不再**是 to_csv CLI 入参（已下沉为 text metrics 行键，由 `inject_dims.py` / CSV 列提供）。

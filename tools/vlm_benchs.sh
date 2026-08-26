@@ -55,16 +55,17 @@ FRAMEWORK_VERSION="0.4.6"
 GPU_TYPE="910B4-64G"
 LAUNCH_CMD="python -m sglang.launch_server --tp-size 8"
 BENCH_CMD=""
-# 以下三项都可留空：填了 MODEL_CONFIG 就全部按 config 推导，不必手填。
+# 以下三项**正常都留空**：全部由模型 config.json 推导，不必手填。
 # 多模态的参数量含 vision tower / patch embedding / Qwen-VL 系的 merger；
 # CLIP、SigLIP 那类 projector 形状不在 vision_config 里，会少算几十 M。
 MODEL_PARAMS_B=""                           # 参数量，单位 B（Qwen2.5-VL-7B 填 8.29）→ test_runs.model_params_b
 MODEL_WEIGHT_GB=""                          # 权重实际占用，单位 GiB → test_runs.model_weight_gb
 MODEL_DTYPE=""                              # 权重精度：bf16|fp16|fp8|int8|int4|fp4 → test_runs.model_dtype
-# 模型目录下的 config.json 路径。强烈建议填：context_length / dtype / quantization /
-# max-num-batched-tokens 这些参数启动命令里通常不写，是 vllm/sglang 读它推导出来的；
-# 上面三项元信息也靠它推导，多模态模型还会一并识别出 vision_config
-# （详见 tools/model_config.py）。
+# 模型 config.json 路径。**留空即自动取 "$TOKENIZER/config.json"**——随机数据集压测
+# 必须给 bench 传 --tokenizer，而它就是模型目录，config.json 直接拼出来即可，不必配第二遍。
+# 只有 tokenizer 目录与模型目录不是同一个时才需要显式指定。
+# 这个文件决定 context_length / dtype / quantization / max-num-batched-tokens 这些
+# 启动命令里通常不写的参数，以及上面三项元信息；多模态还会一并识别出 vision_config。
 MODEL_CONFIG=""                             # 例：/models/Qwen2.5-VL-72B/config.json
 
 declare -a max_concurrency=(1 2 4 8 16)
@@ -595,12 +596,19 @@ if [[ "$RUN_TO_CSV" == "1" ]]; then
     [[ -n "$MODEL_PARAMS_B" ]]  && TO_CSV_ARGS+=(--model-params-b "$MODEL_PARAMS_B")
     [[ -n "$MODEL_WEIGHT_GB" ]] && TO_CSV_ARGS+=(--model-weight-gb "$MODEL_WEIGHT_GB")
     [[ -n "$MODEL_DTYPE" ]]     && TO_CSV_ARGS+=(--model-dtype "$MODEL_DTYPE")
-    if [[ -n "$MODEL_CONFIG" ]]; then
-        if [[ -f "$MODEL_CONFIG" ]]; then
-            TO_CSV_ARGS+=(--model-config "$MODEL_CONFIG")
-        else
-            echo "[WARN] MODEL_CONFIG 指向的文件不存在，跳过：$MODEL_CONFIG"
-        fi
+    # MODEL_CONFIG 留空就按 TOKENIZER 拼：随机数据集压测必须传 --tokenizer，而它就是模型目录。
+    RESOLVED_MODEL_CONFIG="$MODEL_CONFIG"
+    if [[ -z "$RESOLVED_MODEL_CONFIG" && -n "$TOKENIZER" ]]; then
+        RESOLVED_MODEL_CONFIG="${TOKENIZER%/}/config.json"
+        echo "[to_csv] MODEL_CONFIG 未配置，按 TOKENIZER 推出：$RESOLVED_MODEL_CONFIG"
+    fi
+    if [[ -f "$RESOLVED_MODEL_CONFIG" ]]; then
+        TO_CSV_ARGS+=(--model-config "$RESOLVED_MODEL_CONFIG")
+    else
+        # 没有 config，参数量就推不出来，而它是必须有值的一列 → to_csv 会直接失败。
+        echo "[WARN] 找不到模型 config.json：${RESOLVED_MODEL_CONFIG:-<未配置且 TOKENIZER 为空>}"
+        echo "       context_length / dtype / quantization 等列将留空；"
+        echo "       且除非设置 MODEL_PARAMS_B，to_csv 会因无法确定参数量而失败。"
     fi
     if [[ "$DEPLOYMENT_MODE" == "pd_disagg" ]]; then
         TO_CSV_ARGS+=(--prefill-cmd "$PREFILL_CMD" --decode-cmd "$DECODE_CMD")

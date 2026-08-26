@@ -128,7 +128,7 @@ bash vllm_sgl_benchs.sh
 |------|------|------|
 | `FRAMEWORK` | `sglang` | `sglang` 或 `vllm`（决定 bench 命令与指标抓取方式） |
 | `SERVER_HOST` / `SERVER_PORT` | 见脚本 | 推理服务地址 |
-| `MODEL` / `TOKENIZER` | 见脚本 | 模型名与 tokenizer 路径 |
+| `MODEL` / `TOKENIZER` | 见脚本 | 模型名与 tokenizer 路径。`TOKENIZER` 就是模型目录，落盘时 `MODEL_CONFIG` 默认取它下面的 `config.json` |
 | `FLUSH_CACHE` | `0` | `1` = 每轮压测前清 server KV/prefix cache |
 | `WARMUP_REQUESTS` | `0` | 每轮正式压测前的预热请求数。`0` = 不预热；`>0` 由脚本自己发，两个 bench 的原生 warmup 一律关掉，保证 sglang / vllm 行为一致 |
 | `WARMUP_OUTPUT_LEN` | `32` | 预热请求的输出长度（对齐 sglang 原生 warmup 的 32 token 上限） |
@@ -214,7 +214,6 @@ python tools/to_csv.py \
   --nas-dir /mnt/nas/benchmark_root \
   --gpu-type H20-141G \
   --model DeepSeek-V4 \
-  --model-size 350 --model-dtype fp8 \
   --model-config /models/DeepSeek-V4/config.json \
   --launch-cmd "python -m sglang.launch_server --tp-size 8 --enable-cache-report --speculative-algorithm EAGLE"
 ```
@@ -242,6 +241,8 @@ python tools/to_csv.py \
 
 > 压测脚本 `vllm_sgl_benchs.sh` / `vlm_benchs.sh` 顶部把 `RUN_TO_CSV=1` 时，**压测跑完会自动调用一次 `to_csv.py`**
 > （带对应 `--benchmark-kind`；`--bench-flush-cache` 由脚本的 `FLUSH_CACHE` 派生），无需手动执行本步。
+> 模型 `config.json` 也不用另配：`MODEL_CONFIG` 留空即取 `$TOKENIZER/config.json`，
+> 于是 `MODEL_PARAMS_B` / `MODEL_WEIGHT_GB` / `MODEL_DTYPE` 三项都可以留空、全部按 config 推导。
 
 **vllm-ascend：** 与 vllm 相同，仅 `--framework vllm-ascend`；参数解析走 vllm 分支，入库 `framework` 仍存 `vllm-ascend`。
 
@@ -260,6 +261,8 @@ python tools/to_csv.py \
   `max-num-batched-tokens` / `chunked-prefill-size` 这些参数**启动命令里通常不写**，是 vllm / sglang 读模型 config
   在运行时推导的；不传则相应列留空。推导算法逐项照搬上游源码，见 `tools/model_config.py`。
   三个模型元信息列也靠它推导（见下）。
+  用压测脚本自动落盘时不必单独配：`MODEL_CONFIG` 留空即取 `$TOKENIZER/config.json`
+  （随机数据集压测必须给 bench 传 `--tokenizer`，那个路径就是模型目录）。
 - `--model-params-b` / `--model-weight-gb` / `--model-dtype`：参数量（单位 B）、权重实际占用（单位 GiB）、
   权重精度（`bf16|fp16|fp8|int8|int4|fp4`），对应同名表列。**传了 `--model-config` 就三项都不用给**，
   全部按 config 推导；给了命令行值则以命令行为准、与推导值不符时告警。
