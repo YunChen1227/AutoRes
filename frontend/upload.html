@@ -108,6 +108,9 @@
           <b>可选列</b>：<code>Prefix Rate</code>（缺失则整列记为 N/A，且不与有值的行对齐）。
           其他指标列名会自动映射到 to_csv.py 规范 schema。Excel <b>仅支持单个 sheet</b>，多 sheet / 旧版 .xls 会报错。
           启动命令直接粘贴，支持 # 注释行与反斜杠续行。<br>
+          <b>请上传模型目录下的 config.json</b>（就在 CSV 下方），用于推导参数量 / 权重占用 / 权重精度，
+          以及 <code>context_length</code>、<code>dtype</code>、<code>quantization</code> 等启动命令里通常不写的参数。
+          不传 config 时参数量需手填，其余推导列留空。<br>
           默认「单机 / 分布式」；<b>若命令里出现 disaggregation / kv-transfer-config 等 PD 参数，会自动切到「PD 分离」</b>，
           需分别填写 prefill、decode（router 可选）。
         </div>

@@ -22,6 +22,13 @@ _FRONTEND = os.path.join(_FRONTEND_DIR, "index.html")
 _UPLOAD_PAGE = os.path.join(_FRONTEND_DIR, "upload.html")
 _UPLOAD_VLM_PAGE = os.path.join(_FRONTEND_DIR, "upload_vlm.html")
 
+# 上传页 HTML 常改；禁止浏览器/CDN 缓存旧版（/upload 比 /upload/vlm 更早访问，容易 stale）。
+_HTML_NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
+
+def _html_page(path: str) -> FileResponse:
+    return FileResponse(path, media_type="text/html", headers=_HTML_NO_CACHE)
+
 
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
@@ -29,7 +36,7 @@ def _sse(event: dict) -> str:
 
 @router.get("/")
 def index():
-    return FileResponse(_FRONTEND, media_type="text/html")
+    return _html_page(_FRONTEND)
 
 
 @router.get("/api/health")
@@ -87,13 +94,13 @@ async def chat(request: Request):
 @router.get("/upload")
 def upload_page():
     """手工上传子页面（文本压测 CSV + 启动命令文本）。"""
-    return FileResponse(_UPLOAD_PAGE, media_type="text/html")
+    return _html_page(_UPLOAD_PAGE)
 
 
 @router.get("/upload/vlm")
 def upload_vlm_page():
     """VLM 多模态压测手工上传子页面。"""
-    return FileResponse(_UPLOAD_VLM_PAGE, media_type="text/html")
+    return _html_page(_UPLOAD_VLM_PAGE)
 
 
 @router.get("/api/upload/options")
