@@ -9,7 +9,9 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from autores.common.logging import get_logger
 from autores.db.client import DuplicateRunError
+from autores.server import gpu_types as gpu_types_mod
 from autores.server.agent.loop import Agent
+from autores.server.gpu_types import GpuTypeError
 from autores.server.ingest import launch_params, upload as upload_mod
 from autores.server.ingest.upload import UploadError
 
@@ -21,6 +23,7 @@ _FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__f
 _FRONTEND = os.path.join(_FRONTEND_DIR, "index.html")
 _UPLOAD_PAGE = os.path.join(_FRONTEND_DIR, "upload.html")
 _UPLOAD_VLM_PAGE = os.path.join(_FRONTEND_DIR, "upload_vlm.html")
+_GPUS_PAGE = os.path.join(_FRONTEND_DIR, "gpus.html")
 
 # 上传页 HTML 常改；禁止浏览器/CDN 缓存旧版（/upload 比 /upload/vlm 更早访问，容易 stale）。
 _HTML_NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
@@ -101,6 +104,97 @@ def upload_page():
 def upload_vlm_page():
     """VLM 多模态压测手工上传子页面。"""
     return _html_page(_UPLOAD_VLM_PAGE)
+
+
+@router.get("/gpus")
+def gpus_page():
+    """显卡型号管理子页面（增删改查 tools/gpu_types.json）。"""
+    return _html_page(_GPUS_PAGE)
+
+
+@router.get("/api/gpu-types")
+def gpu_types_list(request: Request):
+    """列出全部显卡型号（含库内引用数 in_use）。"""
+    try:
+        items = gpu_types_mod.list_types(request.app.state.db)
+        return JSONResponse({
+            "gpu_types": items,
+            "vendors": gpu_types_mod.vendor_choices(),
+        })
+    except Exception as e:  # noqa: BLE001
+        log.error("列出显卡型号失败", extra={"fields": {"error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
+
+
+@router.post("/api/gpu-types")
+async def gpu_types_create(request: Request):
+    """新增显卡型号。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "请求体须为 JSON"}, status_code=400)
+    try:
+        item = gpu_types_mod.create_type(
+            request.app.state.db,
+            name=body.get("name"),
+            memory_gib=body.get("memory_gib"),
+            cards_per_machine=body.get("cards_per_machine", 8),
+            vendor=body.get("vendor", "other"),
+            released=body.get("released", True),
+            note=body.get("note", ""),
+        )
+        log.info("新增显卡型号", extra={"fields": {"name": item["name"]}})
+        return JSONResponse(item, status_code=201)
+    except GpuTypeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        log.error("新增显卡型号失败", extra={"fields": {"error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
+
+
+@router.patch("/api/gpu-types/{name}")
+async def gpu_types_update(name: str, request: Request):
+    """修改显卡型号（不允许改 name）。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "请求体须为 JSON"}, status_code=400)
+    if "name" in body and body["name"] != name:
+        return JSONResponse(
+            {"error": "不允许修改型号名；要改名请新建后迁移历史记录"},
+            status_code=400,
+        )
+    try:
+        item = gpu_types_mod.update_type(
+            request.app.state.db,
+            name,
+            memory_gib=body.get("memory_gib"),
+            cards_per_machine=body.get("cards_per_machine"),
+            vendor=body.get("vendor"),
+            released=body.get("released"),
+            note=body.get("note"),
+        )
+        log.info("更新显卡型号", extra={"fields": {"name": name}})
+        return JSONResponse(item)
+    except GpuTypeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        log.error("更新显卡型号失败", extra={"fields": {"error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
+
+
+@router.delete("/api/gpu-types/{name}")
+def gpu_types_delete(name: str, request: Request):
+    """删除显卡型号（有库内引用时拒绝）。"""
+    try:
+        result = gpu_types_mod.delete_type(request.app.state.db, name)
+        log.info("删除显卡型号", extra={"fields": {"name": name}})
+        return JSONResponse(result)
+    except GpuTypeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        log.error("删除显卡型号失败", extra={"fields": {"error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
 
 
 @router.get("/api/upload/options")

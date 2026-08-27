@@ -27,7 +27,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from autores.common.logging import get_logger
 from autores.config import Config
 from autores.db import schema
+from autores.server import gpu_types as gpu_types_mod
 from autores.server.agent import tools as agent_tools
+from autores.server.gpu_types import GpuTypeError
 from autores.server.report.pipeline import generate_report
 
 log = get_logger("mcp")
@@ -38,7 +40,13 @@ _INSTRUCTIONS = (
     "1) 用 list_dimension_values 把用户口语（如 '4090'）对齐到库内真实值；\n"
     "2) 用 count_matching_runs 预检命中数量，0 条则提示无数据、过多则加约束；\n"
     "3a) 查饱和点 / 推荐并发 / 性能墙 → 调用 analyze_saturation（无需生成 Excel）；\n"
-    "3b) 横向对比 → 用 generate_comparison_report 生成报告并返回下载链接。"
+    "3b) 横向对比 → 用 generate_comparison_report 生成报告并返回下载链接。\n"
+    "\n"
+    "显卡型号管理（配置变更，非压测查询）：\n"
+    "- 只读：gpu_type_list / gpu_type_get；\n"
+    "- 写入：gpu_type_create / gpu_type_update / gpu_type_delete，"
+    "必须先以 confirm=false 拿到 preview，确认后再用 confirm=true 落盘；\n"
+    "- 有库内引用的型号不能删；型号名不可改。"
 )
 
 
@@ -285,5 +293,135 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
             return {"status": "ok", "db": "ok"}
         except Exception as e:  # noqa: BLE001
             return {"status": "degraded", "db": f"error: {e}"}
+
+    # ── 显卡型号管理（固定指令；写操作需 confirm=true）──
+    # 刻意不挂到内置 chat agent（agent/tools.py），避免对话里的 LLM 语义化乱改。
+
+    @mcp.tool()
+    def gpu_type_list() -> dict:
+        """列出全部显卡型号（含 in_use 引用数与 vendors 枚举）。只读。"""
+        try:
+            return {
+                "ok": True,
+                "gpu_types": gpu_types_mod.list_types(db),
+                "vendors": gpu_types_mod.vendor_choices(),
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def gpu_type_get(name: str) -> dict:
+        """按型号名取单条明细（含 in_use）。只读。"""
+        try:
+            item = gpu_types_mod.get_type(db, name)
+            if item is None:
+                return {"ok": False, "error": f"型号不存在: {name}"}
+            return {"ok": True, "gpu_type": item}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def gpu_type_create(
+        name: str,
+        memory_gib: float,
+        cards_per_machine: int = 8,
+        vendor: str = "other",
+        released: bool = True,
+        note: str = "",
+        confirm: bool = False,
+    ) -> dict:
+        """新增显卡型号。固定指令：confirm=false 只返回 preview，不落盘；
+        confirm=true 才写入 tools/gpu_types.json。"""
+        try:
+            if not confirm:
+                preview = gpu_types_mod.preview_create(
+                    name=name,
+                    memory_gib=memory_gib,
+                    cards_per_machine=cards_per_machine,
+                    vendor=vendor,
+                    released=released,
+                    note=note,
+                )
+                return {
+                    "ok": False,
+                    "requires_confirm": True,
+                    "preview": {"before": None, "after": preview},
+                    "hint": "确认无误后以相同参数再次调用并设 confirm=true",
+                }
+            item = gpu_types_mod.create_type(
+                db,
+                name=name,
+                memory_gib=memory_gib,
+                cards_per_machine=cards_per_machine,
+                vendor=vendor,
+                released=released,
+                note=note,
+            )
+            log.info("MCP 新增显卡型号", extra={"fields": {"name": item["name"]}})
+            return {"ok": True, "gpu_type": item}
+        except GpuTypeError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def gpu_type_update(
+        name: str,
+        memory_gib: float | None = None,
+        cards_per_machine: int | None = None,
+        vendor: str | None = None,
+        released: bool | None = None,
+        note: str | None = None,
+        confirm: bool = False,
+    ) -> dict:
+        """修改显卡型号（不可改 name）。confirm=false 只返回 before/after preview；
+        confirm=true 才落盘。"""
+        try:
+            kwargs = {
+                "memory_gib": memory_gib,
+                "cards_per_machine": cards_per_machine,
+                "vendor": vendor,
+                "released": released,
+                "note": note,
+            }
+            # 去掉未传字段，避免把 None 当成要清空
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            if not confirm:
+                before, after = gpu_types_mod.preview_update(name, **kwargs)
+                return {
+                    "ok": False,
+                    "requires_confirm": True,
+                    "preview": {"before": before, "after": after},
+                    "hint": "确认无误后以相同参数再次调用并设 confirm=true",
+                }
+            item = gpu_types_mod.update_type(db, name, **kwargs)
+            log.info("MCP 更新显卡型号", extra={"fields": {"name": name}})
+            return {"ok": True, "gpu_type": item}
+        except GpuTypeError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def gpu_type_delete(name: str, confirm: bool = False) -> dict:
+        """删除显卡型号。有库内引用时拒绝。confirm=false 只返回 preview；
+        confirm=true 才落盘。"""
+        try:
+            if not confirm:
+                preview = gpu_types_mod.preview_delete(db, name)
+                return {
+                    "ok": False,
+                    "requires_confirm": True,
+                    "preview": {"before": preview.get("before"), "after": None,
+                                "in_use": preview.get("in_use", 0)},
+                    "hint": "确认无误后以相同参数再次调用并设 confirm=true",
+                }
+            result = gpu_types_mod.delete_type(db, name)
+            log.info("MCP 删除显卡型号", extra={"fields": {"name": name}})
+            return result
+        except GpuTypeError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
 
     return mcp

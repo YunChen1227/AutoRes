@@ -52,7 +52,17 @@ pip install -r requirements.txt
 | `count_matching_runs` | 生成报告前**预检**一组条件命中多少条记录（1~20 条会附带明细） | `filters`，`exclude?` |
 | `analyze_saturation` | 分析**性能饱和点**（hardware wall）：按 `input_length` 给出墙并发、推荐运行点、瓶颈与置信度（JSON + Markdown） | `filters?`，`exclude?`，`run_id?`，`slo_*?`，`include_points?`，`max_runs?` |
 | `generate_comparison_report` | 生成 **Excel 对比报告**，返回下载链接与摘要 | `compare_on`，`filters?`，`compare_values?`，`exclude?`，`metrics?`，`metric_filters?`，`normalize_gpu_scale?` |
+| `gpu_type_list` | 列出全部显卡型号（含 `in_use`） | 无 |
+| `gpu_type_get` | 按型号名取单条明细 | `name` |
+| `gpu_type_create` | **新增**型号（固定指令；需 `confirm=true` 才落盘） | `name`，`memory_gib`，`cards_per_machine?`，`vendor?`，`released?`，`note?`，`confirm?` |
+| `gpu_type_update` | **修改**型号（不可改名；需 `confirm=true`） | `name`，可改字段…，`confirm?` |
+| `gpu_type_delete` | **删除**型号（有引用则拒绝；需 `confirm=true`） | `name`，`confirm?` |
 | `health` | 健康检查（数据库连通性） | 无 |
+
+> **显卡写操作两段式**：`gpu_type_create` / `update` / `delete` 默认 `confirm=false`，只返回
+> `{ok:false, requires_confirm:true, preview:{before,after}}`，**不改文件**；确认后再用相同参数
+> 并设 `confirm=true` 落盘。这是「固定指令」而非「语义随便改」的防护——内置 chat Agent
+> （`agent/tools.py`）**根本不注册**这些工具，只有 MCP 客户端能显式调用。
 
 ### 推荐调用流程
 
@@ -116,7 +126,7 @@ pip install -r requirements.txt
 }
 ```
 
-保存后在 Cursor 的 MCP 设置里应能看到 `autores` 及其 7 个工具。
+保存后在 Cursor 的 MCP 设置里应能看到 `autores` 及其工具（含显卡管理五个固定指令）。
 
 ### 3.2 Claude Desktop / 其他仅支持 stdio 的客户端
 

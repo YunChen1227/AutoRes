@@ -94,6 +94,7 @@
   <header>
     <span class="dot"></span>上传测试结果（文本）
     <span class="spacer"></span>
+    <a href="/gpus">显卡管理</a>
     <a href="/upload/vlm">VLM 上传 →</a>
     <a href="/">← 返回对比助手</a>
   </header>
@@ -300,10 +301,10 @@
     })
     .catch(function () {
       fillSelect(frameworkSel, ["sglang", "vllm", "vllm-ascend"]);
-      fillSelect(gpuSel, [
-        "H20-141G", "H20-96G", "910B3", "910B4-32G", "910B4-64G",
-        "C550", "PPU810E", "PPU890",
-      ]);
+      gpuSel.innerHTML = "";
+      const opt = document.createElement("option");
+      opt.value = ""; opt.textContent = "（无法加载显卡列表，请刷新或检查 /api/upload/options）";
+      gpuSel.appendChild(opt);
       fillSelect(dtypeSel, ["bf16", "fp8", "int8", "int4", "fp4"]);
       fillSelect(benchSel, ["sglang", "vllm"]);
     });

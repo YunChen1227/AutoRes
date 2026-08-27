@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "gpu_types": [
+    {
+      "name": "H20-141G",
+      "memory_gib": 141,
+      "cards_per_machine": 8,
+      "vendor": "nvidia",
+      "released": true,
+      "note": ""
+    },
+    {
+      "name": "H20-96G",
+      "memory_gib": 96,
+      "cards_per_machine": 8,
+      "vendor": "nvidia",
+      "released": true,
+      "note": ""
+    },
+    {
+      "name": "910B3",
+      "memory_gib": 64,
+      "cards_per_machine": 8,
+      "vendor": "huawei",
+      "released": true,
+      "note": ""
+    },
+    {
+      "name": "910B4-32G",
+      "memory_gib": 32,
+      "cards_per_machine": 8,
+      "vendor": "huawei",
+      "released": true,
+      "note": "910B4 显存可选 32/64GB"
+    },
+    {
+      "name": "910B4-64G",
+      "memory_gib": 64,
+      "cards_per_machine": 8,
+      "vendor": "huawei",
+      "released": true,
+      "note": ""
+    },
+    {
+      "name": "C550",
+      "memory_gib": 64,
+      "cards_per_machine": 8,
+      "vendor": "metax",
+      "released": true,
+      "note": ""
+    },
+    {
+      "name": "MLU580-X6G",
+      "memory_gib": 48,
+      "cards_per_machine": 16,
+      "vendor": "cambricon",
+      "released": false,
+      "note": "未发布；16 卡/机 × 48 GiB = 768 GiB"
+    },
+    {
+      "name": "PPU810E",
+      "memory_gib": 96,
+      "cards_per_machine": 16,
+      "vendor": "t-head",
+      "released": true,
+      "note": ""
+    },
+    {
+      "name": "PPU890",
+      "memory_gib": 144,
+      "cards_per_machine": 16,
+      "vendor": "t-head",
+      "released": true,
+      "note": ""
+    }
+  ]
+}

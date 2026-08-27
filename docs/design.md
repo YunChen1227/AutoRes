@@ -72,6 +72,7 @@
 | D21 | 排除逻辑 | 取出数据可能过多，Agent 除"取哪些"外还支持"排除哪些"：QuerySpec 增加 `exclude` 字段，用户可要求剔除某维度值（如"去掉 A800 的"） | 见 §7.3、§7.4 |
 | D23 | config.json 参与推导 | 落盘脚本与上传页面都接收模型 `config.json`（可选），与启动命令**一起**推导参数：`params` 列存实际生效值，`extra` 里留 `params_explicit` / `param_sources` / `param_notes` / `model_arch`。推导算法逐项照搬 vllm/sglang 上游，算不准的（sglang `mem_fraction_static` / `max_running_requests` / `attention_backend`）宁缺勿编 | `context_length`、`dtype`、`quantization`、`max-num-batched-tokens` 这类参数命令里通常不写，只解析命令则列全是 NULL，见 §5.4.2 |
 | D24 | 模型元信息列拆分 | 口径不清的 `model_size` 列**彻底移除**，拆成 `model_params_b`（参数量，B）+ `model_weight_gb`（权重占用，GiB）。这两列与 `model_dtype` 三者**全部由 `config.json` 推导**，表单/CLI 只作可选覆盖：传了 config 就一个都不用填。仅 `model_params_b` 在推不出来时（没传 config 或 config 缺形状字段）要求手填——它是分组对比的主轴，不能为空。老库里的 `model_size` 留作死列，**不做换算回填** | 原列的三处文档口径互相矛盾（注释写参数量 GB、README 写权重占用 GB、前端占位符给 `72`），旧值到底是 GB 还是 B 判断不了；手填还容易把量化模型的 dtype 记成 `bf16`（那是激活精度）、把 MoE 的激活参数量当总参数量。既然 config 能算准，就别让人再填一遍，见 §5.4.3 |
+| D25 | 显卡型号可 CRUD | 硬编码的 `GPU_MEMORY_GIB` dict **迁到** `tools/gpu_types.json` 作唯一真相；`/gpus` 页面与 MCP 五个固定指令（`gpu_type_list/get/create/update/delete`）做增删改查。写操作需 `confirm=true` 两段式；**内置 chat agent 不授予**这些工具。有库内引用的型号不能删；**不允许改名**（历史 `gpu_type` 是裸字符串） | 压测机 `tools/` 需能离线用，故不用 SQLite；型号表频繁增删（未发布卡）不该改代码。见 §5.4.4 |
 
 ---
 
@@ -358,6 +359,35 @@ patch embedding（Conv3d）与 Qwen-VL 系的 patch merger 都计入。CLIP / Si
 **刻意不推导**：`torchao` / `gguf` / `inc` / `modelslim` / `MIXED_PRECISION` 等逐层位宽不同的量化方式，config 里没有足够信息还原，`model_dtype` 与 `model_weight_gb` 均留 NULL 并在 `param_notes` 里写明原因。这三列都不参与任何计算、只做分组对比，编一个值会让"同模型两次上传对不上"，比留空更糟。
 
 **参数量推不出来时的回退**：`model_params_b` 是唯一"必须有值"的一列。推不出来只有两种原因——没传 `config.json`，或 config 缺核心形状字段。两种情况都会在合并后校验时报错，要求显式指定（表单 `model_params_b` / CLI `--model-params-b`）。前端据 `inspect-config` 的返回决定是否强制该框必填：没选 config 或 config 没推出参数量时才拦。
+
+#### 5.4.4 显卡型号注册表（D25）
+
+型号表真相源是 **`tools/gpu_types.json`**（不是 SQLite、不是硬编码 dict）。上传白名单、按显存推导 `chunked_prefill_size`、报告层「N卡(M机)」换算都读它。选择 JSON 而非 DB：压测机侧 `tools/` 约定能脱离 `autores` 包单独跑，拷走目录（含该 JSON）即可离线校验 `--gpu-type`。
+
+每条字段：
+
+| 字段 | 说明 |
+|------|------|
+| `name` | 型号名（主键）；`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` |
+| `memory_gib` | 单卡显存 GiB（1–2048） |
+| `cards_per_machine` | 每机卡数（1–64）；取代旧的前缀猜测 |
+| `vendor` | `nvidia` / `huawei` / `metax` / `cambricon` / `t-head` / `other` |
+| `released` | 是否已发布 |
+| `note` | 备注，≤200 字 |
+
+读写入口：`tools/gpu_memory_presets.py`（mtime 缓存 + 原子写）。对外兼容 `gmp.GPU_MEMORY_GIB`（PEP 562 `__getattr__`，每次取最新 map）。业务校验与引用检查在 `autores/server/gpu_types.py`。
+
+**管理入口**：
+
+- 页面：`GET /gpus`（`frontend/gpus.html`）
+- REST：`GET/POST /api/gpu-types`，`PATCH/DELETE /api/gpu-types/{name}`
+- MCP 固定指令（**不**挂到内置 chat agent）：`gpu_type_list` / `gpu_type_get` / `gpu_type_create` / `gpu_type_update` / `gpu_type_delete`。写工具默认 `confirm=false` 只返回 preview，显式 `confirm=true` 才落盘。
+
+**刻意约束**：
+
+- 删除前查 `test_runs` + `vlm_test_runs` 引用数，`in_use > 0` 拒绝（历史 `gpu_type` 是裸字符串）
+- `update` **不允许改 `name`**（改名等于让历史记录变孤儿；要改名只能新建 + 手工迁移）
+- 路径可用 `AUTORES_GPU_TYPES_PATH` 覆盖（自检用临时文件）
 
 ### 5.5 Scanner：扫描、入库与半成品处理（D19）
 

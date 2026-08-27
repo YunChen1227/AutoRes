@@ -10,6 +10,7 @@
 |------|------|
 | 自动入库 | Scanner 定时扫描 NAS 时间戳目录，解析 `result.csv` + `metadata.json` |
 | 手工上传 | 数据不在 NAS 时，在 `/upload` 提交 CSV + 启动命令 + 模型 `config.json`（可选）+ 元信息；支持 **单机/分布式** 与 **PD 分离** 两种部署模式 |
+| 显卡管理 | `/gpus` 增删改查型号（`tools/gpu_types.json`）；MCP 提供固定指令工具，写操作需 `confirm=true` |
 | 参数推导 | 启动命令 + 模型 `config.json` 一起推出**实际生效**的启动参数（`context_length` / `dtype` / `quantization` / 批量调度默认值…），算法照搬 vllm / sglang 上游，并逐项记录来源 |
 | 自然语言对比 | Chatbot 多轮澄清需求 → 确定性流水线查库对齐 → 下载 Excel |
 | 跨框架参数对齐 | `tools/param_map.py` 维护 vLLM ↔ SGLang 启动参数配对（含量纲/类型差异说明） |
@@ -43,7 +44,8 @@ frontend/upload.html / upload_vlm.html ──────► API 上传 ──�
   - `/` — chatbot（SSE）
   - `/upload` — 文本压测手工上传
   - `/upload/vlm` — VLM 压测手工上传
-  - `/api/chat`、`/api/upload`、`/api/download/{token}`、`/api/health`
+  - `/gpus` — 显卡型号管理（增删改查）
+  - `/api/chat`、`/api/upload`、`/api/gpu-types`、`/api/download/{token}`、`/api/health`
 - **参数工具**（`tools/`）：
   - `param_map.py` — vLLM/SGLang 启动参数配对表
   - `param_map_pd.py` — PD 分离 / kv-transfer / router 参数解析
@@ -343,6 +345,20 @@ CLIP / SigLIP 那类 projector 形状不在 `vision_config` 里，会少算几�
 启动参数提取与 `to_csv.py` 同一套规则；PD 模式下分别填写 prefill / decode / router 启动命令
 （两个角色跑同一个模型，共用同一份 `config.json`）。提交成功后的回显会给每个参数标出来源：
 无标记 = 命令显式写的，`←config` = 从模型 config 推的，`←显存` = 按显卡显存档位推的，`←默认` = 上游静态默认值。
+
+### 显卡型号维护
+
+型号表真相源是 [`tools/gpu_types.json`](tools/gpu_types.json)（单卡显存、每机卡数、厂商、是否发布）。
+上传下拉、`--gpu-type` 校验、按显存推导启动参数、报告「N卡(M机)」都读这份文件。
+
+维护方式（任选其一）：
+
+1. **页面**：打开 `http://<服务器>:8080/gpus`，表格里增删改
+2. **MCP 固定指令**：`gpu_type_list` / `gpu_type_get` / `gpu_type_create` / `gpu_type_update` / `gpu_type_delete`  
+   写操作必须先 `confirm=false` 看 preview，再 `confirm=true` 落盘（内置对话 Agent **不会**拿到这些工具）
+3. **直接改 JSON**：压测机拷走 `tools/` 时记得带上该文件；服务按 mtime 热读，一般不用重启
+
+约束：有测试记录引用的型号不能删；型号名不可改（要改名请新建）。详见 `docs/design.md` §5.4.4 / D25。
 
 #### 样例：`result.csv`（节选表头 + 一行）
 

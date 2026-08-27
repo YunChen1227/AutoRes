@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>显卡管理 - 性能测试报告助手</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --border: #e3e5e9;
+    --text: #1f2328; --muted: #6b7280; --accent: #1f4e78;
+    --err: #b42318; --err-bg: #fdecea; --ok: #0a7c42; --ok-bg: #e9f7ef;
+    --warn: #9a6700; --warn-bg: #fff8c5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    font-weight: 600; display: flex; align-items: center; gap: 10px;
+  }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: #2ea043; }
+  header .spacer { flex: 1; }
+  header a {
+    font-weight: 500; font-size: 14px; color: var(--accent); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 14px;
+  }
+  header a:hover { background: var(--bg); }
+  main { flex: 1; max-width: 1100px; width: 100%; margin: 0 auto; padding: 24px 20px 40px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  .card h3 { margin: 0 0 4px; font-size: 15px; color: var(--accent); }
+  .card .desc { color: var(--muted); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .field.full { grid-column: 1 / -1; }
+  label { font-size: 13px; font-weight: 500; }
+  label .req { color: var(--err); }
+  label .muted { color: var(--muted); font-weight: 400; }
+  input[type="text"], input[type="number"], select, textarea {
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+    font: inherit; background: #fff; width: 100%;
+  }
+  input:disabled { background: #f0f2f5; color: var(--muted); }
+  textarea { min-height: 64px; resize: vertical; }
+  .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button {
+    border: none; border-radius: 8px; padding: 9px 16px; font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #fff; }
+  button.primary:hover { opacity: 0.92; }
+  button.ghost { background: #fff; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: var(--err); color: #fff; }
+  button.danger:disabled, button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.small { padding: 5px 10px; font-size: 13px; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .msg { padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; display: none; }
+  .msg.ok { display: block; background: var(--ok-bg); color: var(--ok); }
+  .msg.err { display: block; background: var(--err-bg); color: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tr:hover td { background: #fafbfc; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+  }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .row-ops { display: flex; gap: 6px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  @media (max-width: 800px) {
+    .grid { grid-template-columns: 1fr; }
+    main { padding: 16px 12px 32px; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot"></span>显卡管理
+    <span class="spacer"></span>
+    <a href="/upload">上传测试结果</a>
+    <a href="/">← 返回对比助手</a>
+  </header>
+
+  <main>
+    <div class="card">
+      <h3>型号列表</h3>
+      <div class="desc">
+        真相源是 <code>tools/gpu_types.json</code>。上传白名单、显存推导、报告「N卡(M机)」都读这份表。
+        <b>有测试记录引用的型号不能删</b>；型号名不可改（要改名请新建）。
+      </div>
+      <div id="list-msg" class="msg"></div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>型号</th>
+              <th>显存 (GiB)</th>
+              <th>卡数/机</th>
+              <th>整机显存</th>
+              <th>厂商</th>
+              <th>状态</th>
+              <th>已用记录</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody">
+            <tr><td colspan="8" style="color:var(--muted)">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 id="form-title">新增型号</h3>
+      <div class="desc" id="form-desc">填写后点「保存」。编辑时型号名只读。</div>
+      <div id="form-msg" class="msg"></div>
+      <form id="form">
+        <div class="grid">
+          <div class="field">
+            <label>型号名 <span class="req">*</span></label>
+            <input type="text" id="name" required maxlength="64"
+                   placeholder="如 MLU580-X6G" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}">
+          </div>
+          <div class="field">
+            <label>单卡显存 GiB <span class="req">*</span></label>
+            <input type="number" id="memory_gib" required min="1" max="2048" step="0.1" placeholder="48">
+          </div>
+          <div class="field">
+            <label>卡数 / 机 <span class="req">*</span></label>
+            <input type="number" id="cards_per_machine" required min="1" max="64" step="1" value="8">
+          </div>
+          <div class="field">
+            <label>厂商 <span class="req">*</span></label>
+            <select id="vendor" required></select>
+          </div>
+          <div class="field">
+            <label>发布状态</label>
+            <select id="released">
+              <option value="true">已发布</option>
+              <option value="false">未发布</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>整机显存 <span class="muted">(自动)</span></label>
+            <input type="text" id="total_preview" disabled placeholder="memory × cards">
+          </div>
+          <div class="field full">
+            <label>备注</label>
+            <textarea id="note" maxlength="200" placeholder="可选，最长 200 字"></textarea>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="submit" class="primary" id="save">保存</button>
+          <button type="button" class="ghost" id="cancel" style="display:none">取消编辑</button>
+        </div>
+      </form>
+      <div class="hint">整机显存 = 单卡显存 × 卡数/机，仅展示不入库。</div>
+    </div>
+  </main>
+
+<script>
+(function () {
+  const tbody = document.getElementById("tbody");
+  const listMsg = document.getElementById("list-msg");
+  const formMsg = document.getElementById("form-msg");
+  const form = document.getElementById("form");
+  const formTitle = document.getElementById("form-title");
+  const formDesc = document.getElementById("form-desc");
+  const nameInput = document.getElementById("name");
+  const memInput = document.getElementById("memory_gib");
+  const cardsInput = document.getElementById("cards_per_machine");
+  const vendorSel = document.getElementById("vendor");
+  const releasedSel = document.getElementById("released");
+  const noteInput = document.getElementById("note");
+  const totalPreview = document.getElementById("total_preview");
+  const cancelBtn = document.getElementById("cancel");
+
+  let editing = null; // 当前编辑的型号名；null = 新增模式
+  let vendors = [];
+
+  function showMsg(el, text, ok) {
+    el.className = "msg " + (ok ? "ok" : "err");
+    el.textContent = text || "";
+    if (!text) el.className = "msg";
+  }
+
+  function updateTotal() {
+    const m = parseFloat(memInput.value);
+    const c = parseInt(cardsInput.value, 10);
+    if (isFinite(m) && isFinite(c) && m > 0 && c > 0) {
+      totalPreview.value = (m * c) + " GiB";
+    } else {
+      totalPreview.value = "";
+    }
+  }
+  memInput.addEventListener("input", updateTotal);
+  cardsInput.addEventListener("input", updateTotal);
+
+  function fillVendors(list) {
+    vendors = list || [];
+    vendorSel.innerHTML = "";
+    vendors.forEach(function (v) {
+      const opt = document.createElement("option");
+      opt.value = v; opt.textContent = v;
+      vendorSel.appendChild(opt);
+    });
+  }
+
+  function resetForm() {
+    editing = null;
+    formTitle.textContent = "新增型号";
+    formDesc.textContent = "填写后点「保存」。编辑时型号名只读。";
+    nameInput.disabled = false;
+    nameInput.value = "";
+    memInput.value = "";
+    cardsInput.value = "8";
+    releasedSel.value = "true";
+    noteInput.value = "";
+    if (vendors.length) vendorSel.value = vendors[0];
+    cancelBtn.style.display = "none";
+    showMsg(formMsg, "", true);
+    updateTotal();
+  }
+
+  function startEdit(item) {
+    editing = item.name;
+    formTitle.textContent = "编辑型号：" + item.name;
+    formDesc.textContent = "型号名不可改。保存后立即写入 gpu_types.json。";
+    nameInput.value = item.name;
+    nameInput.disabled = true;
+    memInput.value = item.memory_gib;
+    cardsInput.value = item.cards_per_machine;
+    vendorSel.value = item.vendor;
+    releasedSel.value = item.released ? "true" : "false";
+    noteInput.value = item.note || "";
+    cancelBtn.style.display = "";
+    showMsg(formMsg, "", true);
+    updateTotal();
+    form.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function renderRows(items) {
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="8" style="color:var(--muted)">暂无型号</td></tr>';
+      return;
+    }
+    tbody.innerHTML = "";
+    items.forEach(function (item) {
+      const tr = document.createElement("tr");
+      const status = item.released
+        ? '<span class="badge ok">已发布</span>'
+        : '<span class="badge warn">未发布</span>';
+      const inUse = item.in_use || 0;
+      const delDisabled = inUse > 0 ? "disabled" : "";
+      const delTitle = inUse > 0
+        ? ("仍有 " + inUse + " 条记录引用，无法删除")
+        : "删除";
+      tr.innerHTML =
+        '<td class="mono">' + escapeHtml(item.name) + '</td>' +
+        '<td>' + item.memory_gib + '</td>' +
+        '<td>' + item.cards_per_machine + '</td>' +
+        '<td>' + item.total_memory_gib + '</td>' +
+        '<td>' + escapeHtml(item.vendor) + '</td>' +
+        '<td>' + status + '</td>' +
+        '<td>' + inUse + '</td>' +
+        '<td class="row-ops">' +
+          '<button type="button" class="ghost small" data-act="edit">编辑</button>' +
+          '<button type="button" class="danger small" data-act="del" ' + delDisabled +
+            ' title="' + escapeHtml(delTitle) + '">删除</button>' +
+        '</td>';
+      tr.querySelector('[data-act="edit"]').addEventListener("click", function () {
+        startEdit(item);
+      });
+      const delBtn = tr.querySelector('[data-act="del"]');
+      if (!delBtn.disabled) {
+        delBtn.addEventListener("click", function () { doDelete(item.name); });
+      }
+      tbody.appendChild(tr);
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function loadList() {
+    showMsg(listMsg, "", true);
+    return fetch("/api/gpu-types")
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          showMsg(listMsg, res.d.error || "加载失败", false);
+          tbody.innerHTML = '<tr><td colspan="8" style="color:var(--err)">加载失败</td></tr>';
+          return;
+        }
+        fillVendors(res.d.vendors || []);
+        renderRows(res.d.gpu_types || []);
+      })
+      .catch(function (e) {
+        showMsg(listMsg, "无法连接服务器：" + e, false);
+        tbody.innerHTML = '<tr><td colspan="8" style="color:var(--err)">无法连接服务器</td></tr>';
+      });
+  }
+
+  function doDelete(name) {
+    if (!confirm("确认删除型号 " + name + "？此操作会立刻写入 gpu_types.json。")) return;
+    fetch("/api/gpu-types/" + encodeURIComponent(name), { method: "DELETE" })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          showMsg(listMsg, res.d.error || "删除失败", false);
+          return;
+        }
+        showMsg(listMsg, "已删除 " + name, true);
+        if (editing === name) resetForm();
+        loadList();
+      })
+      .catch(function (e) { showMsg(listMsg, "删除失败：" + e, false); });
+  }
+
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    const payload = {
+      memory_gib: parseFloat(memInput.value),
+      cards_per_machine: parseInt(cardsInput.value, 10),
+      vendor: vendorSel.value,
+      released: releasedSel.value === "true",
+      note: noteInput.value || "",
+    };
+    let url = "/api/gpu-types";
+    let method = "POST";
+    if (editing) {
+      url = "/api/gpu-types/" + encodeURIComponent(editing);
+      method = "PATCH";
+    } else {
+      payload.name = nameInput.value.trim();
+    }
+    fetch(url, {
+      method: method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          showMsg(formMsg, res.d.error || "保存失败", false);
+          return;
+        }
+        showMsg(formMsg, (editing ? "已更新 " : "已新增 ") + res.d.name, true);
+        resetForm();
+        loadList();
+      })
+      .catch(function (e) { showMsg(formMsg, "保存失败：" + e, false); });
+  });
+
+  cancelBtn.addEventListener("click", resetForm);
+
+  loadList().then(resetForm);
+})();
+</script>
+</body>
+</html>
