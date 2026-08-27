@@ -54,10 +54,15 @@ pip install -r requirements.txt
 | `generate_comparison_report` | 生成 **Excel 对比报告**，返回下载链接与摘要 | `compare_on`，`filters?`，`compare_values?`，`exclude?`，`metrics?`，`metric_filters?`，`normalize_gpu_scale?` |
 | `gpu_type_list` | 列出全部显卡型号（含 `in_use`） | 无 |
 | `gpu_type_get` | 按型号名取单条明细 | `name` |
-| `gpu_type_create` | **新增**型号（固定指令；需 `confirm=true` 才落盘） | `name`，`memory_gib`，`cards_per_machine?`，`vendor?`，`released?`，`note?`，`confirm?` |
+| `gpu_type_create` | **新增**型号（固定指令；需 `confirm=true` 才落盘） | `name`，`memory_gib`，`vendor`（必填，可自定义 slug），`cards_per_machine?`，`released?`，`note?`，`confirm?` |
 | `gpu_type_update` | **修改**型号（不可改名；需 `confirm=true`） | `name`，可改字段…，`confirm?` |
 | `gpu_type_delete` | **删除**型号（有引用则拒绝；需 `confirm=true`） | `name`，`confirm?` |
 | `health` | 健康检查（数据库连通性） | 无 |
+
+> **删除测试记录不在 MCP 范围**：错误上传的 CSV / 启动命令，只能在 Web 页面
+> （`/runs` 或上传成功面板）删除；MCP **不提供且不会提供** `delete_run` 一类工具
+> （会动磁盘原始产物，不可由 LLM 自主调用）。这与上面的 `gpu_type_delete` 不同——
+> 后者只改 `gpu_types.json` 配置条目，且有 `confirm` 两段式。
 
 > **显卡写操作两段式**：`gpu_type_create` / `update` / `delete` 默认 `confirm=false`，只返回
 > `{ok:false, requires_confirm:true, preview:{before,after}}`，**不改文件**；确认后再用相同参数

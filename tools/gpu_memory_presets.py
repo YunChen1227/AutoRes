@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 from typing import Any
@@ -71,10 +72,14 @@ _CACHE: dict[str, Any] | None = None
 _CACHE_MTIME: float | None = None
 _CACHE_PATH: str | None = None
 
-# 厂商枚举（页面下拉 / MCP / 校验共用）
-VENDOR_CHOICES: tuple[str, ...] = (
-    "nvidia", "huawei", "metax", "cambricon", "t-head", "other",
+# 常见厂商快捷选项（页面下拉）；也可选「自定义」手填其它标识
+VENDOR_PRESETS: tuple[str, ...] = (
+    "nvidia", "huawei", "metax", "cambricon", "t-head",
 )
+# 兼容旧名
+VENDOR_CHOICES = VENDOR_PRESETS
+
+_VENDOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 
 _REQUIRED_FIELDS = ("name", "memory_gib", "cards_per_machine", "vendor",
                     "released", "note")
@@ -86,13 +91,31 @@ def registry_path() -> str:
     return override or _DEFAULT_REGISTRY
 
 
+def normalize_vendor(value: Any) -> str:
+    """
+    归一化厂商标识：去空白、转小写。
+    允许预设列表之外的自定义值（格式同型号名 slug）。
+    """
+    if value is None or not str(value).strip():
+        raise ValueError("vendor 不能为空")
+    v = str(value).strip().lower()
+    if not _VENDOR_RE.match(v):
+        raise ValueError(
+            f"vendor 非法（需匹配 {_VENDOR_RE.pattern}），收到: {value!r}")
+    return v
+
+
 def _normalize_entry(raw: dict) -> dict:
     """补齐缺省字段，返回规范化条目（不改入参）。"""
+    vendor_raw = raw.get("vendor")
+    vendor = ""
+    if vendor_raw is not None and str(vendor_raw).strip():
+        vendor = str(vendor_raw).strip().lower()
     return {
         "name": str(raw["name"]),
         "memory_gib": float(raw["memory_gib"]),
         "cards_per_machine": int(raw.get("cards_per_machine", 8)),
-        "vendor": str(raw.get("vendor") or "other"),
+        "vendor": vendor,
         "released": bool(raw.get("released", True)),
         "note": str(raw.get("note") or ""),
     }

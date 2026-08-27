@@ -82,6 +82,7 @@
   <header>
     <span class="dot"></span>显卡管理
     <span class="spacer"></span>
+    <a href="/runs">记录管理</a>
     <a href="/upload">上传测试结果</a>
     <a href="/">← 返回对比助手</a>
   </header>
@@ -134,9 +135,16 @@
             <label>卡数 / 机 <span class="req">*</span></label>
             <input type="number" id="cards_per_machine" required min="1" max="64" step="1" value="8">
           </div>
-          <div class="field">
+          <div class="field full">
             <label>厂商 <span class="req">*</span></label>
-            <select id="vendor" required></select>
+            <select id="vendor"></select>
+            <input type="text" id="vendor_custom" maxlength="32"
+                   placeholder="自定义厂商标识，如 my-chip（小写英文/数字/._-）"
+                   style="display:none; margin-top:8px;"
+                   pattern="[a-z0-9][a-z0-9._-]{0,31}">
+            <div class="hint" style="margin-top:6px; text-align:left;">
+              常见厂商可直接选；选「自定义…」后手填标识，会原样写入 gpu_types.json。
+            </div>
           </div>
           <div class="field">
             <label>发布状态</label>
@@ -175,13 +183,18 @@
   const memInput = document.getElementById("memory_gib");
   const cardsInput = document.getElementById("cards_per_machine");
   const vendorSel = document.getElementById("vendor");
+  const vendorCustom = document.getElementById("vendor_custom");
   const releasedSel = document.getElementById("released");
   const noteInput = document.getElementById("note");
   const totalPreview = document.getElementById("total_preview");
   const cancelBtn = document.getElementById("cancel");
 
+  const VENDOR_CUSTOM = "__custom__";
+  const VENDOR_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
+
   let editing = null; // 当前编辑的型号名；null = 新增模式
-  let vendors = [];
+  let vendorPresets = [];
+  let usedVendors = [];
 
   function showMsg(el, text, ok) {
     el.className = "msg " + (ok ? "ok" : "err");
@@ -201,14 +214,72 @@
   memInput.addEventListener("input", updateTotal);
   cardsInput.addEventListener("input", updateTotal);
 
-  function fillVendors(list) {
-    vendors = list || [];
+  function syncVendorCustomVisibility() {
+    const custom = vendorSel.value === VENDOR_CUSTOM;
+    vendorCustom.style.display = custom ? "block" : "none";
+    vendorCustom.required = custom;
+  }
+
+  vendorSel.addEventListener("change", syncVendorCustomVisibility);
+
+  function fillVendors(presets, used) {
+    vendorPresets = presets || [];
+    usedVendors = used || [];
     vendorSel.innerHTML = "";
-    vendors.forEach(function (v) {
+    vendorPresets.forEach(function (v) {
       const opt = document.createElement("option");
       opt.value = v; opt.textContent = v;
       vendorSel.appendChild(opt);
     });
+    const customOpt = document.createElement("option");
+    customOpt.value = VENDOR_CUSTOM;
+    customOpt.textContent = "自定义…";
+    vendorSel.appendChild(customOpt);
+
+    vendorCustom.innerHTML = "";
+    const dlId = "vendor-used-list";
+    let dl = document.getElementById(dlId);
+    if (!dl) {
+      dl = document.createElement("datalist");
+      dl.id = dlId;
+      vendorCustom.setAttribute("list", dlId);
+      vendorCustom.parentNode.appendChild(dl);
+    }
+    dl.innerHTML = "";
+    usedVendors.forEach(function (v) {
+      if (vendorPresets.indexOf(v) >= 0) return;
+      const opt = document.createElement("option");
+      opt.value = v;
+      dl.appendChild(opt);
+    });
+  }
+
+  function setVendorValue(v) {
+    const val = String(v || "").trim().toLowerCase();
+    if (vendorPresets.indexOf(val) >= 0) {
+      vendorSel.value = val;
+      vendorCustom.value = "";
+    } else {
+      vendorSel.value = VENDOR_CUSTOM;
+      vendorCustom.value = val;
+    }
+    syncVendorCustomVisibility();
+  }
+
+  function getVendorValue() {
+    if (vendorSel.value === VENDOR_CUSTOM) {
+      return vendorCustom.value.trim().toLowerCase();
+    }
+    return vendorSel.value;
+  }
+
+  function validateVendor() {
+    const v = getVendorValue();
+    if (!v) return "请填写或选择厂商";
+    if (!VENDOR_RE.test(v)) {
+      return "厂商标识非法：须为小写英文/数字/._-，且以字母或数字开头";
+    }
+    return null;
   }
 
   function resetForm() {
@@ -221,7 +292,8 @@
     cardsInput.value = "8";
     releasedSel.value = "true";
     noteInput.value = "";
-    if (vendors.length) vendorSel.value = vendors[0];
+    if (vendorPresets.length) setVendorValue(vendorPresets[0]);
+    else setVendorValue("");
     cancelBtn.style.display = "none";
     showMsg(formMsg, "", true);
     updateTotal();
@@ -235,7 +307,7 @@
     nameInput.disabled = true;
     memInput.value = item.memory_gib;
     cardsInput.value = item.cards_per_machine;
-    vendorSel.value = item.vendor;
+    setVendorValue(item.vendor);
     releasedSel.value = item.released ? "true" : "false";
     noteInput.value = item.note || "";
     cancelBtn.style.display = "";
@@ -300,7 +372,8 @@
           tbody.innerHTML = '<tr><td colspan="8" style="color:var(--err)">加载失败</td></tr>';
           return;
         }
-        fillVendors(res.d.vendors || []);
+        fillVendors(res.d.vendor_presets || res.d.vendors || [],
+                    res.d.used_vendors || []);
         renderRows(res.d.gpu_types || []);
       })
       .catch(function (e) {
@@ -327,10 +400,15 @@
 
   form.addEventListener("submit", function (ev) {
     ev.preventDefault();
+    const verr = validateVendor();
+    if (verr) {
+      showMsg(formMsg, verr, false);
+      return;
+    }
     const payload = {
       memory_gib: parseFloat(memInput.value),
       cards_per_machine: parseInt(cardsInput.value, 10),
-      vendor: vendorSel.value,
+      vendor: getVendorValue(),
       released: releasedSel.value === "true",
       note: noteInput.value || "",
     };

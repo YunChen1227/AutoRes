@@ -50,8 +50,24 @@ def _load_gmp():
     return _gmp
 
 
+def vendor_presets() -> list[str]:
+    """常见厂商快捷选项（页面下拉预设）。"""
+    return list(_load_gmp().VENDOR_PRESETS)
+
+
 def vendor_choices() -> list[str]:
-    return list(_load_gmp().VENDOR_CHOICES)
+    """兼容旧 API 名；返回 vendor_presets。"""
+    return vendor_presets()
+
+
+def used_vendors() -> list[str]:
+    """注册表里已出现过的厂商标识（去重排序），供自定义输入参考。"""
+    seen: set[str] = set()
+    for entry in _load_gmp().all_types():
+        v = (entry.get("vendor") or "").strip().lower()
+        if v:
+            seen.add(v)
+    return sorted(seen)
 
 
 def usage_count(db, name: str) -> int:
@@ -109,10 +125,10 @@ def _validate_fields(
     note: Any = None,
     require_name: bool = False,
     require_memory: bool = False,
+    require_vendor: bool = False,
 ) -> dict:
     """校验并归一化字段；只返回调用方显式传入的键。"""
     out: dict = {}
-    vendors = set(vendor_choices())
 
     if name is not None or require_name:
         if name is None or not str(name).strip():
@@ -148,12 +164,13 @@ def _validate_fields(
                 f"cards_per_machine 须在 [{_CARDS_MIN}, {_CARDS_MAX}]，收到: {cards}")
         out["cards_per_machine"] = cards
 
-    if vendor is not None:
-        v = str(vendor).strip().lower()
-        if v not in vendors:
-            raise GpuTypeError(
-                f"vendor 必须是 {sorted(vendors)} 之一，收到: {vendor!r}")
-        out["vendor"] = v
+    if vendor is not None or require_vendor:
+        if vendor is None or not str(vendor).strip():
+            raise GpuTypeError("缺少必填字段: vendor")
+        try:
+            out["vendor"] = _load_gmp().normalize_vendor(vendor)
+        except ValueError as e:
+            raise GpuTypeError(str(e)) from e
 
     if released is not None:
         out["released"] = _as_bool(released, "released")
@@ -173,7 +190,7 @@ def create_type(
     name: str,
     memory_gib: float,
     cards_per_machine: int = 8,
-    vendor: str = "other",
+    vendor: str = "",
     released: bool = True,
     note: str = "",
 ) -> dict:
@@ -187,6 +204,7 @@ def create_type(
         note=note,
         require_name=True,
         require_memory=True,
+        require_vendor=True,
     )
     gmp = _load_gmp()
     if gmp.get_type(fields["name"]) is not None:
@@ -195,7 +213,7 @@ def create_type(
         "name": fields["name"],
         "memory_gib": fields["memory_gib"],
         "cards_per_machine": fields.get("cards_per_machine", 8),
-        "vendor": fields.get("vendor", "other"),
+        "vendor": fields["vendor"],
         "released": fields.get("released", True),
         "note": fields.get("note", ""),
     }
@@ -266,11 +284,12 @@ def preview_create(**kwargs) -> dict:
         name=kwargs.get("name"),
         memory_gib=kwargs.get("memory_gib"),
         cards_per_machine=kwargs.get("cards_per_machine", 8),
-        vendor=kwargs.get("vendor", "other"),
+        vendor=kwargs.get("vendor"),
         released=kwargs.get("released", True),
         note=kwargs.get("note", ""),
         require_name=True,
         require_memory=True,
+        require_vendor=True,
     )
     gmp = _load_gmp()
     if gmp.get_type(fields["name"]) is not None:
@@ -279,7 +298,7 @@ def preview_create(**kwargs) -> dict:
         "name": fields["name"],
         "memory_gib": fields["memory_gib"],
         "cards_per_machine": fields.get("cards_per_machine", 8),
-        "vendor": fields.get("vendor", "other"),
+        "vendor": fields["vendor"],
         "released": fields.get("released", True),
         "note": fields.get("note", ""),
     }

@@ -10,6 +10,7 @@
 |------|------|
 | 自动入库 | Scanner 定时扫描 NAS 时间戳目录，解析 `result.csv` + `metadata.json` |
 | 手工上传 | 数据不在 NAS 时，在 `/upload` 提交 CSV + 启动命令 + 模型 `config.json`（可选）+ 元信息；支持 **单机/分布式** 与 **PD 分离** 两种部署模式 |
+| 记录管理 | `/runs` 列出并删除**页面上传**的错误记录（目录 + 库 + 台账）；MCP **不提供**删除 |
 | 显卡管理 | `/gpus` 增删改查型号（`tools/gpu_types.json`）；MCP 提供固定指令工具，写操作需 `confirm=true` |
 | 参数推导 | 启动命令 + 模型 `config.json` 一起推出**实际生效**的启动参数（`context_length` / `dtype` / `quantization` / 批量调度默认值…），算法照搬 vllm / sglang 上游，并逐项记录来源 |
 | 自然语言对比 | Chatbot 多轮澄清需求 → 确定性流水线查库对齐 → 下载 Excel |
@@ -44,8 +45,9 @@ frontend/upload.html / upload_vlm.html ──────► API 上传 ──�
   - `/` — chatbot（SSE）
   - `/upload` — 文本压测手工上传
   - `/upload/vlm` — VLM 压测手工上传
+  - `/runs` — 测试记录管理（仅可删页面上传的记录）
   - `/gpus` — 显卡型号管理（增删改查）
-  - `/api/chat`、`/api/upload`、`/api/gpu-types`、`/api/download/{token}`、`/api/health`
+  - `/api/chat`、`/api/upload`、`/api/runs`、`/api/gpu-types`、`/api/download/{token}`、`/api/health`
 - **参数工具**（`tools/`）：
   - `param_map.py` — vLLM/SGLang 启动参数配对表
   - `param_map_pd.py` — PD 分离 / kv-transfer / router 参数解析
@@ -359,6 +361,19 @@ CLIP / SigLIP 那类 projector 形状不在 `vision_config` 里，会少算几�
 3. **直接改 JSON**：压测机拷走 `tools/` 时记得带上该文件；服务按 mtime 热读，一般不用重启
 
 约束：有测试记录引用的型号不能删；型号名不可改（要改名请新建）。详见 `docs/design.md` §5.4.4 / D25。
+
+### 删除错误上传（D26）
+
+上传填错 CSV / 启动命令 / 压测命令时，可在以下入口删除：
+
+1. **上传成功面板**：入库回显里的「删除这条记录」（两段式确认）
+2. **记录管理页**：`http://<服务器>:8080/runs`（按类型筛选、关键字过滤）
+
+删除会同时清除落盘目录、数据库行与 `ingest_log` 台账（顺序：先目录后库，避免 Scanner 复活）。
+
+**范围**：仅 `manual_upload`（页面上传）的记录可删；Scanner 从 NAS 扫入的原始产物不可通过本接口删除。  
+**MCP / 内置 Agent 不提供删除能力**（不是遗漏，是刻意）。  
+已生成的 Excel 报告快照不会回溯修改。详见 `docs/design.md` §5.4.5 / D26。
 
 #### 样例：`result.csv`（节选表头 + 一行）
 

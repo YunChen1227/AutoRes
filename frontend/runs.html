@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>记录管理 - 性能测试报告助手</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --border: #e3e5e9;
+    --text: #1f2328; --muted: #6b7280; --accent: #1f4e78;
+    --err: #b42318; --err-bg: #fdecea; --ok: #0a7c42; --ok-bg: #e9f7ef;
+    --warn: #9a6700; --warn-bg: #fff8c5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    font-weight: 600; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: #2ea043; }
+  header .spacer { flex: 1; }
+  header a {
+    font-weight: 500; font-size: 14px; color: var(--accent); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 14px;
+  }
+  header a:hover { background: var(--bg); }
+  main { flex: 1; max-width: 1280px; width: 100%; margin: 0 auto; padding: 24px 20px 40px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  .card h3 { margin: 0 0 4px; font-size: 15px; color: var(--accent); }
+  .card .desc { color: var(--muted); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+  .filters {
+    display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px;
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  label { font-size: 13px; font-weight: 500; color: var(--muted); }
+  input[type="text"], input[type="number"], select {
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+    font: inherit; background: #fff; min-width: 140px;
+  }
+  button {
+    border: none; border-radius: 8px; padding: 9px 16px; font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #fff; }
+  button.primary:hover { opacity: 0.92; }
+  button.ghost { background: #fff; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: var(--err); color: #fff; }
+  button.danger:disabled, button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.small { padding: 5px 10px; font-size: 13px; }
+  .msg { padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; display: none; }
+  .msg.ok { display: block; background: var(--ok-bg); color: var(--ok); }
+  .msg.err { display: block; background: var(--err-bg); color: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; white-space: nowrap; }
+  tr:hover td { background: #fafbfc; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+  }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.muted { background: #eef0f3; color: var(--muted); }
+  .row-ops { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-width: 160px; }
+  .preview-hint {
+    margin-top: 6px; font-size: 12px; color: var(--err); line-height: 1.5;
+    background: var(--err-bg); border-radius: 6px; padding: 6px 8px;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  @media (max-width: 900px) {
+    main { padding: 16px 12px 32px; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot"></span>记录管理
+    <span class="spacer"></span>
+    <a href="/gpus">显卡管理</a>
+    <a href="/upload">上传测试结果</a>
+    <a href="/">← 返回对比助手</a>
+  </header>
+
+  <main>
+    <div class="card">
+      <h3>测试记录</h3>
+      <div class="desc">
+        仅<strong>页面上传</strong>（manual_upload）的记录可删：会同时清除落盘目录、数据库行与 ingest_log 台账。
+        Scanner 从 NAS 扫入的原始产物不可通过此页删除。已生成的报告快照不会回溯修改。
+      </div>
+      <div class="filters">
+        <div class="field">
+          <label>类型</label>
+          <select id="kind">
+            <option value="text">文本 (text)</option>
+            <option value="vlm">VLM</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>模型关键字</label>
+          <input type="text" id="q" placeholder="如 Qwen" maxlength="80">
+        </div>
+        <div class="field">
+          <label>条数上限</label>
+          <input type="number" id="limit" value="200" min="1" max="2000" step="1">
+        </div>
+        <button type="button" class="primary" id="reload">刷新</button>
+      </div>
+      <div id="list-msg" class="msg"></div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>记录 ID</th>
+              <th>时间</th>
+              <th>模型</th>
+              <th>框架</th>
+              <th>显卡</th>
+              <th>部署</th>
+              <th>指标行</th>
+              <th>来源</th>
+              <th>落盘</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody">
+            <tr><td colspan="10" class="muted">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+<script>
+(function () {
+  const tbody = document.getElementById("tbody");
+  const listMsg = document.getElementById("list-msg");
+  const kindSel = document.getElementById("kind");
+  const qInput = document.getElementById("q");
+  const limitInput = document.getElementById("limit");
+  const reloadBtn = document.getElementById("reload");
+
+  let pendingConfirm = null; // run_id currently in confirm stage
+
+  function showMsg(el, text, ok) {
+    el.className = "msg " + (ok ? "ok" : "err");
+    el.textContent = text || "";
+    if (!text) el.className = "msg";
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function sourceBadge(item) {
+    if (item.ingest_source === "manual_upload") {
+      return '<span class="badge ok">页面上传</span>';
+    }
+    if (item.ingest_source) {
+      return '<span class="badge warn">' + escapeHtml(item.ingest_source) + "</span>";
+    }
+    return '<span class="badge muted">Scanner</span>';
+  }
+
+  function diskBadge(item) {
+    return item.disk_exists
+      ? '<span class="badge ok">在</span>'
+      : '<span class="badge muted">无</span>';
+  }
+
+  function deployLabel(mode) {
+    return mode === "pd_disagg" ? "PD 分离" : "单机/分布式";
+  }
+
+  function renderOps(tr, item) {
+    const ops = tr.querySelector(".row-ops");
+    ops.innerHTML = "";
+    if (!item.deletable) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "danger small";
+      btn.disabled = true;
+      btn.title = item.undeletable_reason || "不可删除";
+      btn.textContent = "不可删";
+      ops.appendChild(btn);
+      return;
+    }
+
+    if (pendingConfirm === item.run_id) {
+      const hint = document.createElement("div");
+      hint.className = "preview-hint";
+      hint.id = "preview-" + item.run_id;
+      hint.textContent = "加载预览…";
+      ops.parentNode.appendChild(hint);
+
+      const confirmBtn = document.createElement("button");
+      confirmBtn.type = "button";
+      confirmBtn.className = "danger small";
+      confirmBtn.textContent = "确认删除";
+      confirmBtn.addEventListener("click", function () {
+        doDelete(item);
+      });
+
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "ghost small";
+      cancelBtn.textContent = "取消";
+      cancelBtn.addEventListener("click", function () {
+        pendingConfirm = null;
+        loadList();
+      });
+
+      ops.appendChild(confirmBtn);
+      ops.appendChild(cancelBtn);
+
+      const kind = kindSel.value;
+      const url = "/api/runs/" + encodeURIComponent(item.run_id) +
+        "/delete-preview?kind=" + encodeURIComponent(kind);
+      fetch(url)
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          const el = document.getElementById("preview-" + item.run_id);
+          if (!el) return;
+          if (!res.ok) {
+            el.textContent = res.d.error || "预览失败";
+            return;
+          }
+          el.innerHTML =
+            "将删除目录 <code class=\"mono\">" + escapeHtml(res.d.disk_path) + "</code>" +
+            "（" + (res.d.disk_exists ? "存在" : "已不存在") + "），" +
+            "指标 " + escapeHtml(String(res.d.num_metrics)) + " 行，表 " +
+            escapeHtml(res.d.table) + "。此操作不可逆。";
+        })
+        .catch(function (e) {
+          const el = document.getElementById("preview-" + item.run_id);
+          if (el) el.textContent = "预览失败：" + e;
+        });
+      return;
+    }
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "danger small";
+    delBtn.textContent = "删除";
+    delBtn.addEventListener("click", function () {
+      pendingConfirm = item.run_id;
+      loadList();
+    });
+    ops.appendChild(delBtn);
+  }
+
+  function renderRows(items) {
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="muted">暂无记录</td></tr>';
+      return;
+    }
+    tbody.innerHTML = "";
+    items.forEach(function (item) {
+      const tr = document.createElement("tr");
+      const fw = escapeHtml(item.framework || "") +
+        (item.framework_version ? " " + escapeHtml(item.framework_version) : "");
+      tr.innerHTML =
+        '<td class="mono">' + escapeHtml(item.run_id) + "</td>" +
+        '<td class="mono">' + escapeHtml(item.run_timestamp || "") + "</td>" +
+        "<td>" + escapeHtml(item.model || "") +
+          (item.model_version ? '<div class="muted mono">' + escapeHtml(item.model_version) + "</div>" : "") +
+        "</td>" +
+        "<td>" + fw + "</td>" +
+        "<td>" + escapeHtml(item.gpu_type || "") + "</td>" +
+        "<td>" + escapeHtml(deployLabel(item.deployment_mode)) + "</td>" +
+        "<td>" + escapeHtml(String(item.num_metrics || 0)) + "</td>" +
+        "<td>" + sourceBadge(item) + "</td>" +
+        "<td>" + diskBadge(item) +
+          '<div class="muted mono">' + escapeHtml(item.source_dir || "") + "</div></td>" +
+        '<td class="row-ops"></td>';
+      renderOps(tr, item);
+      tbody.appendChild(tr);
+    });
+  }
+
+  function loadList() {
+    showMsg(listMsg, "", true);
+    const kind = kindSel.value;
+    const q = qInput.value.trim();
+    const limit = limitInput.value || "200";
+    let url = "/api/runs?kind=" + encodeURIComponent(kind) +
+      "&limit=" + encodeURIComponent(limit);
+    if (q) url += "&q=" + encodeURIComponent(q);
+    return fetch(url)
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          showMsg(listMsg, res.d.error || "加载失败", false);
+          tbody.innerHTML = '<tr><td colspan="10" style="color:var(--err)">加载失败</td></tr>';
+          return;
+        }
+        renderRows(res.d.runs || []);
+      })
+      .catch(function (e) {
+        showMsg(listMsg, "无法连接服务器：" + e, false);
+        tbody.innerHTML = '<tr><td colspan="10" style="color:var(--err)">无法连接服务器</td></tr>';
+      });
+  }
+
+  function doDelete(item) {
+    const kind = kindSel.value;
+    const url = "/api/runs/" + encodeURIComponent(item.run_id) +
+      "?kind=" + encodeURIComponent(kind);
+    fetch(url, { method: "DELETE" })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          showMsg(listMsg, res.d.error || "删除失败", false);
+          pendingConfirm = null;
+          loadList();
+          return;
+        }
+        showMsg(listMsg,
+          "已删除 " + item.run_id +
+          "（目录" + (res.d.removed_dir ? "已清" : "原本不在") +
+          "，表行 " + res.d.removed_row + "，台账 " + res.d.removed_log + "）",
+          true);
+        pendingConfirm = null;
+        loadList();
+      })
+      .catch(function (e) {
+        showMsg(listMsg, "删除失败：" + e, false);
+      });
+  }
+
+  reloadBtn.addEventListener("click", function () {
+    pendingConfirm = null;
+    loadList();
+  });
+  kindSel.addEventListener("change", function () {
+    pendingConfirm = null;
+    loadList();
+  });
+  qInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      pendingConfirm = null;
+      loadList();
+    }
+  });
+
+  loadList();
+})();
+</script>
+</body>
+</html>

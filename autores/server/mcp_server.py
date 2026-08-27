@@ -299,12 +299,14 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
 
     @mcp.tool()
     def gpu_type_list() -> dict:
-        """列出全部显卡型号（含 in_use 引用数与 vendors 枚举）。只读。"""
+        """列出全部显卡型号（含 in_use 引用数与 vendor 预设）。只读。"""
         try:
             return {
                 "ok": True,
                 "gpu_types": gpu_types_mod.list_types(db),
-                "vendors": gpu_types_mod.vendor_choices(),
+                "vendors": gpu_types_mod.vendor_presets(),
+                "vendor_presets": gpu_types_mod.vendor_presets(),
+                "used_vendors": gpu_types_mod.used_vendors(),
             }
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)}
@@ -324,8 +326,8 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
     def gpu_type_create(
         name: str,
         memory_gib: float,
+        vendor: str,
         cards_per_machine: int = 8,
-        vendor: str = "other",
         released: bool = True,
         note: str = "",
         confirm: bool = False,

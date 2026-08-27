@@ -10,10 +10,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from autores.common.logging import get_logger
 from autores.db.client import DuplicateRunError
 from autores.server import gpu_types as gpu_types_mod
+from autores.server import runs as runs_mod
 from autores.server.agent.loop import Agent
 from autores.server.gpu_types import GpuTypeError
 from autores.server.ingest import launch_params, upload as upload_mod
 from autores.server.ingest.upload import UploadError
+from autores.server.runs import RunDeleteError
 
 log = get_logger("api")
 router = APIRouter()
@@ -24,6 +26,7 @@ _FRONTEND = os.path.join(_FRONTEND_DIR, "index.html")
 _UPLOAD_PAGE = os.path.join(_FRONTEND_DIR, "upload.html")
 _UPLOAD_VLM_PAGE = os.path.join(_FRONTEND_DIR, "upload_vlm.html")
 _GPUS_PAGE = os.path.join(_FRONTEND_DIR, "gpus.html")
+_RUNS_PAGE = os.path.join(_FRONTEND_DIR, "runs.html")
 
 # 上传页 HTML 常改；禁止浏览器/CDN 缓存旧版（/upload 比 /upload/vlm 更早访问，容易 stale）。
 _HTML_NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
@@ -112,6 +115,83 @@ def gpus_page():
     return _html_page(_GPUS_PAGE)
 
 
+@router.get("/runs")
+def runs_page():
+    """测试记录管理子页面（仅可删页面上传的记录）。"""
+    return _html_page(_RUNS_PAGE)
+
+
+@router.get("/api/runs")
+def runs_list(request: Request, kind: str = "text", limit: int = 200, q: str = ""):
+    """列出测试记录摘要（供 /runs 管理页）。"""
+    try:
+        st = request.app.state
+        items = runs_mod.list_briefs(
+            st.db,
+            kind=kind,
+            limit=limit,
+            keyword=q or None,
+            benchmark_root=st.config.scanner.benchmark_root,
+        )
+        return JSONResponse({
+            "runs": items,
+            "kinds": ["text", "vlm"],
+        })
+    except (ValueError, RunDeleteError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        log.error("列出测试记录失败", extra={"fields": {"error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
+
+
+@router.get("/api/runs/{run_id}/delete-preview")
+def runs_delete_preview(run_id: str, request: Request, kind: str | None = None):
+    """删除预览：跑完护栏但不删，供前端二次确认。"""
+    st = request.app.state
+    try:
+        result = runs_mod.preview_delete(
+            st.db,
+            run_id,
+            kind=kind,
+            benchmark_root=st.config.scanner.benchmark_root,
+            dir_pattern=st.config.scanner.dir_pattern,
+        )
+        return JSONResponse(result)
+    except RunDeleteError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        log.error("删除预览失败", extra={"fields": {"run_id": run_id, "error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
+
+
+@router.delete("/api/runs/{run_id}")
+def runs_delete(run_id: str, request: Request, kind: str | None = None):
+    """删除一条页面上传的测试记录（目录 + 表行 + ingest_log）。MCP 不提供。"""
+    st = request.app.state
+    try:
+        result = runs_mod.delete_run(
+            st.db,
+            run_id,
+            kind=kind,
+            benchmark_root=st.config.scanner.benchmark_root,
+            dir_pattern=st.config.scanner.dir_pattern,
+        )
+        log.info("删除测试记录", extra={"fields": {
+            "run_id": result.get("run_id"),
+            "source_dir": result.get("source_dir"),
+            "kind": result.get("benchmark_kind"),
+            "removed_dir": result.get("removed_dir"),
+            "removed_row": result.get("removed_row"),
+            "removed_log": result.get("removed_log"),
+        }})
+        return JSONResponse(result)
+    except RunDeleteError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        log.error("删除测试记录失败", extra={"fields": {"run_id": run_id, "error": str(e)}})
+        return JSONResponse({"error": "服务器内部错误，请稍后重试。"}, status_code=500)
+
+
 @router.get("/api/gpu-types")
 def gpu_types_list(request: Request):
     """列出全部显卡型号（含库内引用数 in_use）。"""
@@ -119,7 +199,9 @@ def gpu_types_list(request: Request):
         items = gpu_types_mod.list_types(request.app.state.db)
         return JSONResponse({
             "gpu_types": items,
-            "vendors": gpu_types_mod.vendor_choices(),
+            "vendors": gpu_types_mod.vendor_presets(),
+            "vendor_presets": gpu_types_mod.vendor_presets(),
+            "used_vendors": gpu_types_mod.used_vendors(),
         })
     except Exception as e:  # noqa: BLE001
         log.error("列出显卡型号失败", extra={"fields": {"error": str(e)}})
@@ -139,7 +221,7 @@ async def gpu_types_create(request: Request):
             name=body.get("name"),
             memory_gib=body.get("memory_gib"),
             cards_per_machine=body.get("cards_per_machine", 8),
-            vendor=body.get("vendor", "other"),
+            vendor=body.get("vendor"),
             released=body.get("released", True),
             note=body.get("note", ""),
         )

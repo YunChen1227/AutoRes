@@ -8,6 +8,7 @@ SQLite 访问层。Scanner 与 API 共用同一 Database 类。
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -130,12 +131,77 @@ class Database:
             out.append(item)
         return out
 
+    def list_run_briefs(self, kind: str | None = None, limit: int = 200,
+                        keyword: str | None = None) -> list[dict]:
+        """
+        轻量列表：只取管理页需要的列，不做完整 row_to_doc。
+        keyword 非空时按 model LIKE %kw% 过滤（大小写不敏感）。
+        """
+        bk = schema.resolve_kind(kind).name
+        table = schema.table_for(bk)
+        cols = (
+            "run_id, run_timestamp, model, model_version, framework, "
+            "framework_version, gpu_type, deployment_mode, gpu_count, extra, metrics"
+        )
+        sql = f"SELECT {cols} FROM {table}"
+        params: list = []
+        if keyword and keyword.strip():
+            sql += " WHERE model LIKE ? COLLATE NOCASE"
+            params.append(f"%{keyword.strip()}%")
+        sql += " ORDER BY run_timestamp DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 2000)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            extra_raw = r["extra"]
+            try:
+                extra = json.loads(extra_raw) if extra_raw else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                extra = {}
+            metrics_raw = r["metrics"]
+            try:
+                metrics = json.loads(metrics_raw) if metrics_raw else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metrics = []
+            out.append({
+                "run_id": r["run_id"],
+                "run_timestamp": r["run_timestamp"],
+                "model": r["model"],
+                "model_version": r["model_version"],
+                "framework": r["framework"],
+                "framework_version": r["framework_version"],
+                "gpu_type": r["gpu_type"],
+                "deployment_mode": r["deployment_mode"],
+                "gpu_count": r["gpu_count"],
+                "extra": extra if isinstance(extra, dict) else {},
+                "num_metrics": len(metrics) if isinstance(metrics, list) else 0,
+                "benchmark_kind": bk,
+            })
+        return out
+
     # ── ingest_log ──
 
     def ingested_dirs(self) -> set[str]:
         with self._lock:
             rows = self._conn.execute("SELECT source_dir FROM ingest_log").fetchall()
         return {r["source_dir"] for r in rows}
+
+    def ingest_log_entry(self, run_id: str) -> dict | None:
+        """按 run_id 反查 ingest_log 行；无则返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT source_dir, run_id, ingested_at FROM ingest_log "
+                "WHERE run_id = ?",
+                [run_id],
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "source_dir": row["source_dir"],
+            "run_id": row["run_id"],
+            "ingested_at": row["ingested_at"],
+        }
 
     def mark_ingested(self, source_dir: str, run_id: str) -> None:
         with self._lock:
@@ -145,6 +211,23 @@ class Database:
                 [source_dir, run_id, datetime.now(timezone.utc).isoformat()],
             )
             self._conn.commit()
+
+    def delete_run_and_log(self, run_id: str, source_dir: str,
+                           kind: str | None = None) -> tuple[int, int]:
+        """
+        单事务内删除 runs 表行与 ingest_log 台账。
+        返回 (deleted_run_rows, deleted_log_rows)。
+        """
+        table = schema.table_for(kind)
+        with self._lock:
+            cur_run = self._conn.execute(
+                f"DELETE FROM {table} WHERE run_id = ?", [run_id])
+            cur_log = self._conn.execute(
+                "DELETE FROM ingest_log WHERE source_dir = ? OR run_id = ?",
+                [source_dir, run_id],
+            )
+            self._conn.commit()
+            return int(cur_run.rowcount), int(cur_log.rowcount)
 
 
 def connect(cfg: DatabaseConfig) -> Database:

@@ -76,6 +76,18 @@
   }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); height: 42px; border-radius: 10px; padding: 0 18px; cursor: pointer; }
+  button.danger {
+    background: var(--err); color: #fff; border: none; border-radius: 8px;
+    padding: 6px 14px; font-size: 13px; cursor: pointer;
+  }
+  button.danger:disabled { opacity: 0.5; cursor: not-allowed; }
+  .del-box {
+    margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border);
+    color: var(--text); font-size: 13px;
+  }
+  .del-box .ops { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .del-box a { color: var(--accent); }
+  .del-preview { margin-top: 8px; font-size: 12px; color: var(--err); line-height: 1.5; }
   .result { padding: 14px; border-radius: 10px; margin-top: 16px; display: none; line-height: 1.6; }
   .result.err { background: var(--err-bg); color: var(--err); display: block; }
   .result.ok { background: var(--ok-bg); color: var(--ok); display: block; }
@@ -94,6 +106,7 @@
   <header>
     <span class="dot"></span>上传测试结果（文本）
     <span class="spacer"></span>
+    <a href="/runs">记录管理</a>
     <a href="/gpus">显卡管理</a>
     <a href="/upload/vlm">VLM 上传 →</a>
     <a href="/">← 返回对比助手</a>
@@ -533,8 +546,81 @@
     (d.param_notes || []).forEach(function (n) {
       html += '<div class="warn">' + esc(n) + "</div>";
     });
+    html += '<div class="del-box" id="del-box">' +
+      "<div>发现填错了？可删除本条记录（目录 + 数据库 + 台账），然后重新提交。</div>" +
+      '<div class="ops">' +
+        '<button type="button" class="danger" data-act="del-run">删除这条记录</button>' +
+        '<a href="/runs">打开记录管理 →</a>' +
+      "</div>" +
+      '<div class="del-preview" id="del-preview" style="display:none"></div>' +
+    "</div>";
     result.className = "result ok";
     result.innerHTML = html;
+    bindDeleteRun(d);
+  }
+
+  function bindDeleteRun(d) {
+    const btn = result.querySelector('[data-act="del-run"]');
+    if (!btn || !d.run_id) return;
+    const kind = d.benchmark_kind || "text";
+    let stage = 0; // 0=idle, 1=confirm
+    const preview = document.getElementById("del-preview");
+
+    function showDeleted() {
+      result.className = "result ok";
+      result.innerHTML = "<h4>已删除，可重新提交</h4>" +
+        '<div class="kv">记录 <b>' + esc(d.run_id) + "</b> 及其落盘目录、数据库行、ingest_log 已清除。" +
+        ' 也可在 <a href="/runs">记录管理</a> 查看其他记录。</div>';
+    }
+
+    btn.addEventListener("click", function () {
+      if (stage === 0) {
+        stage = 1;
+        btn.textContent = "确认删除（不可逆）";
+        if (preview) {
+          preview.style.display = "block";
+          preview.textContent = "加载预览…";
+        }
+        const url = "/api/runs/" + encodeURIComponent(d.run_id) +
+          "/delete-preview?kind=" + encodeURIComponent(kind);
+        fetch(url)
+          .then(function (r) { return r.json().then(function (x) { return { ok: r.ok, d: x }; }); })
+          .then(function (res) {
+            if (!preview) return;
+            if (!res.ok) {
+              preview.textContent = res.d.error || "预览失败";
+              stage = 0;
+              btn.textContent = "删除这条记录";
+              return;
+            }
+            preview.textContent = "将删除 " + (res.d.disk_path || "") +
+              "（" + (res.d.disk_exists ? "目录存在" : "目录已不存在") +
+              "），指标 " + res.d.num_metrics + " 行。再点一次确认。";
+          })
+          .catch(function (e) {
+            if (preview) preview.textContent = "预览失败：" + e;
+            stage = 0;
+            btn.textContent = "删除这条记录";
+          });
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = "删除中…";
+      const url = "/api/runs/" + encodeURIComponent(d.run_id) +
+        "?kind=" + encodeURIComponent(kind);
+      fetch(url, { method: "DELETE" })
+        .then(function (r) { return r.json().then(function (x) { return { ok: r.ok, d: x }; }); })
+        .then(function (res) {
+          if (!res.ok) {
+            showError(res.d.error || "删除失败");
+            return;
+          }
+          showDeleted();
+        })
+        .catch(function (e) {
+          showError("删除失败：" + e);
+        });
+    });
   }
 
   function validate() {
