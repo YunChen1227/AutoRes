@@ -74,6 +74,7 @@
 | D24 | 模型元信息列拆分 | 口径不清的 `model_size` 列**彻底移除**，拆成 `model_params_b`（参数量，B）+ `model_weight_gb`（权重占用，GiB）。这两列与 `model_dtype` 三者**全部由 `config.json` 推导**，表单/CLI 只作可选覆盖：传了 config 就一个都不用填。仅 `model_params_b` 在推不出来时（没传 config 或 config 缺形状字段）要求手填——它是分组对比的主轴，不能为空。老库里的 `model_size` 留作死列，**不做换算回填** | 原列的三处文档口径互相矛盾（注释写参数量 GB、README 写权重占用 GB、前端占位符给 `72`），旧值到底是 GB 还是 B 判断不了；手填还容易把量化模型的 dtype 记成 `bf16`（那是激活精度）、把 MoE 的激活参数量当总参数量。既然 config 能算准，就别让人再填一遍，见 §5.4.3 |
 | D25 | 显卡型号可 CRUD | 硬编码的 `GPU_MEMORY_GIB` dict **迁到** `tools/gpu_types.json` 作唯一真相；`/gpus` 页面与 MCP 五个固定指令（`gpu_type_list/get/create/update/delete`）做增删改查。写操作需 `confirm=true` 两段式；**内置 chat agent 不授予**这些工具。有库内引用的型号不能删；**不允许改名**（历史 `gpu_type` 是裸字符串） | 压测机 `tools/` 需能离线用，故不用 SQLite；型号表频繁增删（未发布卡）不该改代码。见 §5.4.4 |
 | D26 | 删除测试记录（页面专属） | 上传填错 CSV / 启动命令时可删：同时清除**落盘目录 + runs 表行 + ingest_log 台账**。顺序必须**先删目录、再单事务清库**（反过来会让 Scanner 把记录扫回来）。**仅**允许删 `extra.ingest_source == "manual_upload"` 的记录；Scanner 从 NAS 扫入的原始产物不可通过本接口删。**MCP 与内置 Agent 一律不提供**删除能力（比 gpu_type 的 confirm 更严——这里毁掉的是压测原始产物） | 见 §5.4.5；自检 `test/check_delete_run.py` |
+| D27 | 弱扩展归一按机器数，**不按卡数** | `normalize_gpu_scale` 的唯一基准是机器数：`machines = gpu_count / cards_per_machine`，**允许小数**（H20 4 卡 = 0.5 机、2 卡 = 0.25 机）。归一到组内最大机器数，吞吐类 × 比例、`concurrency` 同比对齐、延迟类保持原值。**取消**"同型号按卡数 / 跨型号不能整除则回退按卡数"的旧分支 | 卡数跨型号不可比：H20 8 卡/机与 MLU580 16 卡/机，"1 台机器"才是采购与机房的同口径单位，按卡数比会把 16 卡/机的机器当成两倍规模。同型号下机器数与卡数成正比，结果与旧逻辑等价，所以不必保留两套单位。见 §5.4.6；自检 `test/check_gpu_scale.py` |
 
 ---
 
@@ -415,6 +416,30 @@ patch embedding（Conv3d）与 Qwen-VL 系的 patch merger 都计入。CLIP / Si
 - **MCP / Agent：明确不提供**，且自检断言工具名集合不含 delete-run 类
 
 已生成的报告快照（`var/data/reports`）是时间点产物，删记录不回溯修改。
+
+#### 5.4.6 弱扩展归一按机器数（D27）
+
+`autores/server/report/hardware.py` 的 `annotate_and_scale` 是唯一入口，基准只有一个：
+
+```
+machines = gpu_count / cards_per_machine(gpu_type)      # 允许小数
+scale    = max(machines of the group) / machines
+```
+
+`cards_per_machine` 来自显卡注册表（D25），未登记型号回退 8 卡/机。折算示例：
+
+| 配置 | 每机卡数 | 机器数 |
+|------|---------|--------|
+| H20-141G 16 卡 | 8 | 2 |
+| H20-141G 4 卡 | 8 | 0.5 |
+| H20-141G 2 卡 | 8 | 0.25 |
+| MLU580-X6G 16 卡 | 16 | 1 |
+
+于是 H20 4 卡 vs MLU580 16 卡 = 0.5 机 vs 1 机 → H20 侧吞吐与 `concurrency` × 2（旧的按卡数逻辑会算成 × 4，把"16 卡/机的一台机器"误当成四倍规模）。机器数相同（H20 8 卡 vs MLU580 16 卡）则 scale 全为 1，不做任何换算。
+
+- **换算范围**：吞吐类（`THROUGHPUT_METRICS`）× scale、`concurrency` × scale；延迟类（TTFT/TPOT/ITL/E2E）与 `input_length` 保持原值
+- **规模描述**：`unit_desc` 统一带机器数，`16卡(2机)` / `4卡(0.5机)`，不再出现只有卡数的写法
+- **关闭方式**：QuerySpec 的 `normalize_gpu_scale=false`，此时输出原始未换算数值
 
 ### 5.5 Scanner：扫描、入库与半成品处理（D19）
 

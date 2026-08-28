@@ -255,7 +255,6 @@ def build_comparison_table(
         "multi_version": len(versions) > len(frameworks),
         "merged_from": sorted(set(merged_from)) if merged_from else [],
         "benchmark_kind": bk,
-        "scale_mode": docs[0].get("_scale_mode", "card") if docs else "card",
     }
 
     return {

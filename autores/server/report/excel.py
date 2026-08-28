@@ -187,18 +187,11 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
                 scale = column_scale.get(label, 1)
                 tag = f"×{scale:g}" if scale not in (None, 1) else "基准"
                 parts.append(f"{label}={hardware.unit_desc(gpus, column_gpu_types.get(label, ''))}({tag})")
-        scale_mode = notes.get("scale_mode", "card")
-        if scale_mode == "machine":
-            norm_desc = (
-                "已按机器数弱扩展归一（跨显卡型号对比）：吞吐类×机器数比例、"
-                "concurrency 同比对齐、延迟类(TTFT/TPOT/ITL/E2E)保持原值"
-            )
-        else:
-            norm_desc = (
-                "已按卡数弱扩展归一：吞吐类×卡数比例、concurrency 同比对齐、"
-                "延迟类(TTFT/TPOT/ITL/E2E)保持原值"
-            )
-        note_bits.append(norm_desc + "　" + "，".join(parts))
+        note_bits.append(
+            "已按机器数弱扩展归一（机器数 = 卡数 ÷ 该型号每机卡数，可为 0.5/0.25 等小数）："
+            "吞吐类×机器数比例、concurrency 同比对齐、"
+            "延迟类(TTFT/TPOT/ITL/E2E)保持原值　" + "，".join(parts)
+        )
     total = coverage.get("total_rows", 0)
     aligned = coverage.get("aligned_rows", 0)
     if total:
