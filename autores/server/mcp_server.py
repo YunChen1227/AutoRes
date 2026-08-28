@@ -245,9 +245,9 @@ def build_mcp_server(db, cfg: Config, reports) -> MCPServer:
         exclude: 可选，排除项，键为维度、值为要剔除的取值数组。
         metrics: 可选，要对比的指标列名；缺省=全部指标。
         metric_filters: 可选，按行键（如 input_length / concurrency）进一步筛选。
-        normalize_gpu_scale: 可选，默认 true。各配置卡数不同时按卡数做弱扩展归一
-            （吞吐×卡数比、并发同比对齐、延迟不变）以做"对齐卡数"的公平对比；
-            卡数相同则自动无操作；需看原始未换算数值时设 false。
+        normalize_gpu_scale: 可选，默认 true。规模不同时做弱扩展归一（吞吐×比例、
+            并发同比对齐、延迟不变）：同 gpu_type 按总卡数；多种 gpu_type 混比时
+            优先按机器数（不能整除单机卡数则整组回退按卡）；需看原始值时设 false。
         benchmark_kind: text|vlm，默认 text。
 
         返回：{ok, download_url, filename, summary} 或 {ok: false, error/reason}。"""
