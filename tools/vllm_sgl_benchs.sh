@@ -75,7 +75,7 @@ WARMUP_REQUESTS=0
 WARMUP_OUTPUT_LEN=32          # 预热请求输出长度（对齐 sglang 原生 warmup 的 32 token 上限）
 
 # ── 共享前缀比例数组（0~1，行键维度 Prefix_Rate，写入 metrics / _autores_dims）──
-#   作为第 3 层循环：concurrency → input_len → prefix_rate。
+#   作为最外层循环：prefix_rate → concurrency → input_len。
 #   每轮真实前缀长度 = round(INPUT_LEN * PREFIX_RATE)，正文长度 = INPUT_LEN - 前缀，
 #   保证两框架的「总输入 = INPUT_LEN」一致，可横向比较。
 #   PREFIX_RATE=0 → 无前缀（vllm: --random-prefix-len 0；sglang: 沿用 random-ids）。
@@ -268,7 +268,7 @@ if (( WARMUP_REQUESTS > 0 )); then
 else
     echo "  WARMUP_REQUESTS  = 0  (不预热)"
 fi
-echo "  PREFIX_RATES     = ${PREFIX_RATES[*]}  (第 3 层循环；>0 时 sglang→GSP / vllm→random-prefix-len)"
+echo "  PREFIX_RATES     = ${PREFIX_RATES[*]}  (最外层循环；>0 时 sglang→GSP / vllm→random-prefix-len)"
 echo "  ⚠ 落盘请执行: to_csv.py --benchmark-kind text --framework $BENCH_FRAMEWORK ..."
 if [[ "$BENCH_WARMUP_FLAG_OK" == "0" ]]; then
     if [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
@@ -428,14 +428,14 @@ capture_kv_from_vllm_server() {
     fi
 }
 
-# ---- 主循环：concurrency → input_len → prefix_rate ----
+# ---- 主循环：prefix_rate → concurrency → input_len ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INJECT_DIMS="${SCRIPT_DIR}/inject_dims.py"
 
-for CONCURRENCY in "${max_concurrency[@]}"; do
-    INPUT_LENGTHS=(${input_length_map[$CONCURRENCY]})
-    for INPUT_LEN in "${INPUT_LENGTHS[@]}"; do
-      for PREFIX_RATE in "${PREFIX_RATES[@]}"; do
+for PREFIX_RATE in "${PREFIX_RATES[@]}"; do
+    for CONCURRENCY in "${max_concurrency[@]}"; do
+      INPUT_LENGTHS=(${input_length_map[$CONCURRENCY]})
+      for INPUT_LEN in "${INPUT_LENGTHS[@]}"; do
         PROMPTS=$((CONCURRENCY * 5))
         # 文件名带 rate，避免不同 prefix 互相覆盖
         RATE_TAG=$(awk -v r="$PREFIX_RATE" 'BEGIN{printf "%.4g", r+0}')
