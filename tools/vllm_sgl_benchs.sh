@@ -350,30 +350,27 @@ PYEOF
 }
 
 # 抓 BASE_URL 的 vllm prefix cache 累计计数：输出 "queries hits"（抓不到输出空串）
+#   ⚠ 这里必须用 awk（或先落变量再喂给 python），不能写成
+#       curl ... | python3 - <<'PYEOF'
+#     因为 heredoc 是对 fd 0 的重定向，会覆盖管道：python3 - 把 heredoc 当程序体
+#     整篇读到 EOF，之后 sys.stdin 已经空了，curl 的 /metrics 输出永远读不到，
+#     函数恒返回空串 → 上层恒报 "未取到 prefix cache metrics"。
+#   /metrics 不在 vllm 的鉴权前缀（/v1,/v2,/inference,/cohere）内，带不带 Bearer 都能读。
 scrape_vllm_prefix_cache() {
-    curl -s "${CURL_AUTH[@]}" "${BASE_URL}/metrics" 2>/dev/null | python3 - <<'PYEOF'
-import sys
-q = h = 0.0
-found = False
-for line in sys.stdin:
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    parts = line.split()
-    if len(parts) < 2:
-        continue
-    name = parts[0].split("{")[0]
-    try:
-        val = float(parts[-1])
-    except ValueError:
-        continue
-    if name in ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries"):
-        q += val; found = True
-    elif name in ("vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits"):
-        h += val; found = True
-if found:
-    print(f"{q} {h}")
-PYEOF
+    curl -s "${CURL_AUTH[@]}" "${BASE_URL}/metrics" 2>/dev/null | awk '
+        /^[[:space:]]*#/ { next }
+        NF < 2 { next }
+        {
+            name = $1
+            sub(/\{.*$/, "", name)     # 去掉 {model_name="...",engine="0"} 标签
+            if (name == "vllm:prefix_cache_queries_total" || name == "vllm:prefix_cache_queries") {
+                q += $NF; found = 1
+            } else if (name == "vllm:prefix_cache_hits_total" || name == "vllm:prefix_cache_hits") {
+                h += $NF; found = 1
+            }
+        }
+        END { if (found) printf "%.0f %.0f\n", q, h }
+    '
 }
 
 # 把 KV hit rate 注入结果 JSON。
@@ -424,7 +421,8 @@ capture_kv_from_vllm_server() {
         local pct; pct=$(python3 -c "print($dh/$dq*100.0)")
         inject_kv_hit_rate "$jf" "$pct" "$BENCH_FRAMEWORK"
     else
-        echo "[WARN] prefix_cache queries delta<=0，跳过 KV hit rate（不强求）"
+        echo "[WARN] prefix_cache queries delta<=0（queries: $q0→$q1），跳过 KV hit rate（不强求）"
+        echo "       常见原因：vllm server 启动带了 --no-enable-prefix-caching，或该模型不支持 prefix caching"
     fi
 }
 
