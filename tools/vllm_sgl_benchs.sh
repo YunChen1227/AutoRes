@@ -17,14 +17,16 @@
 # server | bench  | flush端点          | KV hit rate                       | spec
 # -------|--------|--------------------|-----------------------------------|--------------------
 # sglang | sglang | /flush_cache       | bench --cache-report(原生,精确)    | 原生 accept_length
-# sglang | vllm   | /flush_cache       | N/A(sglang只有瞬时gauge,不硬凑)    | N/A(颗粒度错位)
-# vllm   | sglang | /reset_prefix_cache| 抓 vllm 计数器delta→注入嵌套cache  | N/A(颗粒度错位)
+# sglang | vllm   | /flush_cache       | N/A(sglang只有瞬时gauge,不硬凑)    | N/A(在/server_info里)
+# vllm   | sglang | /reset_prefix_cache| 抓 vllm 计数器delta→注入嵌套cache  | 抓 vllm 计数器delta→注入
 # vllm   | vllm   | /reset_prefix_cache| 抓 vllm 计数器delta→注入kv_cache   | 原生 spec_decode_*
 # ----------------------------------------------------------------------
 #   · KV：server=vllm 用 /metrics 计数器 delta（精确，与 bench 无关）；
 #         server=sglang 只能靠 sglang bench 的 --cache-report，换 vllm bench 就拿不到。
-#   · spec：只在 server==bench（原生路径）时采集；跨框架会把 accept_length 当成
-#         accept_rate 之类误贴标签，故直接 N/A（"实在没有也不强求"）。
+#   · spec：同样只看 SERVER。server=vllm 时 accept rate/length 都在 /metrics 的
+#         spec_decode_* 计数器里，bench=sglang 也能抓（与 vllm bench 同源同公式，
+#         写的是 vllm 自己的计数器，不存在跨框架误贴标签）；server=sglang 时
+#         accept_length 只在 /server_info，换 vllm bench 就拿不到。
 #   · 抓不到的指标一律留空 / N/A，绝不阻断压测。
 # ============================================================================
 
@@ -115,13 +117,13 @@ BENCH_CMD=""
 declare -a max_concurrency=(8 16 32 64 128 256 512)
 # 并发数 → 输入长度列表
 declare -A input_length_map=(
-    [1]="1024 2048 4096 8192 16384 32768 65538 128000"
-    [2]="1024 2048 4096 8192 16384 32768 65538 128000"
-    [4]="1024 2048 4096 8192 16384 32768 65538 128000"
-    [8]="1024 2048 4096 8192 16384 32768 65538 128000"
-    [16]="1024 2048 4096 8192 16384 32768 65538 128000"
-    [32]="1024 2048 4096 8192 16384 32768 65538 128000"
-    [64]="1024 2048 4096 8192 16384 32768 65538"
+    [1]="1024 2048 4096 8192 16384 32768 65536 128000"
+    [2]="1024 2048 4096 8192 16384 32768 65536 128000"
+    [4]="1024 2048 4096 8192 16384 32768 65536 128000"
+    [8]="1024 2048 4096 8192 16384 32768 65536 128000"
+    [16]="1024 2048 4096 8192 16384 32768 65536 128000"
+    [32]="1024 2048 4096 8192 16384 32768 65536 128000"
+    [64]="1024 2048 4096 8192 16384 32768 65536"
     [128]="1024 2048 4096 8192 16384 32768"
     [256]="1024 2048 4096 8192 16384 32768"
     [512]="1024 2048 4096 8192 16384"
@@ -210,7 +212,7 @@ fi
 
 # ── 依据组合预解析各指标的采集策略（只算一次）──
 #   CAPTURE_KV  : none | sglang_native | scrape_vllm
-#   CAPTURE_SPEC: none | native
+#   CAPTURE_SPEC: none | native | scrape_vllm
 if [[ "$SERVER_FRAMEWORK" == "vllm" ]]; then
     CAPTURE_KV="scrape_vllm"
 elif [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
@@ -218,10 +220,27 @@ elif [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
 else
     CAPTURE_KV="none"              # server=sglang & bench=vllm
 fi
-if [[ "$SERVER_FRAMEWORK" == "$BENCH_FRAMEWORK" ]]; then
-    CAPTURE_SPEC="native"
+# spec 的「来源」看 SERVER，和 KV 同理（旧版按 server==bench 判断，把
+# server=vllm & bench=sglang 这个完全可采的组合误关成 none）：
+#   server=vllm & bench=vllm    → vllm bench serve 原生抓 /metrics 并写进 JSON
+#   server=vllm & bench=sglang  → 脚本自己抓 /metrics 的 spec_decode_* delta。
+#                                 与 bench 原生同源同公式，是 vllm 自己的计数器，
+#                                 不存在「把 sglang 的 accept_length 误贴成 vllm
+#                                 的 accept_rate」那类跨框架错位问题。
+#   server=sglang & bench=sglang→ sglang bench 原生读 /server_info 的
+#                                 avg_spec_accept_length
+#   server=sglang & bench=vllm  → 拿不到：vllm bench 只认 vllm 的 /metrics，
+#                                 sglang 的 accept_length 在 /server_info 里
+if [[ "$SERVER_FRAMEWORK" == "vllm" ]]; then
+    if [[ "$BENCH_FRAMEWORK" == "vllm" ]]; then
+        CAPTURE_SPEC="native"
+    else
+        CAPTURE_SPEC="scrape_vllm"
+    fi
+elif [[ "$BENCH_FRAMEWORK" == "sglang" ]]; then
+    CAPTURE_SPEC="native"          # server=sglang & bench=sglang
 else
-    CAPTURE_SPEC="none"
+    CAPTURE_SPEC="none"            # server=sglang & bench=vllm
 fi
 
 # sglang bench 打不同 server 用不同 backend
@@ -278,7 +297,7 @@ if [[ "$BENCH_WARMUP_FLAG_OK" == "0" ]]; then
     fi
 fi
 [[ "$CAPTURE_KV" == "none" ]] && echo "  ⚠ 该组合无法可靠获取 KV hit rate（sglang server 请改用 sglang bench + --cache-report）"
-[[ "$CAPTURE_SPEC" == "none" && ( "$SERVER_FRAMEWORK" != "$BENCH_FRAMEWORK" ) ]] && echo "  ⚠ server≠bench：spec 指标颗粒度错位，本轮不采集（避免误贴标签）"
+[[ "$CAPTURE_SPEC" == "none" ]] && echo "  ⚠ server=sglang & bench=vllm：accept_length 在 sglang 的 /server_info 里，vllm bench 读不到 → spec 本轮 N/A"
 echo "============================================"
 
 # ---- 工具函数（flush / metrics 均只打 BASE_URL，与官方 bench 一致）----
@@ -373,6 +392,61 @@ scrape_vllm_prefix_cache() {
     '
 }
 
+# 抓 BASE_URL 的 vllm spec decode 累计计数：输出 "drafts draft_tokens accepted"
+#   （抓不到 / server 未开投机解码则输出空串——SpecDecodingProm 在
+#     speculative_config 为空时直接 early-return，/metrics 里连 spec_decode_* 都没有）
+#   与 vllm bench serve 的 fetch_spec_decode_metrics 同源（都读 /metrics 的
+#   spec_decode_* 计数器），所以 server=vllm 时不管 bench 是谁，拿到的都是真值。
+#   ⚠ 必须精确名匹配：spec_decode_num_accepted_tokens_per_pos_total 要排除，
+#     否则会被重复计进 accepted（vllm 自己用的是子串匹配 + 判断顺序来规避）。
+#   ⚠ 同样别用 `curl | python3 - <<'PYEOF'`，见 scrape_vllm_prefix_cache 的说明。
+scrape_vllm_spec_decode() {
+    curl -s "${CURL_AUTH[@]}" "${BASE_URL}/metrics" 2>/dev/null | awk '
+        /^[[:space:]]*#/ { next }
+        NF < 2 { next }
+        {
+            name = $1
+            sub(/\{.*$/, "", name)
+            if (name == "vllm:spec_decode_num_drafts_total" || name == "vllm:spec_decode_num_drafts") {
+                d += $NF; found = 1
+            } else if (name == "vllm:spec_decode_num_draft_tokens_total" || name == "vllm:spec_decode_num_draft_tokens") {
+                t += $NF; found = 1
+            } else if (name == "vllm:spec_decode_num_accepted_tokens_total" || name == "vllm:spec_decode_num_accepted_tokens") {
+                a += $NF; found = 1
+            }
+        }
+        END { if (found) printf "%.0f %.0f %.0f\n", d, t, a }
+    '
+}
+
+# 把 spec 指标注入结果 JSON 顶层。key 与 vllm bench serve 原生写的完全一致，
+# 这样 to_csv 无论 bench 框架是谁都能按同一套 key 解析。
+#   $1=json 文件  $2=accept rate(0-100)  $3=accept length  $4=drafts  $5=draft_tokens  $6=accepted
+inject_spec_metrics() {
+    local jf="$1"
+    [[ -f "$jf" ]] || { echo "[WARN] 结果文件不存在，跳过 spec 注入: $jf"; return 0; }
+    python3 - "$jf" "$2" "$3" "$4" "$5" "$6" <<'PYEOF'
+import sys, json
+jf = sys.argv[1]
+rate, length = float(sys.argv[2]), float(sys.argv[3])
+drafts, dtoks, acc = (int(float(x)) for x in sys.argv[4:7])
+try:
+    with open(jf, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"[WARN] 读取 {jf} 失败: {e}"); sys.exit(0)
+# 与 vllm/benchmarks/serve.py 一致：rate 是 0-100 的百分比，length 含 bonus token
+data["spec_decode_acceptance_rate"] = round(rate, 2)
+data["spec_decode_acceptance_length"] = round(length, 4)
+data["spec_decode_num_drafts"] = drafts
+data["spec_decode_draft_tokens"] = dtoks
+data["spec_decode_accepted_tokens"] = acc
+with open(jf, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False)
+print(f"[OK] spec accept rate={round(rate, 2)}% / accept length={round(length, 2)} 已注入")
+PYEOF
+}
+
 # 把 KV hit rate 注入结果 JSON。
 #   $1=json 文件  $2=百分比(0-100)  $3=bench 框架（决定写哪个 key）
 #   bench=sglang → 嵌套 cache_report.cache_hit_rate_pct
@@ -426,6 +500,35 @@ capture_kv_from_vllm_server() {
     fi
 }
 
+# 对 vllm server 抓 spec：压测前后各一次，算 delta 注入（$1=json 文件）
+#   accept rate   = Δaccepted / Δdraft_tokens × 100
+#   accept length = 1 + Δaccepted / Δdrafts   （含 bonus token，与 vllm 惯例一致）
+capture_spec_from_vllm_server() {
+    local jf="$1"
+    if [[ -z "$SPEC_BEFORE" ]]; then
+        echo "[WARN] 未取到压测前 vllm spec_decode metrics，跳过 spec（不强求）"
+        echo "       常见原因：server 启动未带 --speculative-config，/metrics 里没有 spec_decode_*"
+        return 0
+    fi
+    local spec_after; spec_after="$(scrape_vllm_spec_decode)"
+    if [[ -z "$spec_after" ]]; then
+        echo "[WARN] 未取到压测后 vllm spec_decode metrics，跳过 spec（不强求）"; return 0
+    fi
+    local d0 t0 a0 d1 t1 a1
+    read -r d0 t0 a0 <<<"$SPEC_BEFORE"
+    read -r d1 t1 a1 <<<"$spec_after"
+    local dd=$((d1 - d0)) dt=$((t1 - t0)) da=$((a1 - a0))
+    if (( dd <= 0 || dt <= 0 )); then
+        echo "[WARN] spec_decode delta<=0（drafts: $d0→$d1，draft_tokens: $t0→$t1），跳过 spec（不强求）"
+        echo "       常见原因：投机解码未真正生效，或本轮请求未走 spec 路径"
+        return 0
+    fi
+    local rate len
+    rate=$(awk -v a="$da" -v t="$dt" 'BEGIN{printf "%.6f", a / t * 100}')
+    len=$(awk -v a="$da" -v d="$dd" 'BEGIN{printf "%.6f", 1 + a / d}')
+    inject_spec_metrics "$jf" "$rate" "$len" "$dd" "$dt" "$da"
+}
+
 # ---- 主循环：prefix_rate → concurrency → input_len ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INJECT_DIMS="${SCRIPT_DIR}/inject_dims.py"
@@ -434,7 +537,16 @@ for PREFIX_RATE in "${PREFIX_RATES[@]}"; do
     for CONCURRENCY in "${max_concurrency[@]}"; do
       INPUT_LENGTHS=(${input_length_map[$CONCURRENCY]})
       for INPUT_LEN in "${INPUT_LENGTHS[@]}"; do
-        PROMPTS=$((CONCURRENCY * 5))
+        # 请求条数按并发分档（不再用 concurrency*5）
+        if (( CONCURRENCY < 10 )); then
+            PROMPTS=50
+        elif (( CONCURRENCY < 50 )); then
+            PROMPTS=100
+        elif (( CONCURRENCY < 100 )); then
+            PROMPTS=200
+        else
+            PROMPTS=300
+        fi
         # 文件名带 rate，避免不同 prefix 互相覆盖
         RATE_TAG=$(awk -v r="$PREFIX_RATE" 'BEGIN{printf "%.4g", r+0}')
         OUTPUT_FILE="${BASE_LOG_DIR}/${FILE_PREFIX}_${CONCURRENCY}_${INPUT_LEN}_${OUTPUT_LEN}_${PROMPTS}_pr${RATE_TAG}.json"
@@ -469,6 +581,11 @@ for PREFIX_RATE in "${PREFIX_RATES[@]}"; do
         PC_BEFORE=""
         if [[ "$CAPTURE_KV" == "scrape_vllm" ]]; then
             PC_BEFORE="$(scrape_vllm_prefix_cache)"
+        fi
+        # spec：server=vllm & bench≠vllm 时同样先抓基线（bench=vllm 由 bench 原生负责）
+        SPEC_BEFORE=""
+        if [[ "$CAPTURE_SPEC" == "scrape_vllm" ]]; then
+            SPEC_BEFORE="$(scrape_vllm_spec_decode)"
         fi
 
         # ── 跑 bench（命令按 BENCH_FRAMEWORK；backend 按 SERVER_FRAMEWORK）──
@@ -542,9 +659,12 @@ for PREFIX_RATE in "${PREFIX_RATES[@]}"; do
                 --model "$MODEL"
         fi
 
-        # ── 压测后：KV 采集（spec 已由原生 bench 写入，无需额外处理）──
+        # ── 压测后：KV / spec 采集（CAPTURE_*=native 时已由原生 bench 写入）──
         if [[ "$CAPTURE_KV" == "scrape_vllm" ]]; then
             capture_kv_from_vllm_server "$OUTPUT_FILE"
+        fi
+        if [[ "$CAPTURE_SPEC" == "scrape_vllm" ]]; then
+            capture_spec_from_vllm_server "$OUTPUT_FILE"
         fi
 
         # 注入行键维度（供 to_csv 优先读 _autores_dims）

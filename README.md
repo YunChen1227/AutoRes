@@ -166,7 +166,9 @@ bash vllm_sgl_benchs.sh
 |---|--------|------|
 | 命令 | `python3 -m sglang.bench_serving --backend sglang-oai-chat ...` | `vllm bench serve --backend openai ...` |
 | KV hit rate | `--cache-report` → JSON 内 `cache_report.cache_hit_rate_pct` | 脚本前后抓 `/metrics`，注入 `kv_cache_hit_rate` |
-| Spec | JSON 内 `accept_length` | JSON 内 `spec_decode_acceptance_rate` / `spec_decode_acceptance_length` |
+| Spec | JSON 内 `accept_length`（仅 server=sglang） | JSON 内 `spec_decode_acceptance_rate` / `spec_decode_acceptance_length` |
+
+> server=vllm 且 bench=sglang 时，spec 两个指标由脚本抓 `/metrics` 的 `spec_decode_*` 计数器 delta 后注入上面那两个 vllm 同名 key（sglang bench 自己的 `accept_length` 此时为 `null`，落 `N/A`）。
 
 ### 1b. VLM 压测：`tools/vlm_benchs.sh`
 
@@ -307,14 +309,18 @@ CLIP / SigLIP 那类 projector 形状不在 `vision_config` 里，会少算几�
 
 除吞吐/延迟外，新增列如下：
 
-| CSV 列 | 跨框架可比 | sglang 来源 | vllm 来源 |
+下面的「来源」一律指 **server 框架**（指标从哪个服务的接口读出来的），与 bench 框架无关：
+
+| CSV 列 | 跨框架可比 | server=sglang 来源 | server=vllm 来源 |
 |--------|------------|-------------|-----------|
-| `KV_Cache_Hit_Rate(%)` | **是** | `cache_report.cache_hit_rate_pct` | 脚本注入的 `kv_cache_hit_rate` |
-| `SGLang_Spec_Accept_Length` | 否（仅 sglang） | `accept_length` | `N/A` |
+| `KV_Cache_Hit_Rate(%)` | **是** | `cache_report.cache_hit_rate_pct`（需 bench=sglang） | 脚本注入的 `kv_cache_hit_rate` |
+| `SGLang_Spec_Accept_Length` | 否（仅 sglang） | `accept_length`（需 bench=sglang） | `N/A` |
 | `vLLM_Spec_Accept_Rate(%)` | 否（仅 vllm） | `N/A` | `spec_decode_acceptance_rate` |
 | `vLLM_Spec_Accept_Length` | 否（仅 vllm） | `N/A` | `spec_decode_acceptance_length` |
 
 对比报告里 **`KV_Cache_Hit_Rate(%)` 可直接跨框架比较**；spec 三列各框架各填各的，另一框架为 `N/A`，不要跨框架对比 accept rate 与 accept length 的数值含义。
+
+vLLM 那两列的来源是 server `/metrics` 的 `spec_decode_*` 计数器，所以 **server=vllm 时 bench 用 sglang 也能拿到**：bench=vllm 由 `vllm bench serve` 原生写入，bench=sglang 由脚本抓计数器 delta 后注入同名 key，两条路径同源同公式。反过来 server=sglang 时 `accept_length` 只在 `/server_info` 里，换 vllm bench 就读不到。
 
 ---
 

@@ -101,8 +101,14 @@ _SHARED_METRIC_FIELD_MAP = {
     "KV_Cache_Hit_Rate(%)": {"sglang": "cache_report.cache_hit_rate_pct",
                              "vllm": "kv_cache_hit_rate"},
     "SGLang_Spec_Accept_Length": {"sglang": "accept_length",              "vllm": None},
-    "vLLM_Spec_Accept_Rate(%)":  {"sglang": None, "vllm": "spec_decode_acceptance_rate"},
-    "vLLM_Spec_Accept_Length":   {"sglang": None, "vllm": "spec_decode_acceptance_length"},
+    # vLLM spec 两列的来源是 server 的 /metrics（spec_decode_* 计数器），与 bench
+    # 框架无关：bench=vllm 时由 vllm bench serve 原生写入，bench=sglang 时由
+    # vllm_sgl_benchs.sh 的 capture_spec_from_vllm_server 抓 delta 后注入同名 key。
+    # 所以两侧都映射到同一组 key；server=sglang 时 JSON 里没这些 key，自然落 N/A。
+    "vLLM_Spec_Accept_Rate(%)":  {"sglang": "spec_decode_acceptance_rate",
+                                  "vllm": "spec_decode_acceptance_rate"},
+    "vLLM_Spec_Accept_Length":   {"sglang": "spec_decode_acceptance_length",
+                                  "vllm": "spec_decode_acceptance_length"},
 }
 
 # 行键维度：原生 JSON key（_autores_dims 优先，见 _dim_from_record）
@@ -160,13 +166,17 @@ def _dig(record, key):
     """
     从 record 取值，支持点号嵌套 key（如 cache_report.cache_hit_rate_pct）。
     命中返回值；缺失返回 _MISSING（供上层区分"没有该字段"与"值为 0"）。
+
+    显式的 null 也算缺失：sglang bench 打 vllm server 时会写
+    `"accept_length": null`（accept_length 只在 backend 含 sglang 时才去
+    /server_info 取），键存在但无意义，应落 N/A 而不是空值。
     """
     cur = record
     for part in key.split("."):
         if not isinstance(cur, dict) or part not in cur:
             return _MISSING
         cur = cur[part]
-    return cur
+    return _MISSING if cur is None else cur
 
 
 # ============================================================================
