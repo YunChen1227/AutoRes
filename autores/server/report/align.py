@@ -99,6 +99,93 @@ def _sort_dim_value(dim: str, val: Any) -> tuple:
     return (1, 0, 0, str(val))
 
 
+_SHEET_DIM_SHORT = {
+    "prefix_rate": "pr", "image_count": "img",
+    "video_count": "vid", "image_resolution": "res",
+}
+
+
+def _sheet_sort_key(sheet_dims: list[str], key_tuple: tuple) -> tuple:
+    return tuple(_sort_dim_value(d, v) for d, v in zip(sheet_dims, key_tuple))
+
+
+def _sheet_label(sheet_dims: list[str], key_tuple: tuple) -> str:
+    parts = []
+    for d, v in zip(sheet_dims, key_tuple):
+        short = _SHEET_DIM_SHORT.get(d, d)
+        parts.append(f"{short}={'N-A' if v is None else v}")
+    return "/".join(parts) if parts else "all"
+
+
+def split_table_into_sheets(table: dict, sheet_dims: list[str]) -> dict:
+    """把扁平对比表按 sheet_dims（如 ['prefix_rate']）拆成多 sheet 视图。
+
+    - sheet 集合 = 各副本在 sheet_dims 上取值的**并集**（缺该取值的副本，其列在
+      对应 sheet 里整列 N/A —— 由渲染层的逐单元格 .get(col, N/A) 兜底）。
+    - 每个 sheet 内：行 = 剩余行键（text: input_length/concurrency），
+      列 = compare_on 各取值（全局一致，跨 sheet 对齐）。
+    - 两列都有数据才算差异（沿用 excel 渲染逻辑，一列 N/A → 差异 N/A）。
+
+    返回在原 table 基础上追加 "sheets" / "sheet_dim_keys" / "sheet_dim_labels"；
+    原有键（column_labels/metric_names/constraints/notes/rows 等）保持不变，
+    供渲染层作全局信息复用。sheet_dims 为空则原样返回（单 sheet 语义）。
+    """
+    dim_keys = list(table.get("dim_keys") or [])
+    dim_labels = list(table.get("dim_labels") or [])
+    label_by_key = dict(zip(dim_keys, dim_labels))
+    sheet_dims = [d for d in sheet_dims if d in dim_keys]
+    if not sheet_dims:
+        return table
+
+    remaining_keys = [d for d in dim_keys if d not in sheet_dims]
+    remaining_labels = [label_by_key[d] for d in remaining_keys]
+    column_labels = table.get("column_labels", [])
+    metric_names = table.get("metric_names", [])
+
+    groups: dict[tuple, list[dict]] = {}
+    for entry in table.get("matrix", []):
+        sk = tuple(entry.get("dims", {}).get(d) for d in sheet_dims)
+        groups.setdefault(sk, []).append(entry)
+
+    sheets: list[dict] = []
+    for sk in sorted(groups, key=lambda k: _sheet_sort_key(sheet_dims, k)):
+        sub_matrix = []
+        for e in groups[sk]:
+            e_dims = e.get("dims", {})
+            sub_matrix.append({
+                "dims": {k: e_dims.get(k) for k in remaining_keys},
+                "input_length": e_dims.get("input_length"),
+                "concurrency": e_dims.get("concurrency"),
+                "metrics": e.get("metrics", {}),
+            })
+        # 对齐率：所有对比列都非 N/A 的场景行数
+        total_rows = len(sub_matrix)
+        aligned_rows = 0
+        for e in sub_matrix:
+            fully = bool(metric_names)
+            for mname in metric_names:
+                per_column = e["metrics"].get(mname, {})
+                if any(per_column.get(col, NA) == NA for col in column_labels):
+                    fully = False
+                    break
+            if fully:
+                aligned_rows += 1
+        sheets.append({
+            "sheet_dims": dict(zip(sheet_dims, sk)),
+            "sheet_label": _sheet_label(sheet_dims, sk),
+            "dim_keys": remaining_keys,
+            "dim_labels": remaining_labels,
+            "matrix": sub_matrix,
+            "coverage": {"total_rows": total_rows, "aligned_rows": aligned_rows},
+        })
+
+    out = dict(table)
+    out["sheets"] = sheets
+    out["sheet_dim_keys"] = sheet_dims
+    out["sheet_dim_labels"] = [label_by_key[d] for d in sheet_dims]
+    return out
+
+
 def build_comparison_table(
     docs: list[dict],
     compare_on: str,

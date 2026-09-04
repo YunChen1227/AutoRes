@@ -10,6 +10,7 @@ Excel 渲染（design.md §7.4 步骤 4-5）。纯数据对比表，无图表、
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 
 from openpyxl import Workbook
@@ -126,26 +127,69 @@ def _dim_cell_value(val):
     return "N/A" if val is None else val
 
 
+_INVALID_SHEET_CHARS = re.compile(r"[:\\/?*\[\]]")
+
+
+def _safe_sheet_title(name: str, used: set[str]) -> str:
+    """Excel sheet 名：去非法字符、截断 31、去重。"""
+    title = _INVALID_SHEET_CHARS.sub("_", str(name)).strip() or "sheet"
+    title = title[:31]
+    base, n = title, 2
+    while title in used:
+        suffix = f"_{n}"
+        title = base[: 31 - len(suffix)] + suffix
+        n += 1
+    used.add(title)
+    return title
+
+
 def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
-    """把对比宽表渲染为 xlsx，返回文件路径。"""
+    """把对比宽表渲染为 xlsx，返回文件路径。
+
+    若 table 含 "sheets"（按 sheet_dims 拆分，例如 text kind 下每个 prefix_rate
+    一个 sheet），则逐 sheet 渲染；否则退化为单 sheet（旧行为）。
+    sheet 集合 = 各副本在 sheet_dims 上取值的并集；某副本缺某取值时该列填 N/A，
+    两列都有数据才计算差异（复用逐单元格逻辑）。
+    """
     os.makedirs(output_dir, exist_ok=True)
-
     wb = Workbook()
-    ws = wb.active
-    ws.title = "对比报告"
+    sheets = table.get("sheets")
+    if sheets:
+        used: set[str] = set()
+        for i, view in enumerate(sheets):
+            ws = wb.active if i == 0 else wb.create_sheet()
+            ws.title = _safe_sheet_title(
+                view.get("sheet_label") or f"sheet{i + 1}", used)
+            _draw_sheet(ws, table, view, compare_on)
+    else:
+        ws = wb.active
+        ws.title = "对比报告"
+        _draw_sheet(ws, table, table, compare_on)
 
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"对比报告_{compare_on}_{ts}.xlsx"
+    path = os.path.join(output_dir, filename)
+    wb.save(path)
+    return path
+
+
+def _draw_sheet(ws, table: dict, view: dict, compare_on: str) -> None:
+    """在 ws 上绘制一个 sheet。全局信息（列轴/指标/显卡换算/notes）取自 table，
+    分片信息（行键/矩阵/对齐率/场景标识）取自 view。单 sheet 时 view 即 table。"""
     column_labels = list(table["column_labels"])
-    matrix = table["matrix"]
+    matrix = view["matrix"]
     metric_names = table["metric_names"]
-    dim_labels = list(table.get("dim_labels") or schema.metric_dimension_keys())
-    dim_keys = list(table.get("dim_keys") or schema.metric_dims())
+    dim_labels = list(view.get("dim_labels") or table.get("dim_labels")
+                      or schema.metric_dimension_keys())
+    dim_keys = list(view.get("dim_keys") or table.get("dim_keys")
+                    or schema.metric_dims())
     n_dims = len(dim_labels)
 
     gpu_scaled = table.get("gpu_scaled", False)
     column_gpus = table.get("column_gpus", {})
     column_gpu_types = table.get("column_gpu_types", {})
     column_scale = table.get("column_scale", {})
-    coverage = table.get("coverage") or {}
+    coverage = view.get("coverage") or table.get("coverage") or {}
     notes = table.get("notes") or {}
 
     def _col_display(label) -> str:
@@ -167,8 +211,13 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
 
     # ── 标题区 ──
     kind = notes.get("benchmark_kind") or table.get("benchmark_kind", "text")
-    ws.cell(row=1, column=1,
-            value=f"对比轴: {compare_on}　kind: {kind}").font = _TITLE_FONT
+    title = f"对比轴: {compare_on}　kind: {kind}"
+    sheet_dims = view.get("sheet_dims") or {}
+    if sheet_dims:
+        sd_text = " ".join(
+            f"{k}={'N/A' if v is None else v}" for k, v in sheet_dims.items())
+        title += f"　场景: {sd_text}"
+    ws.cell(row=1, column=1, value=title).font = _TITLE_FONT
     constraints = _constraints_text(table["constraints"])
     if constraints:
         ws.cell(row=2, column=1, value=f"约束: {constraints}")
@@ -313,9 +362,3 @@ def render_comparison(table: dict, compare_on: str, output_dir: str) -> str:
             if v is not None:
                 max_len = max(max_len, len(f"{v:.4f}" if isinstance(v, float) else str(v)))
         ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 32)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"对比报告_{compare_on}_{ts}.xlsx"
-    path = os.path.join(output_dir, filename)
-    wb.save(path)
-    return path

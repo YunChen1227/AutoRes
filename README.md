@@ -447,7 +447,8 @@ docker compose up -d
 
 报告为纯数据对比表（无图表、无 LLM 结论）：
 
-- **行**：`(Input_Length, Concurrency)` 测试条件，按输入长度分块
+- **Sheet（仅 text kind）**：每个 `Prefix_Rate` 一个 sheet（sheet 名如 `pr=0.0`）。sheet 集合取参与对比各副本的**并集**——某副本没跑过的前缀比例，在对应 sheet 里该列整列 `N/A`，只有两列都有数据才计算差异。vlm kind 维度多，暂维持单 sheet。
+- **行**：sheet 内为 `(Input_Length, Concurrency)` 测试条件，按输入长度分块（`Prefix_Rate` 已上升为 sheet，不再占行键列）
 - **列**：每个指标一组；组内按对比轴取值展开（含 `KV_Cache_Hit_Rate(%)` 等动态指标列）
 - **双层表头**：第 1 行指标名，第 2 行对比轴取值
 - **差异列**：对比轴两个及以上取值时，两两 `A vs B` 相对差异（百分比）

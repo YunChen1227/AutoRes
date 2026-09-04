@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from autores.server.report import align, excel, hardware
 from autores.server.report.query import QuerySpec, run_query
 
+# 按 kind 决定「拆 sheet 的行键」：text 每个 prefix_rate 一个 sheet；
+# vlm 维度多（image_count/video_count/image_resolution），拆开会 sheet 爆炸，暂维持单 sheet。
+_SHEET_DIMS_BY_KIND: dict[str, list[str]] = {"text": ["prefix_rate"]}
+
 
 @dataclass
 class ReportResult:
@@ -40,6 +44,11 @@ def generate_report(db, spec: QuerySpec, output_dir: str) -> ReportResult:
         gpu_scaled=gpu_scaled,
         kind=spec.benchmark_kind,
     )
+    # text kind：按 prefix_rate 拆 sheet（每个前缀比例一个 sheet，sheet 集合取并集，
+    # 缺该前缀的副本整列 N/A，两边都有才对比）。其余 kind 维持单 sheet。
+    sheet_dims = _SHEET_DIMS_BY_KIND.get(spec.benchmark_kind, [])
+    if sheet_dims:
+        table = align.split_table_into_sheets(table, sheet_dims)
     path = excel.render_comparison(table, spec.compare_on, output_dir)
 
     return ReportResult(

@@ -207,6 +207,8 @@ AutoRes/
 > **行键缺值约定**：只有 `Input_Length` / `Concurrency` 硬必填；其余行键（`Prefix_Rate` / `Image_*`）CSV 缺列则整列 N/A，不报错、不给默认值、上传表单不提供整份回退。`(1024,32,None)` 与 `(1024,32,0.0)` 是不同场景，报告里不会横向对齐。
 >
 > **prefix_rate 层级变更**：已从 run 级表列**下沉**为 text kind 的 metric 行键，不再出现在 `test_runs` 列 / 上传表单 / `compare_on`。
+>
+> **prefix_rate → Excel 分 sheet**：出报告时 text kind 按 `prefix_rate` 拆 sheet（`align.split_table_into_sheets`，每个前缀比例一个 sheet，sheet 名如 `pr=0.0`）。sheet 集合 = 各副本 `prefix_rate` 取值的**并集**；缺该取值的副本在对应 sheet 整列 `N/A`，两列都有数据才算差异。sheet 内行键退化为 `(Input_Length, Concurrency)`。vlm kind 维持单 sheet（`_SHEET_DIMS_BY_KIND`，避免多维行键 sheet 爆炸）。
 
 > 新指标写入 metrics JSON 列（schema-less），**无需改表结构**；老数据需重新 to_csv/上传才有新 key。
 
